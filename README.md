@@ -1,12 +1,12 @@
 # ohmybug CLI
 
-[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/hAtEhsWqFe)
+[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/6d7g8J44C7)
 
 Review the changes in a git repository with the [OhMyBug](https://ohmybug.ai) bug hunt from any CI system (GitLab CI, Bitbucket Pipelines, Jenkins) or from your shell. The repository can be hosted anywhere: the CLI sends the diff and a few related files itself.
 
 One file, no dependencies, Node.js 18 or newer.
 
-Questions → [Discord](https://discord.gg/hAtEhsWqFe).
+Questions → [Discord](https://discord.gg/6d7g8J44C7).
 
 ## Install
 
