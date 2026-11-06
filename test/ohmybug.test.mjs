@@ -39,7 +39,7 @@ function repo() {
  * `filesLocation`); `filesUrl` replaces the
  * file request's address; `requestedAgain` makes the second wait_review a second request at the same address.
  */
-async function server({ findings = [], status = "done", review_of_record = true, httpStatus = 200, requested, requestedAgain, sse = false, submitStatus, toolError, faults = {}, filesStatus = 200, filesUrl, filesLocation } = {}, port = 0) {
+async function server({ findings = [], status = "done", review_of_record = true, httpStatus = 200, requested, requestedAgain, sse = false, submitStatus, toolError, faults = {}, filesStatus = 200, filesUrl, filesLocation, extra = {} } = {}, port = 0) {
   const calls = [], posted = [];
   let url, asks = 0;
   const srv = createServer((req, res) => {
@@ -80,7 +80,7 @@ async function server({ findings = [], status = "done", review_of_record = true,
         : name === "submit_review" ? { review_id: "rev_test", status: "running" }
         : ask ? { review_id: "rev_test", status: "needs_files", requested_files: ask, files_url: filesUrl ?? `${url}/files` }
         : name === "wait_review" ? { review_id: "rev_test", status }
-        : { review_id: "rev_test", status, findings, review_of_record, live_url: "https://example.test/live/x" };
+        : { review_id: "rev_test", status, findings, review_of_record, live_url: "https://example.test/live/x", ...extra };
       const answer = JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: JSON.stringify(result) }], ...(toolError ? { isError: true } : {}) } });
       res.writeHead(200, { "content-type": sse ? "text/event-stream" : "application/json" });
       res.end(sse ? `event: message\ndata: ${answer}\n\n` : answer);
@@ -703,4 +703,63 @@ test("--deep sends the pushed commit's coordinates and no payload; refuses what 
     assert.equal(busy.calls.filter((c) => c.name === "submit_review").length, 1);
     assert.equal(busy.calls.filter((c) => c.name !== "submit_review").length, 0);
   } finally { await busy.close() }
+});
+
+test("--story narrows the hunt's feed story: sent as meta.story on fast and deep, never for auto; the story note is printed", async () => {
+  assert.deepEqual(parseArgs(["--story", "never"]).story, "never");
+  assert.deepEqual(parseArgs(["--story=private"]).story, "private");
+  for (const argv of [["--story"], ["--story="], ["--story", "ask"], ["--story=NEVER"], ["--story", "--deep"]]) {
+    assert.equal(typeof parseArgs(argv), "string", argv.join(" "));
+  }
+  const { dir, git } = repo();
+  writeFileSync(join(dir, "app.js"), "export const a = 2\n");
+  git("commit", "-qam", "c");
+  const sent = (s) => s.calls.find((c) => c.name === "submit_review")?.args.meta?.story;
+  for (const [argv, env, want] of [
+    [["--story", "never"], {}, "never"],
+    [[], { OHMYBUG_STORY: "private" }, "private"],
+    [["--story=never"], { OHMYBUG_STORY: "private" }, "never"],
+    [["--story", "auto"], { OHMYBUG_STORY: "never" }, undefined],
+    [[], {}, undefined],
+    [[], { OHMYBUG_STORY: "" }, undefined],
+  ]) {
+    const s = await server();
+    try {
+      const r = await cli(dir, argv, { OHMYBUG_URL: s.url, ...env });
+      assert.equal(r.code, 0, r.log);
+      assert.equal(sent(s), want, `${argv.join(" ")} ${JSON.stringify(env)}`);
+    } finally { await s.close() }
+  }
+  // A bad variable is refused before any call.
+  const bad = await server();
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: bad.url, OHMYBUG_STORY: "ask" });
+    assert.equal(r.code, 2);
+    assert.match(r.log, /OHMYBUG_STORY must be auto, private or never/);
+    assert.equal(bad.calls.length, 0);
+  } finally { await bad.close() }
+  // The deep hunt carries it too.
+  git("remote", "add", "origin", "https://github.com/acme/app");
+  git("update-ref", "refs/remotes/origin/feature", "HEAD");
+  const deep = await server();
+  try {
+    const r = await cli(dir, ["--deep", "--story", "private"], { OHMYBUG_URL: deep.url });
+    assert.equal(r.code, 0, r.log);
+    assert.equal(sent(deep), "private");
+  } finally { await deep.close() }
+  // The service's story note: one line on the log, the exit code untouched; none when absent or not text.
+  for (const [story, line] of [
+    [{ state: "drafting", note: "A story draft of this hunt will wait for your OK on /me." }, "story: A story draft of this hunt will wait for your OK on /me."],
+    [{ state: "waiting", note: "A draft\nwaits\u001b[31m on /me. " }, "story: A draft waits [31m on /me."],
+    [{ state: "off", note: 7 }, null],
+    [undefined, null],
+  ]) {
+    const s = await server({ findings: [high], extra: story ? { story } : {} });
+    try {
+      const r = await cli(dir, [], { OHMYBUG_URL: s.url });
+      assert.equal(r.code, 1, r.log);
+      if (line) assert.ok(r.log.split("\n").includes(line), r.log);
+      else assert.doesNotMatch(r.log, /^story:/m);
+    } finally { await s.close() }
+  }
 });

@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-export const VERSION = "0.2.0";
+export const VERSION = "0.3.0";
 const USAGE = `ohmybug ${VERSION}: review this repository's changes with OhMyBug.
 
 Usage:
@@ -16,6 +16,8 @@ Usage:
   ohmybug --uncommitted      review the working tree against HEAD, untracked files included
   ohmybug --deep [--base <branch>]  the deep hunt of the pushed HEAD commit (GitHub only): the service reads the
                              whole repository; up to 2 hours, so OHMYBUG_TIMEOUT_S defaults to 10800
+  --story auto|private|never  the feed story of this hunt: auto (default) leaves it to the account and key
+                             settings; private keeps any story private; never drafts and posts none
 
 The base is --base, else $CI_MERGE_REQUEST_TARGET_BRANCH_NAME (GitLab merge request pipelines),
 else origin/main. With --deep it is a branch name: --base, else $GITHUB_BASE_REF, else main.
@@ -24,6 +26,7 @@ Environment:
   OHMYBUG_API_KEY     required: a key from https://app.ohmybug.ai/me
   OHMYBUG_URL         default https://mcp.ohmybug.ai
   OHMYBUG_TIMEOUT_S   how long to wait for the review, 30 to 86400 seconds, default 1800 (10800 with --deep)
+  OHMYBUG_STORY       the --story value when the flag is not given
 
 Behind a proxy: Node's fetch reads HTTPS_PROXY only with NODE_USE_ENV_PROXY=1 (Node 22.21+, 24+).
 
@@ -44,6 +47,7 @@ const MAX_TREE = 1024 * 1024;
 // Pinned diff format, whatever the user's git config says (noprefix, mnemonicPrefix, textconv drivers).
 const DIFF_FLAGS = ["--no-color", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/"];
 const TRANSIENT_TOOL = new Set(["internal", "rate_limited"]);
+const STORY = new Set(["auto", "private", "never"]);
 
 export class Refusal extends Error {}
 export class Deadline extends Error {}
@@ -59,6 +63,11 @@ export function parseArgs(argv) {
     else if (a === "--version") o.version = true;
     else if (a === "--base") { if (!argv[i + 1] || argv[i + 1].startsWith("-")) return "--base needs a ref"; o.base = argv[++i]; }
     else if (a.startsWith("--base=")) { if (!a.slice(7)) return "--base needs a ref"; o.base = a.slice(7); }
+    else if (a === "--story" || a.startsWith("--story=")) {
+      const v = a === "--story" ? argv[++i] : a.slice(8);
+      if (!STORY.has(v)) return "--story needs auto, private or never";
+      o.story = v;
+    }
     else return `unknown argument: ${a}`;
   }
   if (o.uncommitted && o.base) return "--uncommitted and --base do not go together";
@@ -258,6 +267,10 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
   if (opts.version) { out(VERSION); return 0; }
   if (!env.OHMYBUG_API_KEY) { log("OHMYBUG_API_KEY is not set: create a key at https://app.ohmybug.ai/me"); return 2; }
   // Under 30 s no poll fits before the deadline: refused before a paid hunt starts.
+  const story = opts.story ?? (env.OHMYBUG_STORY || "auto");
+  if (!STORY.has(story)) { log(`OHMYBUG_STORY must be auto, private or never, not ${env.OHMYBUG_STORY}`); return 2; }
+  // Sent only to narrow: an absent meta.story is the account's and key's settings alone.
+  const storyMeta = story === "auto" ? {} : { story };
   const timeoutS = Number(env.OHMYBUG_TIMEOUT_S || (opts.deep ? 10800 : 1800));
   if (!Number.isInteger(timeoutS) || timeoutS < 30 || timeoutS > 86400) { log(`OHMYBUG_TIMEOUT_S must be whole seconds from 30 to 86400, not ${env.OHMYBUG_TIMEOUT_S}`); return 2; }
   const api = (env.OHMYBUG_URL || "https://mcp.ohmybug.ai").replace(/\/$/, "");
@@ -389,7 +402,7 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
     if (opts.deep) {
       // The service fetches the repository and the diff itself: only where to find them goes up.
       read = () => null;
-      args = { deep: true, meta: { ...ciMeta(env, git), ...deepTarget(opts, env, git) } };
+      args = { deep: true, meta: { ...ciMeta(env, git), ...storyMeta, ...deepTarget(opts, env, git) } };
       log(`deep hunt of ${args.meta.repo} at ${args.meta.ref.slice(0, 12)} against ${args.meta.base_branch}; waiting up to ${timeoutS}s`);
       if (timeoutS < 7200) log("a deep hunt takes up to 2 hours: OHMYBUG_TIMEOUT_S under 7200 may end the wait before the result");
     } else {
@@ -409,7 +422,7 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
       if (Buffer.byteLength(diff) > MAX_BYTES || Buffer.byteLength(JSON.stringify(diff)) + Buffer.byteLength(JSON.stringify(tree.content)) > MAX_BODY - 64 * 1024) {
         throw new Refusal(`the diff (${Buffer.byteLength(diff)} bytes) and the file list are over what the service takes once encoded: ${opts.uncommitted ? "commit part of it and review" : "review"} a smaller range with --base`);
       }
-      const meta = ciMeta(env, git);
+      const meta = { ...ciMeta(env, git), ...storyMeta };
       args = fitBody({ diff, files: [tree, ...pack(read, contextPaths(change.changed, change.all, git, change.rev), MAX_FILES - 1, MAX_BYTES - Buffer.byteLength(diff) - Buffer.byteLength(tree.content))], ...(Object.keys(meta).length ? { meta } : {}) });
       log(`reviewing ${change.changed.length} changed file(s) against ${change.base}`);
     }
@@ -436,6 +449,7 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
         else if (findings.length) out(formatFindings(findings));
         else out(code === 2 ? "No bugs found before the review was cut short." : "No bugs found.");
         if (code === 2 && r.status === "done") log("the review did not finish its protocol: this is not a clean result");
+        if (typeof r.story?.note === "string") log(`story: ${r.story.note.replace(/[\x00-\x1f\x7f]+/g, " ").trim().slice(0, 300)}`);
         if (r.billing) log(`billing: ${r.billing.charged_usd ? `$${r.billing.charged_usd}` : "nothing"} charged${r.billing.paid_by ? ` (${r.billing.paid_by})` : ""}`);
         if (r.live_url) out(`\nReport: ${r.live_url}`);
         if (code !== 2) out(code === 1 ? `\n${findings.filter(isBlocking).length} blocking bug(s): medium or worse, or unrated.` : "\nNo blocking bugs.");
