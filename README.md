@@ -17,7 +17,7 @@ curl -fsSL https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/main/install.s
 Or download [`ohmybug.mjs`](ohmybug.mjs) and run it with `node ohmybug.mjs`. The installer takes the latest `main`; to pin a release in CI, name its file:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/main/install.sh | OHMYBUG_CLI_URL=https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/v0.3.0/ohmybug.mjs sh
+curl -fsSL https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/main/install.sh | OHMYBUG_CLI_URL=https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/v0.4.0/ohmybug.mjs sh
 ```
 
 Behind a proxy: Node's `fetch` reads `HTTPS_PROXY` only with `NODE_USE_ENV_PROXY=1` (Node 22.21 or newer, or 24 or newer).
@@ -60,6 +60,8 @@ A hunt that found a bug can be told as a short anonymous story on the public fee
 
 A key on **CI billing** (the key setting on [app.ohmybug.ai/me](https://app.ohmybug.ai/me)) pays per hunt with no confirm step: $4 for a fast hunt and $12 for a deep one ($24 on a wide change, one spread over 11 or more folder chunks), only when the result holds a medium or worse bug. A clean or failed hunt is free. The run prints what it was charged.
 
+Outside CI billing, some fast hunts bill on their own at a deadline unless every medium or worse finding is rejected as not a real bug first (see the [terms](https://ohmybug.ai/terms/), section 2). When a hunt has one, the run prints one `silent bill:` line on stderr after the billing line: `bills on its own at <time> unless every medium or worse finding is rejected (NOT_REAL) first`, `may bill on its own; the deadline could not be read now`, or `billed on its own at <time>`. Reject or confirm the findings on the hunt's page in [app.ohmybug.ai/me](https://app.ohmybug.ai/me) before that time. The exit code does not change.
+
 ## GitLab CI
 
 ```yaml
@@ -72,7 +74,7 @@ ohmybug:
     GIT_DEPTH: 0
   script:
     - git fetch origin "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
-    - curl -fsSL https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/v0.3.0/install.sh | OHMYBUG_CLI_URL=https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/v0.3.0/ohmybug.mjs sh
+    - curl -fsSL https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/v0.4.0/install.sh | OHMYBUG_CLI_URL=https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/v0.4.0/ohmybug.mjs sh
     - ohmybug
 ```
 
@@ -91,7 +93,7 @@ pipelines:
           script:
             # The clone tracks one branch: name where the target goes, or origin/<target> does not exist.
             - git fetch origin "+refs/heads/$BITBUCKET_PR_DESTINATION_BRANCH:refs/remotes/origin/$BITBUCKET_PR_DESTINATION_BRANCH"
-            - curl -fsSL https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/v0.3.0/install.sh | OHMYBUG_CLI_URL=https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/v0.3.0/ohmybug.mjs sh
+            - curl -fsSL https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/v0.4.0/install.sh | OHMYBUG_CLI_URL=https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/v0.4.0/ohmybug.mjs sh
             - ohmybug --base "origin/$BITBUCKET_PR_DESTINATION_BRANCH"
 ```
 

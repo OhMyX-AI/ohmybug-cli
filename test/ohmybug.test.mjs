@@ -7,7 +7,7 @@ import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ciMeta, exitCodeFor, fitBody, parseArgs, resolveBase, rpcMessage, run, trimDiff, VERSION } from "../ohmybug.mjs";
+import { ciMeta, exitCodeFor, fitBody, parseArgs, resolveBase, rpcMessage, run, silentBillLine, trimDiff, VERSION } from "../ohmybug.mjs";
 
 // The tests own their git config: a developer's or a runner's own (a git-lfs filter, say) would change what they see.
 process.env.GIT_CONFIG_GLOBAL = "/dev/null";
@@ -762,4 +762,35 @@ test("--story narrows the hunt's feed story: sent as meta.story on fast and deep
       else assert.doesNotMatch(r.log, /^story:/m);
     } finally { await s.close() }
   }
+});
+
+test("silent_bill: one fixed line per form; a malformed deadline is never echoed; none for no object", () => {
+  const at = "2026-11-11T04:00:00.000Z";
+  assert.equal(silentBillLine({ at, terms: "x" }), `silent bill: bills on its own at ${at} unless every medium or worse finding is rejected (NOT_REAL) first`);
+  assert.equal(silentBillLine({ at: null, terms: "x" }), "silent bill: may bill on its own; the deadline could not be read now");
+  assert.equal(silentBillLine({ at, billed: true, terms: "x" }), `silent bill: billed on its own at ${at}`);
+  // Server text in the deadline is not echoed: a pending one reads as unreadable, a billed one without its time.
+  assert.equal(silentBillLine({ at: "soon\u001b[2J" }), "silent bill: may bill on its own; the deadline could not be read now");
+  assert.equal(silentBillLine({ at: "x", billed: true }), "silent bill: billed on its own");
+  for (const sb of [undefined, null, "at 4", 7, []].slice(0, 4)) assert.equal(silentBillLine(sb), null, String(sb));
+});
+
+test("a finished hunt with a silent bill prints its line on stderr after the billing line; the exit code is the findings'", async () => {
+  const { dir, git } = repo();
+  writeFileSync(join(dir, "app.js"), "export const a = 2\n");
+  git("commit", "-qam", "change");
+  const at = "2026-11-11T04:00:00.000Z";
+  const s = await server({ findings: [high], extra: { billing: { charged_usd: 0 }, silent_bill: { at, terms: "$4 fast ..." } } });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: s.url });
+    assert.equal(r.code, 1);
+    assert.match(r.log, new RegExp(`billing: nothing charged\\nsilent bill: bills on its own at ${at.replace(/\./g, "\\.")} unless`));
+    assert.doesNotMatch(r.out + r.log, /\$4 fast/);
+  } finally { await s.close() }
+  const clean = await server({ findings: [] });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: clean.url });
+    assert.equal(r.code, 0);
+    assert.doesNotMatch(r.log, /silent bill/);
+  } finally { await clean.close() }
 });

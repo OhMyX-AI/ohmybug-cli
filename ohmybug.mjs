@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-export const VERSION = "0.3.0";
+export const VERSION = "0.4.0";
 const USAGE = `ohmybug ${VERSION}: review this repository's changes with OhMyBug.
 
 Usage:
@@ -206,6 +206,17 @@ export function ciMeta(env, git) {
 }
 
 /** 0, 1 or 2 for a finished review body. */
+/** get_findings' `silent_bill` (a fast hunt that bills on its own unless every medium or worse finding is rejected) as
+ *  one fixed stderr line, or null when there is none. Only a well-formed UTC timestamp is echoed: server text never is. */
+const ISO_UTC = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,3})?Z$/;
+export function silentBillLine(sb) {
+  if (!sb || typeof sb !== "object") return null;
+  const at = typeof sb.at === "string" && ISO_UTC.test(sb.at) ? sb.at : null;
+  if (sb.billed === true) return at ? `silent bill: billed on its own at ${at}` : "silent bill: billed on its own";
+  if (!at) return "silent bill: may bill on its own; the deadline could not be read now";
+  return `silent bill: bills on its own at ${at} unless every medium or worse finding is rejected (NOT_REAL) first`;
+}
+
 export function exitCodeFor(r) {
   if (r.status !== "done") return 2;
   if ((r.findings ?? []).some(isBlocking)) return 1;
@@ -451,6 +462,8 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
         if (code === 2 && r.status === "done") log("the review did not finish its protocol: this is not a clean result");
         if (typeof r.story?.note === "string") log(`story: ${r.story.note.replace(/[\x00-\x1f\x7f]+/g, " ").trim().slice(0, 300)}`);
         if (r.billing) log(`billing: ${r.billing.charged_usd ? `$${r.billing.charged_usd}` : "nothing"} charged${r.billing.paid_by ? ` (${r.billing.paid_by})` : ""}`);
+        const silent = silentBillLine(r.silent_bill);
+        if (silent) log(silent);
         if (r.live_url) out(`\nReport: ${r.live_url}`);
         if (code !== 2) out(code === 1 ? `\n${findings.filter(isBlocking).length} blocking bug(s): medium or worse, or unrated.` : "\nNo blocking bugs.");
         return code;
