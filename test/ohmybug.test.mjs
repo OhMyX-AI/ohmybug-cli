@@ -7,7 +7,7 @@ import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync, readFileSync } from
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ciMeta, exitCodeFor, fitBody, parseArgs, resolveBase, rpcMessage, run, silentBillLine, trimDiff, VERSION } from "../ohmybug.mjs";
+import { ciMeta, exitCodeFor, fitBody, parseArgs, resolveBase, resultMarkdown, resultOf, rpcMessage, run, silentBillLine, trimDiff, VERSION } from "../ohmybug.mjs";
 
 // The tests own their git config: a developer's or a runner's own (a git-lfs filter, say) would change what they see.
 process.env.GIT_CONFIG_GLOBAL = "/dev/null";
@@ -998,11 +998,13 @@ test("--format markdown and --step-summary: one block, server text escaped, the 
     const r = await cli(dir, ["--format", "markdown"], { OHMYBUG_URL: s.url });
     assert.equal(r.code, 1);
     assert.match(r.out, /^### OhMyBug review: 1 blocking bug\n/);
-    assert.match(r.out, /\| HIGH \| a\\\|b\.js:1 \| &lt;img src=x onerror=alert\(1\)&gt; \\\| \\`x\\` next \|/);
+    // Table cells are code spans (literal: no markup, no links, no autolinks); only the table's pipe is escaped.
+    assert.ok(r.out.includes("| HIGH | ` a\\|b.js:1 ` | `` <img src=x onerror=alert(1)> \\| `x` next `` |"), r.out);
     assert.match(r.out, /<pre>&lt;\/pre&gt;&lt;script&gt;bad\(\)&lt;\/script&gt;\nline two<\/pre>/);
-    assert.doesNotMatch(r.out, /<img|<script|<\/pre><script/);
+    const outsideSpans = r.out.replace(/(`+) [^\n]*? \1/g, "");
+    assert.doesNotMatch(outsideSpans, /<img|<script|<\/pre><script/);
     assert.match(r.out, /Billing: charged only when someone confirms/);
-    assert.match(r.out, /Report: https:\/\/example\.test\/live\/x$/);
+    assert.match(r.out, /\n\nReport: <https:\/\/example\.test\/live\/x>$/);
     // --step-summary with text: stdout is the text output as before, the block goes to the file, appended.
     const file = join(mkdtempSync(join(tmpdir(), "ombsum-")), "summary.md");
     writeFileSync(file, "earlier\n");
@@ -1074,10 +1076,11 @@ test("--format json and markdown: a CI charge and a billed silent bill are carri
     assert.deepEqual([j.billing.tariff, j.billing.charged_usd, j.billing.paid_by], ["ci", 4, "balance"]);
     assert.deepEqual([j.silent_bill.billed, j.silent_bill.note], [true, `silent bill: billed on its own at ${at}`]);
     const m = (await cli(dir, ["--format", "markdown"], { OHMYBUG_URL: s.url })).out;
-    assert.match(m, /Billing: \$4 charged \(CI billing, balance\)\. silent bill: billed on its own/);
+    assert.match(m, /Billing: \$4 charged \(CI billing, ` balance `\)\. silent bill: billed on its own/);
     const row = m.split("\n").find((l) => l.startsWith("| HIGH"));
     assert.equal(row.split(/(?<!\\)\|/).length, 5, row);
-    assert.doesNotMatch(row, /(?<!\\)!\[|(?<!\\)\[click\]|(?<!\\)\*em(?<!\\)\*|(?<!\\)`/);
+    // The whole title is one code span: its links, image, emphasis and bare URLs are literal text.
+    assert.ok(row.endsWith("| `` ![x](https://host/p.png) [click](https://host) a\\\\|b *em* _u_ `c` `` |"), row);
   } finally { await s.close() }
   // The error line carries server text: inside a pre block, escaped.
   s = await server({ toolError: { error: "quota_exceeded", message: "<b>no</b>\n### OhMyBug review: No blocking bugs" } });
@@ -1087,5 +1090,47 @@ test("--format json and markdown: a CI charge and a billed silent bill are carri
     assert.match(m, /<pre>could not review: quota_exceeded: &lt;b&gt;no&lt;\/b&gt;\n### OhMyBug review: No blocking bugs<\/pre>/);
     // Inside the pre block the server text is literal: the only heading is the real one.
     assert.equal(m.replace(/<pre>[\s\S]*?<\/pre>/g, "").match(/^### /gm).length, 1);
+  } finally { await s.close() }
+});
+
+test("result helpers: no billing block reads as the confirm tariff, an absent charge is null, a non-https link is not drawn, the cap drops the folds", () => {
+  const done = (extra) => resultOf({ reviewId: "rev_x", answer: { status: "done", findings: [], ...extra } }, 0);
+  assert.deepEqual([done({ billing: { charged_usd: 0 } }).billing.tariff, done({ billing: { charged_usd: 0 } }).billing.charged_usd], ["confirm", null]);
+  assert.match(done({}).billing.note, /as REAL$/);
+  assert.match(done({ silent_bill: { at: "2026-11-12T10:00:00.000Z" } }).billing.note, /or at the billing deadline$/);
+  assert.equal(done({ billing: { tariff: "ci" } }).billing.charged_usd, null);
+  assert.equal(done({ billing: { tariff: "ci", charged_usd: "x" } }).billing.charged_usd, null);
+  assert.equal(resultOf({ reviewId: "rev_x", answer: { status: "failed", billing: { tariff: "ci", charged_usd: 4 } } }, 2).billing.note, "the charge the service reported for this review");
+  const md = resultMarkdown(done({ live_url: "https://x\n\n### fake" }));
+  assert.match(md, /Report: none \(/);
+  assert.equal(md.match(/^### /gm).length, 1);
+  const f = { finding_id: 7, severity: "high", file: { a: 1 }, line: 3, title: "t", failure_scenario: "x".repeat(400 * 1024) };
+  const big = resultOf({ reviewId: "rev_x", answer: { status: "done", findings: [f, { ...f, finding_id: "f2" }, { ...f, finding_id: "f3" }] } }, 1);
+  assert.deepEqual([big.findings[0].id, big.findings[0].file], ["7", null]);
+  const capped = resultMarkdown(big);
+  assert.ok(Buffer.byteLength(capped) < 900 * 1024, String(Buffer.byteLength(capped)));
+  assert.doesNotMatch(capped, /<details>/);
+  assert.match(capped, /Failure scenarios left out/);
+});
+
+test("parseArgs: --format needs a value; the flag wins over OHMYBUG_FORMAT", async () => {
+  for (const argv of [["--format"], ["--format="], ["--format", "--deep"]]) assert.equal(typeof parseArgs(argv), "string", argv.join(" "));
+  const { dir } = repo();
+  const r = await cli(dir, ["--format", "json"], { OHMYBUG_FORMAT: "markdown", OHMYBUG_URL: "http://127.0.0.1:9" });
+  assert.equal(JSON.parse(r.out).outcome, "no_changes");
+});
+
+test("a large json result reaches a pipe whole: the CLI process exits after stdout drains", async () => {
+  const { dir, git } = repo();
+  writeFileSync(join(dir, "app.js"), "export const a = 66\n");
+  git("commit", "-qam", "c");
+  const s = await server({ findings: [{ severity: "low", title: "t", failure_scenario: "y".repeat(2_000_000) }] });
+  try {
+    // The real entry point, through a pipe: its exit must wait for the 2 MB write.
+    const { execFile } = await import("node:child_process");
+    const out = await new Promise((resolve, reject) => execFile(process.execPath, [fileURLToPath(new URL("../ohmybug.mjs", import.meta.url)), "--format", "json"],
+      { cwd: dir, env: { ...process.env, OHMYBUG_API_KEY: "test-key", OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: "60" }, maxBuffer: 64 * 1024 * 1024 },
+      (e, stdout) => (e && e.code !== 0 ? reject(e) : resolve(stdout))));
+    assert.equal(JSON.parse(out).findings[0].body.length, 2_000_000);
   } finally { await s.close() }
 });

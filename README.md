@@ -57,7 +57,7 @@ The CLI prints each finding (severity, file:line, title, failure scenario) and a
 
 - `text` (the default): the findings for people, as before.
 - `json`: one object on one line, schema `ohmybug-cli/result/1`, printed on every exit once the arguments are read, a refusal or a timeout included (a wrong flag exits 2 with nothing on stdout).
-- `markdown`: one block for a CI summary: a headline, a table of findings, each failure scenario under its own fold, the billing line and the report link.
+- `markdown`: one block for a CI summary: a headline, a table of findings (each cell a code span, so nothing from a finding renders as markup or a link), each failure scenario under its own fold, the billing line and the report link.
 
 `--step-summary` also appends the markdown block to the file `$GITHUB_STEP_SUMMARY` names (GitHub Actions), whatever `--format` is. If the variable is unset or the file cannot be written, the run says so on stderr and its exit code does not change.
 

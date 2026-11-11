@@ -253,16 +253,19 @@ export function formatFindings(findings) {
 const SEVERITIES = ["critical", "high", "medium", "low", "unrated"];
 const severityOf = (f) => ["critical", "high", "medium", "low"][rankOf(f)] ?? "unrated";
 const strOrNull = (v) => (typeof v === "string" && v ? v : null);
+// A string or a number as a string; anything else (absent, empty, an object) is null.
+const scalar = (v) => ((typeof v === "string" && v) || (typeof v === "number" && Number.isFinite(v)) ? String(v) : null);
+// An amount the service reported, or null when it reported none: never a guessed 0.
+const usd = (v) => (v === null || v === undefined || v === "" || !Number.isFinite(Number(v)) ? null : Number(v));
 
 /**
  * The run as one object (schema ohmybug-cli/result/1): fields are only ever added within /1. `rec` is what the run
- * saw: reviewId, deep, live, answer (the last done/failed body), error, timedOut, noChanges.
+ * saw: reviewId, deep, live, answer (the last done/failed body), error, timedOut, maybeStarted, noChanges.
  */
 export function resultOf(rec, code) {
   const r = rec.answer;
   const findings = [...(r?.findings ?? []).filter((f) => f && typeof f === "object")].sort((a, b) => rankOf(a) - rankOf(b)).map((f) => ({
-    id: strOrNull(f.finding_id ?? f.id), severity: severityOf(f), blocking: isBlocking(f),
-    file: f.file == null || f.file === "" ? null : String(f.file),
+    id: scalar(f.finding_id ?? f.id), severity: severityOf(f), blocking: isBlocking(f), file: scalar(f.file),
     line: /^[1-9]\d*$/.test(String(f.line ?? "")) ? Number(f.line) : null, title: String(f.title ?? ""),
     body: String(f.failure_scenario ?? ""), suggested_fix: strOrNull(f.suggested_fix),
   }));
@@ -272,17 +275,19 @@ export function resultOf(rec, code) {
   const outcome = rec.noChanges ? "no_changes" : !rec.reviewId ? (rec.maybeStarted ? "maybe_started" : "not_run") : rec.timedOut ? "timed_out"
     : !r ? "interrupted" : r.status === "failed" ? "failed" : code === 1 ? "blocking" : code === 0 ? "clean" : "cut_short";
   const live = strOrNull(r?.live_url) ?? strOrNull(rec.live);
-  const b = r?.billing && typeof r.billing === "object" ? r.billing : null;
+  // The service sends a billing block only on CI billing (tariff "ci"); any other block is read as the confirm tariff.
+  const b = r?.billing && typeof r.billing === "object" && r.billing.tariff === "ci" ? r.billing : null;
+  const sb0 = r?.silent_bill && typeof r.silent_bill === "object";
   const maybe = rec.maybeStarted && !rec.reviewId;
   const billing = maybe ? { tariff: null, charged_usd: null, paid_by: null,
       note: "a hunt may have started and may be charged: check https://app.ohmybug.ai/me before running again" }
     : !rec.reviewId ? { tariff: null, charged_usd: null, paid_by: null, note: "nothing started, nothing charged" }
-    : r?.status === "failed" ? { tariff: strOrNull(b?.tariff), charged_usd: b ? Number(b.charged_usd ?? 0) || 0 : null,
-      paid_by: strOrNull(b?.paid_by), note: "a failed review is free" }
-    : b ? { tariff: strOrNull(b.tariff), charged_usd: Number(b.charged_usd ?? 0) || 0, paid_by: strOrNull(b.paid_by),
-      note: b.tariff === "ci" ? "CI billing: charged when the result holds a medium or worse finding" : "the charge the service reported for this review" }
+    : r?.status === "failed" ? { tariff: b ? "ci" : null, charged_usd: usd(b?.charged_usd), paid_by: strOrNull(b?.paid_by),
+      note: usd(b?.charged_usd) ? "the charge the service reported for this review" : "a failed review is free" }
+    : b ? { tariff: "ci", charged_usd: usd(b.charged_usd), paid_by: strOrNull(b.paid_by),
+      note: "CI billing: charged when the result holds a medium or worse finding" }
     : r ? { tariff: "confirm", charged_usd: null, paid_by: null,
-      note: "charged only when someone confirms a medium or worse finding as REAL, or at the billing deadline (silent_bill)" }
+      note: `charged only when someone confirms a medium or worse finding as REAL${sb0 ? ", or at the billing deadline" : ""}` }
     : { tariff: null, charged_usd: null, paid_by: null, note: "no result was read, so the charge is not known here" };
   const sb = r?.silent_bill && typeof r.silent_bill === "object" ? r.silent_bill : null;
   return {
@@ -301,7 +306,12 @@ export function resultOf(rec, code) {
 
 // Server text in a step summary is data: HTML is escaped, and a table cell keeps to one line and its own column.
 const escHtml = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-const cell = (s) => escHtml(String(s).replace(/[\\`*_[\]!|~#]/g, "\\$&")).replace(/[\r\n]+/g, " ");
+const cell = (s) => {
+  const t = String(s).replace(/[\r\n]+/g, " ").trim();
+  if (!t) return "";
+  const fence = "`".repeat(Math.max(0, ...(t.match(/`+/g) ?? []).map((m) => m.length)) + 1);
+  return `${fence} ${t.replace(/\|/g, "\\|")} ${fence}`;
+};
 const HEADLINE = {
   clean: "No blocking bugs", failed: "The review failed", cut_short: "Cut short, no blocking bug found: not a clean result",
   timed_out: "Timed out before a result", interrupted: "Stopped before a result", not_run: "Could not run", no_changes: "Nothing to review",
@@ -327,11 +337,13 @@ export function resultMarkdown(res, folds = true) {
   }
   if (res.error) out.push(`<pre>${escHtml(res.error.message)}</pre>`, "");
   const b = res.billing;
-  const how = [b.tariff === "ci" ? "CI billing" : "", b.paid_by ? escHtml(b.paid_by) : ""].filter(Boolean).join(", ");
+  const how = [b.tariff === "ci" ? "CI billing" : "", b.paid_by ? cell(b.paid_by) : ""].filter(Boolean).join(", ");
   const bill = b.charged_usd !== null ? `$${b.charged_usd} charged${how ? ` (${how})` : ""}` : escHtml(b.note);
-  out.push(`Billing: ${bill}.${res.silent_bill ? ` ${escHtml(res.silent_bill.note)}.` : ""}`);
-  out.push(res.live_url ? `Report: ${escHtml(res.live_url)}` : `Report: none (${escHtml(res.live_url_missing)})`);
-  if (!folds) out.push("", "Failure scenarios left out: the summary would be over GitHub's size limit. The report has them.");
+  out.push(`Billing: ${bill}.${res.silent_bill ? ` ${escHtml(res.silent_bill.note)}.` : ""}`, "");
+  // The link is drawn only as a plain https URL: anything else is not a link to follow.
+  const link = /^https:\/\/[^\s<>()[\]`]+$/.test(res.live_url ?? "") ? res.live_url : null;
+  out.push(link ? `Report: <${link}>` : `Report: none (${escHtml(res.live_url_missing ?? "the link the service sent is not a plain https URL")})`);
+  if (!folds) out.push("", `Failure scenarios left out: the summary would be over GitHub's size limit.${link ? " The report has them." : ""}`);
   const md = out.join("\n");
   return folds && Buffer.byteLength(md) > SUMMARY_MAX ? resultMarkdown(res, false) : md;
 }
