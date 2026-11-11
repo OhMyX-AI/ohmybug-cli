@@ -49,6 +49,40 @@ The CLI prints each finding (severity, file:line, title, failure scenario) and a
 | `OHMYBUG_TIMEOUT_S` | `1800` (`10800` with `--deep`) | how long to wait for the review, 30 to 86400 seconds |
 | `OHMYBUG_URL` | `https://mcp.ohmybug.ai` | the service |
 | `OHMYBUG_STORY` | `auto` | the `--story` value when the flag is not given |
+| `OHMYBUG_FORMAT` | `text` | the `--format` value when the flag is not given |
+
+## Output for scripts and CI summaries
+
+`--format` picks what goes to stdout; progress and notes always go to stderr, and the exit code is the same in every format.
+
+- `text` (the default): the findings for people, as before.
+- `json`: one object on one line, schema `ohmybug-cli/result/1`, printed on every exit, a refusal or a timeout included.
+- `markdown`: one block for a CI summary: a headline, a table of findings, each failure scenario under its own fold, the billing line and the report link.
+
+`--step-summary` also appends the markdown block to the file `$GITHUB_STEP_SUMMARY` names (GitHub Actions), whatever `--format` is. If the variable is unset or the file cannot be written, the run says so on stderr and its exit code does not change.
+
+```sh
+ohmybug --format json > ohmybug.json; code=$?
+jq -r '.findings[] | select(.blocking) | "\(.severity) \(.file):\(.line) \(.title)"' ohmybug.json
+exit $code
+```
+
+| JSON field | Meaning |
+|---|---|
+| `schema` | `ohmybug-cli/result/1` |
+| `cli_version` | this CLI's version |
+| `exit_code` | the run's exit code: 0 no medium or worse bug, 1 at least one, 2 could not run or cut short |
+| `outcome` | `clean`, `blocking`, `failed`, `cut_short`, `timed_out`, `interrupted` (started, then the run could not follow it to the end), `not_run`, `no_changes` |
+| `review` | `{id, status, deep, complete}`: `id` and `status` are null when nothing started; `complete` is true only for a review that finished its whole protocol |
+| `live_url` | the report link, or null |
+| `live_url_missing` | why `live_url` is null (for example, the key's live link setting is off), else null |
+| `billing` | `{tariff, charged_usd, paid_by, note}`: on CI billing `tariff` is `ci` and `charged_usd` what was charged; otherwise `tariff` is `confirm` and `charged_usd` null, since the charge comes when someone confirms a medium or worse finding as real, or at the billing deadline; null `tariff` when nothing started or no result was read |
+| `silent_bill` | null, or `{at, billed, note}` for a review with a billing deadline |
+| `findings` | most severe first, each `{id, severity, blocking, file, line, title, body, suggested_fix}`; `severity` in lower case, `unrated` when the service gave none; `blocking` is medium or worse or unrated; `body` is the failure scenario |
+| `counts` | `{total, blocking, critical, high, medium, low, unrated}` |
+| `error` | null, or `{code, message}` when the run stopped without a result: `code` is the service's error code when it refused, else null |
+
+Within `ohmybug-cli/result/1`, fields and values are only added, never renamed, removed or retyped: ignore fields you do not know, and treat an `outcome` you do not know by `exit_code`. A breaking change gets a new schema name.
 
 ## Feed stories
 

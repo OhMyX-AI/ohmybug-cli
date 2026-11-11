@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -898,4 +898,122 @@ test("a fast hunt of a pushed GitHub commit lets the service read the repository
       assert.equal(subs(s).length, 1);
     } finally { await s.close() }
   }
+});
+
+test("--format json: one object on stdout, the same exit code, every field present; text lines and logs stay off stdout", async () => {
+  const { dir, git } = repo();
+  writeFileSync(join(dir, "app.js"), "export const a = 61\n");
+  git("commit", "-qam", "c");
+  const med = { finding_id: "rev_test:f2", severity: "MEDIUM", file: "b.js", line: 2, title: "t2", failure_scenario: "s2", suggested_fix: "fix it" };
+  const odd = { severity: "", title: "no where" };
+  const s = await server({ findings: [low, med, high, odd] });
+  try {
+    const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url });
+    assert.equal(r.code, 1);
+    assert.equal(r.out.split("\n").length, 1, "one line");
+    const j = JSON.parse(r.out);
+    assert.deepEqual(Object.keys(j), ["schema", "cli_version", "exit_code", "outcome", "review", "live_url", "live_url_missing", "billing", "silent_bill", "findings", "counts", "error"]);
+    assert.equal(j.schema, "ohmybug-cli/result/1");
+    assert.equal(j.cli_version, VERSION);
+    assert.deepEqual([j.exit_code, j.outcome], [1, "blocking"]);
+    assert.deepEqual(j.review, { id: "rev_test", status: "done", deep: false, complete: true });
+    assert.deepEqual([j.live_url, j.live_url_missing], ["https://example.test/live/x", null]);
+    assert.deepEqual(j.billing.tariff, "confirm");
+    assert.equal(j.billing.charged_usd, null);
+    assert.equal(j.silent_bill, null);
+    assert.deepEqual(j.findings.map((f) => [f.severity, f.blocking]), [["high", true], ["medium", true], ["low", false], ["unrated", true]]);
+    assert.deepEqual(j.findings[1], { id: "rev_test:f2", severity: "medium", blocking: true, file: "b.js", line: 2, title: "t2", body: "s2", suggested_fix: "fix it" });
+    assert.deepEqual([j.findings[3].file, j.findings[3].line, j.findings[3].id], [null, null, null]);
+    assert.deepEqual(j.counts, { total: 4, blocking: 3, critical: 0, high: 1, medium: 1, low: 1, unrated: 1 });
+    assert.equal(j.error, null);
+    assert.doesNotMatch(r.out, /blocking bug\(s\)|Report:/);
+  } finally { await s.close() }
+  // CI billing and a silent bill are carried; no live link says why; OHMYBUG_FORMAT picks json.
+  const at = "2026-11-12T10:00:00.000Z";
+  const ci = await server({ findings: [low], extra: { live_url: undefined, billing: { tariff: "ci", charged_usd: 0, paid_by: "free review" }, silent_bill: { at } } });
+  try {
+    const j = JSON.parse((await cli(dir, [], { OHMYBUG_URL: ci.url, OHMYBUG_FORMAT: "json" })).out);
+    assert.deepEqual([j.exit_code, j.outcome], [0, "clean"]);
+    assert.deepEqual(j.billing, { tariff: "ci", charged_usd: 0, paid_by: "free review", note: "CI billing: charged when the result holds a medium or worse finding" });
+    assert.deepEqual([j.silent_bill.at, j.silent_bill.billed], [at, false]);
+    assert.match(j.silent_bill.note, /bills on its own at 2026-11-12T10:00:00.000Z/);
+    assert.equal(j.live_url, null);
+    assert.match(j.live_url_missing, /live link setting is off/);
+  } finally { await ci.close() }
+});
+
+test("--format json on every exit: not run, refused, timed out, cut short, failed, nothing to review", async () => {
+  const { dir, git } = repo();
+  const json = (r) => JSON.parse(r.out);
+  // Nothing to review: exit 0, no review.
+  let j = json(await cli(dir, ["--format=json"], { OHMYBUG_URL: "http://127.0.0.1:9" }));
+  assert.deepEqual([j.exit_code, j.outcome, j.review.id, j.billing.tariff], [0, "no_changes", null, null]);
+  writeFileSync(join(dir, "app.js"), "export const a = 62\n");
+  git("commit", "-qam", "c");
+  // Not run: a missing key, a bad setting.
+  j = json(await cli(dir, ["--format", "json"], { OHMYBUG_API_KEY: "" }));
+  assert.deepEqual([j.exit_code, j.outcome, j.review.status, j.live_url_missing], [2, "not_run", null, "nothing started"]);
+  assert.match(j.error.message, /OHMYBUG_API_KEY is not set/);
+  j = json(await cli(dir, ["--format", "json"], { OHMYBUG_TIMEOUT_S: "5" }));
+  assert.deepEqual([j.outcome, j.error.code], ["not_run", null]);
+  // Refused by the service: its code is kept.
+  let s = await server({ toolError: { error: "quota_exceeded", message: "no" } });
+  try {
+    j = json(await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url }));
+    assert.deepEqual([j.exit_code, j.outcome, j.error.code], [2, "not_run", "quota_exceeded"]);
+  } finally { await s.close() }
+  // Still running at the timeout: the id and the live page are kept.
+  s = await server({ status: "running" });
+  try {
+    j = json(await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: "30" }));
+    assert.deepEqual([j.exit_code, j.outcome, j.review.id, j.review.status, j.review.complete], [2, "timed_out", "rev_test", "running", false]);
+    assert.equal(j.billing.tariff, null);
+  } finally { await s.close() }
+  // Done but not of record and clean: cut short; failed: failed.
+  for (const [opts, outcome] of [[{ review_of_record: false }, "cut_short"], [{ status: "failed" }, "failed"]]) {
+    s = await server(opts);
+    try {
+      j = json(await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url }));
+      assert.deepEqual([j.exit_code, j.outcome, j.review.complete], [2, outcome, false]);
+    } finally { await s.close() }
+  }
+  // A bad format is refused before anything runs, with nothing on stdout.
+  for (const [argv, env] of [[["--format", "yaml"], {}], [[], { OHMYBUG_FORMAT: "xml" }]]) {
+    const r = await cli(dir, argv, { OHMYBUG_URL: "http://127.0.0.1:9", ...env });
+    assert.deepEqual([r.code, r.out], [2, ""]);
+  }
+});
+
+test("--format markdown and --step-summary: one block, server text escaped, the file appended; text output unchanged", async () => {
+  const { dir, git } = repo();
+  writeFileSync(join(dir, "app.js"), "export const a = 63\n");
+  git("commit", "-qam", "c");
+  const evil = { severity: "high", file: "a|b.js", line: 1, title: "<img src=x onerror=alert(1)> | `x`\nnext", failure_scenario: "</pre><script>bad()</script>\nline two" };
+  const s = await server({ findings: [evil, low] });
+  try {
+    const r = await cli(dir, ["--format", "markdown"], { OHMYBUG_URL: s.url });
+    assert.equal(r.code, 1);
+    assert.match(r.out, /^### OhMyBug review: 1 blocking bug\n/);
+    assert.match(r.out, /\| HIGH \| a\\\|b\.js:1 \| &lt;img src=x onerror=alert\(1\)&gt; \\\| \\`x\\` next \|/);
+    assert.match(r.out, /<pre>&lt;\/pre&gt;&lt;script&gt;bad\(\)&lt;\/script&gt;\nline two<\/pre>/);
+    assert.doesNotMatch(r.out, /<img|<script|<\/pre><script/);
+    assert.match(r.out, /Billing: charged only when someone confirms/);
+    assert.match(r.out, /Report: https:\/\/example\.test\/live\/x$/);
+    // --step-summary with text: stdout is the text output as before, the block goes to the file, appended.
+    const file = join(mkdtempSync(join(tmpdir(), "ombsum-")), "summary.md");
+    writeFileSync(file, "earlier\n");
+    const t = await cli(dir, ["--step-summary"], { OHMYBUG_URL: s.url, GITHUB_STEP_SUMMARY: file });
+    assert.equal(t.code, 1);
+    assert.match(t.out, /HIGH {2}a\|b\.js:1/);
+    assert.doesNotMatch(t.out, /### OhMyBug/);
+    const written = readFileSync(file, "utf8");
+    assert.match(written, /^earlier\n### OhMyBug review: 1 blocking bug\n/);
+    // Unset or unwritable: one stderr line, the exit code is the review's.
+    const u = await cli(dir, ["--step-summary"], { OHMYBUG_URL: s.url });
+    assert.equal(u.code, 1);
+    assert.match(u.log, /GITHUB_STEP_SUMMARY is not set/);
+    const w = await cli(dir, ["--step-summary"], { OHMYBUG_URL: s.url, GITHUB_STEP_SUMMARY: join(tmpdir(), "no-such-dir-omb", "x.md") });
+    assert.equal(w.code, 1);
+    assert.match(w.log, /could not write/);
+  } finally { await s.close() }
 });

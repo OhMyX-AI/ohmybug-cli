@@ -3,12 +3,12 @@
 // One file, no dependencies, Node 18+. Exit 0: no medium or worse bug. 1: at least one. 2: the review could not run,
 // or was cut short with no medium or worse bug.
 import { execFileSync } from "node:child_process";
-import { copyFileSync, realpathSync, rmSync } from "node:fs";
+import { appendFileSync, copyFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-export const VERSION = "0.5.1";
+export const VERSION = "0.6.0";
 const USAGE = `ohmybug ${VERSION}: review this repository's changes with OhMyBug.
 
 Usage:
@@ -16,6 +16,10 @@ Usage:
   ohmybug --uncommitted      review the working tree against HEAD, untracked files included
   ohmybug --deep [--base <branch>]  the deep hunt of the pushed HEAD commit (GitHub only): the service reads the
                              whole repository; up to 2 hours, so OHMYBUG_TIMEOUT_S defaults to 10800
+  --format text|markdown|json  what goes to stdout: text (default, for people), markdown (a block for a CI summary)
+                             or json (one object, schema ohmybug-cli/result/1, for scripts); json and markdown are printed
+                             on every exit, and progress stays on stderr
+  --step-summary             also append the markdown block to the file $GITHUB_STEP_SUMMARY names (GitHub Actions)
   --story auto|private|never  the feed story of this hunt: auto (default) leaves it to the account and key
                              settings; private keeps any story private; never drafts and posts none
 
@@ -31,6 +35,7 @@ Environment:
   OHMYBUG_URL         default https://mcp.ohmybug.ai
   OHMYBUG_TIMEOUT_S   how long to wait for the review, 30 to 86400 seconds, default 1800 (10800 with --deep)
   OHMYBUG_STORY       the --story value when the flag is not given
+  OHMYBUG_FORMAT      the --format value when the flag is not given
 
 Behind a proxy: Node's fetch reads HTTPS_PROXY only with NODE_USE_ENV_PROXY=1 (Node 22.21+, 24+).
 
@@ -52,6 +57,8 @@ const MAX_TREE = 1024 * 1024;
 const DIFF_FLAGS = ["--no-color", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/"];
 const TRANSIENT_TOOL = new Set(["internal", "rate_limited"]);
 const STORY = new Set(["auto", "private", "never"]);
+const FORMATS = new Set(["text", "markdown", "json"]);
+export const RESULT_SCHEMA = "ohmybug-cli/result/1";
 
 /** A run that cannot go on; `code` is the service's error code when the service refused. */
 export class Refusal extends Error { constructor(message, code) { super(message); this.code = code; } }
@@ -68,6 +75,12 @@ export function parseArgs(argv) {
     else if (a === "--version") o.version = true;
     else if (a === "--base") { if (!argv[i + 1] || argv[i + 1].startsWith("-")) return "--base needs a ref"; o.base = argv[++i]; }
     else if (a.startsWith("--base=")) { if (!a.slice(7)) return "--base needs a ref"; o.base = a.slice(7); }
+    else if (a === "--step-summary") o.stepSummary = true;
+    else if (a === "--format" || a.startsWith("--format=")) {
+      const v = a === "--format" ? argv[++i] : a.slice(9);
+      if (!FORMATS.has(v)) return "--format needs text, markdown or json";
+      o.format = v;
+    }
     else if (a === "--story" || a.startsWith("--story=")) {
       const v = a === "--story" ? argv[++i] : a.slice(8);
       if (!STORY.has(v)) return "--story needs auto, private or never";
@@ -237,6 +250,79 @@ export function formatFindings(findings) {
   }).join("\n\n");
 }
 
+const SEVERITIES = ["critical", "high", "medium", "low", "unrated"];
+const severityOf = (f) => { const s = String(f?.severity ?? "").toLowerCase(); return s ? s : "unrated"; };
+const strOrNull = (v) => (typeof v === "string" && v ? v : null);
+
+/**
+ * The run as one object (schema ohmybug-cli/result/1): fields are only ever added within /1. `rec` is what the run
+ * saw: reviewId, deep, live, answer (the last done/failed body), error, timedOut, noChanges.
+ */
+export function resultOf(rec, code) {
+  const r = rec.answer;
+  const findings = [...(r?.findings ?? []).filter((f) => f && typeof f === "object")].sort((a, b) => rankOf(a) - rankOf(b)).map((f) => ({
+    id: strOrNull(f.finding_id ?? f.id), severity: severityOf(f), blocking: isBlocking(f),
+    file: strOrNull(f.file), line: Number.isInteger(f.line) ? f.line : null, title: String(f.title ?? ""),
+    body: String(f.failure_scenario ?? ""), suggested_fix: strOrNull(f.suggested_fix),
+  }));
+  const counts = { total: findings.length, blocking: findings.filter((f) => f.blocking).length };
+  for (const s of SEVERITIES) counts[s] = 0;
+  for (const f of findings) counts[SEVERITIES.includes(f.severity) ? f.severity : "unrated"]++;
+  const outcome = rec.noChanges ? "no_changes" : !rec.reviewId ? "not_run" : rec.timedOut ? "timed_out"
+    : !r ? "interrupted" : r.status === "failed" ? "failed" : code === 1 ? "blocking" : code === 0 ? "clean" : "cut_short";
+  const live = strOrNull(r?.live_url) ?? strOrNull(rec.live);
+  const b = r?.billing && typeof r.billing === "object" ? r.billing : null;
+  const billing = !rec.reviewId ? { tariff: null, charged_usd: null, paid_by: null, note: "nothing started, nothing charged" }
+    : b ? { tariff: strOrNull(b.tariff) ?? "ci", charged_usd: Number(b.charged_usd ?? 0) || 0, paid_by: strOrNull(b.paid_by),
+      note: "CI billing: charged when the result holds a medium or worse finding" }
+    : r ? { tariff: "confirm", charged_usd: null, paid_by: null,
+      note: "charged only when someone confirms a medium or worse finding as REAL, or at the billing deadline (silent_bill)" }
+    : { tariff: null, charged_usd: null, paid_by: null, note: "no result was read, so the charge is not known here" };
+  const sb = r?.silent_bill && typeof r.silent_bill === "object" ? r.silent_bill : null;
+  return {
+    schema: RESULT_SCHEMA, cli_version: VERSION, exit_code: code, outcome,
+    review: { id: rec.reviewId ?? null, status: r ? String(r.status) : rec.reviewId ? "running" : null, deep: !!rec.deep,
+      complete: r ? r.review_of_record !== false && r.status === "done" : false },
+    live_url: live,
+    live_url_missing: live ? null : !rec.reviewId ? "nothing started"
+      : "the service sent no live link: the key's live link setting is off (app.ohmybug.ai/me), or it was not read",
+    billing,
+    silent_bill: sb ? { at: typeof sb.at === "string" && ISO_UTC.test(sb.at) ? sb.at : null, billed: sb.billed === true, note: silentBillLine(sb) } : null,
+    findings, counts,
+    error: rec.error ?? null,
+  };
+}
+
+// Server text in a step summary is data: HTML is escaped, and a table cell keeps to one line and its own column.
+const escHtml = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+const cell = (s) => escHtml(s).replace(/[\r\n]+/g, " ").replace(/\|/g, "\\|").replace(/`/g, "\\`");
+const HEADLINE = {
+  clean: "No blocking bugs", failed: "The review failed", cut_short: "Cut short, no blocking bug found: not a clean result",
+  timed_out: "Timed out before a result", interrupted: "Stopped before a result", not_run: "Could not run", no_changes: "Nothing to review",
+};
+
+/** The markdown block for a CI summary, from resultOf's object. */
+export function resultMarkdown(res) {
+  const head = res.outcome === "blocking" ? `${res.counts.blocking} blocking bug${res.counts.blocking === 1 ? "" : "s"}` : HEADLINE[res.outcome] ?? res.outcome;
+  const out = [`### OhMyBug review: ${head}`, ""];
+  const where = (f) => (f.file ? (f.line ? `${f.file}:${f.line}` : f.file) : "");
+  if (res.findings.length) {
+    out.push("| Severity | Location | Finding |", "|---|---|---|");
+    for (const f of res.findings) out.push(`| ${f.severity.toUpperCase()} | ${cell(where(f))} | ${cell(f.title)} |`);
+    out.push("");
+    for (const f of res.findings) {
+      out.push(`<details><summary>${escHtml(`${f.severity.toUpperCase()} ${where(f)}: ${f.title}`.replace(/[\r\n]+/g, " "))}</summary>`, "");
+      out.push(`<pre>${escHtml(f.body)}</pre>`, "", "</details>", "");
+    }
+  }
+  if (res.error) out.push(escHtml(res.error.message), "");
+  const b = res.billing;
+  const bill = b.tariff === "ci" ? `$${b.charged_usd} charged (CI billing${b.paid_by ? `, ${escHtml(b.paid_by)}` : ""})` : escHtml(b.note);
+  out.push(`Billing: ${bill}.${res.silent_bill ? ` ${escHtml(res.silent_bill.note)}.` : ""}`);
+  out.push(res.live_url ? `Report: ${escHtml(res.live_url)}` : `Report: none (${escHtml(res.live_url_missing)})`);
+  return out.join("\n");
+}
+
 /** Context files dropped from the end until the JSON body (escaping and meta included) fits the server's cap. */
 export function fitBody(body, max = MAX_BODY) {
   const files = [...body.files];
@@ -303,21 +389,39 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
   if (typeof opts === "string") { log(opts); log("see ohmybug --help"); return 2; }
   if (opts.help) { out(USAGE); return 0; }
   if (opts.version) { out(VERSION); return 0; }
-  if (!env.OHMYBUG_API_KEY) { log("OHMYBUG_API_KEY is not set: create a key at https://app.ohmybug.ai/me"); return 2; }
+  const format = opts.format ?? (env.OHMYBUG_FORMAT || "text");
+  if (!FORMATS.has(format)) { log(`OHMYBUG_FORMAT must be text, markdown or json, not ${env.OHMYBUG_FORMAT}`); return 2; }
+  const rec = { deep: opts.deep };
+  // The text lines go to stdout only in text; the other formats print the one result below.
+  const code = await review({ opts, env, cwd, out: format === "text" ? out : () => {}, log, rec });
+  const res = format === "text" && !opts.stepSummary ? null : resultOf(rec, code);
+  if (format === "json") out(JSON.stringify(res));
+  if (format === "markdown") out(resultMarkdown(res));
+  if (opts.stepSummary) {
+    if (!env.GITHUB_STEP_SUMMARY) log("--step-summary: GITHUB_STEP_SUMMARY is not set, so no summary was written");
+    else try { appendFileSync(env.GITHUB_STEP_SUMMARY, resultMarkdown(res) + "\n"); }
+    catch (e) { log(`--step-summary: could not write ${env.GITHUB_STEP_SUMMARY} (${e.code ?? e.message})`); }
+  }
+  return code;
+}
+
+async function review({ opts, env, cwd, out, log, rec }) {
+  // A run that stops before a hunt says why in the result too.
+  const fail = (message) => { log(message); rec.error = { code: null, message }; return 2; };
+  if (!env.OHMYBUG_API_KEY) return fail("OHMYBUG_API_KEY is not set: create a key at https://app.ohmybug.ai/me");
   // Under 30 s no poll fits before the deadline: refused before a paid hunt starts.
   const story = opts.story ?? (env.OHMYBUG_STORY || "auto");
-  if (!STORY.has(story)) { log(`OHMYBUG_STORY must be auto, private or never, not ${env.OHMYBUG_STORY}`); return 2; }
+  if (!STORY.has(story)) return fail(`OHMYBUG_STORY must be auto, private or never, not ${env.OHMYBUG_STORY}`);
   // Sent only to narrow: an absent meta.story is the account's and key's settings alone.
   const storyMeta = story === "auto" ? {} : { story };
   const timeoutS = Number(env.OHMYBUG_TIMEOUT_S || (opts.deep ? 10800 : 1800));
-  if (!Number.isInteger(timeoutS) || timeoutS < 30 || timeoutS > 86400) { log(`OHMYBUG_TIMEOUT_S must be whole seconds from 30 to 86400, not ${env.OHMYBUG_TIMEOUT_S}`); return 2; }
+  if (!Number.isInteger(timeoutS) || timeoutS < 30 || timeoutS > 86400) return fail(`OHMYBUG_TIMEOUT_S must be whole seconds from 30 to 86400, not ${env.OHMYBUG_TIMEOUT_S}`);
   const api = (env.OHMYBUG_URL || "https://mcp.ohmybug.ai").replace(/\/$/, "");
   // The key and the code travel in this request: https, or plain http to this machine only (a local test server).
   let apiUrl;
-  try { apiUrl = new URL(api); } catch { log(`OHMYBUG_URL is not a URL: ${api}`); return 2; }
+  try { apiUrl = new URL(api); } catch { return fail(`OHMYBUG_URL is not a URL: ${api}`); }
   if (apiUrl.protocol !== "https:" && !(apiUrl.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(apiUrl.hostname))) {
-    log(`OHMYBUG_URL must be https (plain http only to this machine): ${api}`);
-    return 2;
+    return fail(`OHMYBUG_URL must be https (plain http only to this machine): ${api}`);
   }
   const deadline = Date.now() + timeoutS * 1000;
   const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, Math.min(ms, deadline - Date.now()))));
@@ -445,7 +549,7 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
       if (timeoutS < 7200) log("a deep hunt takes up to 2 hours: OHMYBUG_TIMEOUT_S under 7200 may end the wait before the result");
     } else {
       const change = selectChange(opts, env, git, () => snapshotTree(git, (extra, ...a) => execGit(root, a, extra).toString(), root));
-      if (!change.diff.trim()) { out(`Nothing to review: no changes against ${change.base}.`); return 0; }
+      if (!change.diff.trim()) { out(`Nothing to review: no changes against ${change.base}.`); rec.noChanges = true; return 0; }
       read = fileReader(change, gitBuf);
       // The reviewers can ask for any file by path; without the list they cannot name a caller to ask for.
       let listing = change.all.join("\n");
@@ -491,6 +595,8 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
     }
     if (!sub.review_id) throw new Refusal(`submit_review answered without a review id: ${JSON.stringify(sub).slice(0, 300)}. ${MAYBE_STARTED}`);
     started = sub;
+    rec.reviewId = sub.review_id;
+    rec.live = sub.live_url;
     log(`review ${sub.review_id} started${sub.recent_median_minutes ? `; recent ones took about ${sub.recent_median_minutes} min` : ""}`);
     if (sub.live_url) log(`live progress: ${sub.live_url}`);
 
@@ -506,6 +612,7 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
       if (r.status === "done" || r.status === "failed") {
         const findings = (r.findings ?? []).filter((f) => f && typeof f === "object");
         const code = exitCodeFor({ ...r, findings });
+        rec.answer = { ...r, findings };
         if (r.status === "failed") log(`the review failed: ${String(r.error ?? r.summary ?? "no reason given").slice(0, 300)}`);
         else if (findings.length) out(formatFindings(findings));
         else out(code === 2 ? "No bugs found before the review was cut short." : "No bugs found.");
@@ -528,9 +635,11 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
       if (!r.timed_out) await sleep(5000);
     }
   } catch (e) {
-    if (e instanceof Refusal) log(`could not review: ${e.message}`);
-    else if (e instanceof Deadline) log(`could not review: no result within OHMYBUG_TIMEOUT_S (${timeoutS}s)`);
-    else log(`could not review: ${e.message ?? e}`);
+    const message = e instanceof Refusal ? `could not review: ${e.message}`
+      : e instanceof Deadline ? `could not review: no result within OHMYBUG_TIMEOUT_S (${timeoutS}s)` : `could not review: ${e.message ?? e}`;
+    log(message);
+    rec.error = { code: e instanceof Refusal && typeof e.code === "string" ? e.code : null, message };
+    rec.timedOut = e instanceof Deadline;
     if (started) log(`review ${started.review_id} may still be running${started.live_url ? `: ${started.live_url}` : ""}`);
     return 2;
   }
