@@ -34,7 +34,7 @@ function repo() {
  * makes the first wait_review a file request whose answer lands in `posted`; `sse` answers as an event stream;
  * `submitStatus` fails submit_review with that HTTP status; `toolError` answers every tool call with isError;
  * `faults` fails the first call of a tool: { wait_review: 503 | "reset" | "garble" | "internal" | "rate_limited" |
- * "slow429" (a 429 asking for 15 s) | a URL (a 307 there) | { error, message } (that tool error) };
+ * "slow429" (a 429 asking for 15 s) | a URL (a 307 there) | { error, message } (that tool error) | a list of these, one per call };
  * `filesStatus` answers the file upload with that status, or with each of a list in turn (a 307 goes to
  * `filesLocation`); `filesUrl` replaces the
  * file request's address; `requestedAgain` makes the second wait_review a second request at the same address.
@@ -56,9 +56,10 @@ async function server({ findings = [], status = "done", review_of_record = true,
       const { name, arguments: args } = msg.params;
       calls.push({ name, args, auth: req.headers.authorization });
       if (name === "submit_review" && submitStatus) { res.writeHead(submitStatus); return res.end("boom"); }
-      let fault = faults[name];
+      // A list fails the calls of that tool in turn (null lets one through).
+      let fault = Array.isArray(faults[name]) ? faults[name].shift() : faults[name];
+      if (!Array.isArray(faults[name]) || !faults[name].length) delete faults[name];
       if (fault) {
-        delete faults[name];
         if (fault === "internal" || fault === "rate_limited" || typeof fault === "object") {
           res.writeHead(200, { "content-type": "application/json" });
           return res.end(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { isError: true, content: [{ type: "text", text: JSON.stringify(typeof fault === "object" ? fault : { error: fault, message: "blip" }) }] } }));
@@ -648,8 +649,8 @@ test("--deep sends the pushed commit's coordinates and no payload; refuses what 
   // Refused before any call: no GitHub repository, a remote that only mentions github.com, an unpushed HEAD,
   // GitHub Enterprise, a base that is not a branch name.
   for (const [setup, env, argv, why] of [
-    [() => {}, {}, [], /--deep needs a pushed commit on GitHub: no GitHub repository/],
-    [() => git("remote", "add", "origin", "https://git.example.com/github.com/acme/app.git"), {}, [], /--deep needs a pushed commit on GitHub: no GitHub repository/],
+    [() => {}, {}, [], /--deep cannot run: no GitHub repository/],
+    [() => git("remote", "add", "origin", "https://git.example.com/github.com/acme/app.git"), {}, [], /--deep cannot run: no GitHub repository/],
     [() => git("remote", "set-url", "origin", "git@github.com:acme/app.git"), {}, [], /push it first/],
     [() => git("update-ref", "refs/remotes/fork/feature", "HEAD"), { GITHUB_SHA: "0".repeat(40) }, [], /push it first/],
     [() => git("update-ref", "refs/remotes/origin/feature", "HEAD"), { GITHUB_SERVER_URL: "https://ghe.example.com" }, [], /not on https:\/\/ghe/],
@@ -802,16 +803,30 @@ test("a fast hunt of a pushed GitHub commit lets the service read the repository
   const head = git("rev-parse", "HEAD").trim();
   const subs = (s) => s.calls.filter((c) => c.name === "submit_review").map((c) => c.args);
   // No target: one request with the diff, and the reason on the log.
-  for (const [setup, argv, why] of [
+  for (const [setup, argv, why, env = {}] of [
     [() => {}, [], /diff only, with one engine: no GitHub repository/],
     [() => git("remote", "add", "origin", "git@github.com:acme/app.git"), [], /diff only, with one engine: HEAD is not pushed/],
     [() => git("update-ref", "refs/remotes/origin/feature", "HEAD"), ["--base", "HEAD~1"], /diff only, with one engine: the base HEAD~1 is not a branch name/],
+    [() => {}, ["--base", git("rev-parse", "HEAD~1").trim()], /diff only, with one engine: the base [0-9a-f]{40} is not a branch name/],
+    // Another remote's branch, a local branch with no origin twin, an origin branch whose local copy moved: GitHub's
+    // branch of that name is not the base diffed here.
+    [() => git("update-ref", "refs/remotes/upstream/main", "HEAD~1"), ["--base", "upstream/main"], /the base upstream\/main is not an origin branch at the commit diffed here/],
+    [() => git("branch", "dev", "HEAD~1"), ["--base", "dev"], /the base dev is not an origin branch/],
+    [() => git("branch", "develop", "HEAD~1"), ["--base", "develop", "--story", "never"], null],
+    [() => {}, ["--base", "refs/heads/dev"], /the base refs\/heads\/dev is not an origin branch/],
+    [() => {}, [], /diff only, with one engine: the service reads repositories on github.com, not on https:\/\/ghe/, { GITHUB_SERVER_URL: "https://ghe.example.com" }],
     [() => writeFileSync(join(dir, "app.js"), "export const a = 42\n"), ["--uncommitted"], /diff only, with one engine: --uncommitted/],
   ]) {
     setup();
     const s = await server();
     try {
-      const r = await cli(dir, argv, { OHMYBUG_URL: s.url });
+      const r = await cli(dir, argv, { OHMYBUG_URL: s.url, ...env });
+      if (!why) {
+        // origin/develop and the local develop are the same commit: the repository path, the story choice with it.
+        assert.equal(r.code, 0, r.log);
+        assert.deepEqual([subs(s)[0].diff, subs(s)[0].meta.base_branch, subs(s)[0].meta.story], ["", "develop", "never"]);
+        continue;
+      }
       assert.equal(r.code, 0, r.log);
       assert.match(r.log, why);
       assert.equal(subs(s).length, 1);
@@ -829,7 +844,7 @@ test("a fast hunt of a pushed GitHub commit lets the service read the repository
     assert.equal(subs(s).length, 1);
     assert.equal(sub.diff, "");
     assert.deepEqual([sub.meta.repo, sub.meta.ref, sub.meta.base_branch, sub.meta.branch], ["acme/app", head, "main", "feature"]);
-    assert.equal(sub.files[0].path, ".review-client/tree.txt");
+    assert.deepEqual(sub.files.map((f) => f.path), [".review-client/tree.txt", "app.js"]);
     assert.match(r.log, new RegExp(`the service reads acme/app at ${head.slice(0, 12)} against main from GitHub`));
   } finally { await s.close() }
   // A refused read: the same hunt again with the diff, said on the log; the App hint only where it helps.
@@ -844,10 +859,36 @@ test("a fast hunt of a pushed GitHub commit lets the service read the repository
       assert.match(second.diff, /^diff --git a\/app\.js/);
       assert.equal(second.meta.repo, undefined);
       assert.deepEqual(second.files, first.files);
-      assert.match(r.log, new RegExp(`did not read acme/app \\(${code}\\): reviewing the diff only, with one engine`));
+      assert.match(r.log, new RegExp(`did not take the change from GitHub \\(${code}\\): reviewing the diff only, with one engine`));
       assert.equal(/GitHub App installed/.test(r.log), code === "diff_required");
     } finally { await s.close() }
   }
+  // The resend is the paid call too: no clear answer on it is not sent a third time.
+  const resent = await server({ faults: { submit_review: [{ error: "diff_required", message: "no" }, "reset"] } });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: resent.url });
+    assert.equal(r.code, 2, r.log);
+    assert.equal(subs(resent).length, 2);
+    assert.match(r.log, /not sent again/);
+  } finally { await resent.close() }
+  // A diff over the cap: the repository path never trims or refuses it; the diff path still does.
+  writeFileSync(join(dir, "big.txt"), "x".repeat(10 * 1024 * 1024) + "\n");
+  git("add", "big.txt");
+  git("commit", "-qm", "big");
+  git("update-ref", "refs/remotes/origin/feature", "HEAD");
+  for (const fallback of [false, true]) {
+    const s = await server(fallback ? { faults: { submit_review: { error: "diff_required", message: "no" } } } : {});
+    try {
+      const r = await cli(dir, [], { OHMYBUG_URL: s.url });
+      assert.equal(r.code, 0, r.log);
+      assert.equal(subs(s).length, fallback ? 2 : 1);
+      assert.equal(subs(s)[0].diff, "");
+      assert.equal(/diff trimmed: left out 1 file/.test(r.log), fallback);
+      if (fallback) assert.ok(!subs(s)[1].diff.includes("big.txt") && subs(s)[1].diff.includes("app.js"));
+    } finally { await s.close() }
+  }
+  git("reset", "-q", "--hard", "HEAD~1");
+  git("update-ref", "refs/remotes/origin/feature", "HEAD");
   // Any other refusal, or no clear answer, is not sent again.
   for (const fault of [{ error: "commit_required", message: "no" }, "internal", "reset"]) {
     const s = await server({ faults: { submit_review: fault } });

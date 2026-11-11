@@ -19,8 +19,9 @@ Usage:
   --story auto|private|never  the feed story of this hunt: auto (default) leaves it to the account and key
                              settings; private keeps any story private; never drafts and posts none
 
-A pushed HEAD of a github.com repository is read by the service from GitHub (public, or with the OhMyBug
-GitHub App installed), which runs the full fast hunt; otherwise the diff is sent and one engine reviews it.
+Without --uncommitted, a pushed HEAD of a github.com repository whose base is an origin branch (at the same commit
+here) is read by the service from GitHub (public, or with the OhMyBug GitHub App installed), which runs the full fast
+hunt; otherwise, or when the service does not take it from GitHub, the diff is sent and one engine reviews it.
 
 The base is --base, else $CI_MERGE_REQUEST_TARGET_BRANCH_NAME (GitLab merge request pipelines),
 else origin/main. With --deep it is a branch name: --base, else $GITHUB_BASE_REF, else main.
@@ -200,7 +201,7 @@ function contextPaths(changed, all, git, rev) {
   return [...changed, ...roots, ...[...hits].sort((a, b) => b[1] - a[1]).map(([p]) => p)];
 }
 
-/** What the CI says about the change, as the server's optional labels; never repo or ref, so the server reads no host (only --deep adds them, deepTarget). */
+/** What the CI says about the change, as the server's optional labels; never repo or ref: those come only from repoTarget, on a pushed GitHub commit. */
 export function ciMeta(env, git) {
   const cut = (v, n) => (typeof v === "string" ? v.slice(0, n).trim() : "");
   let branch = cut(env.CI_MERGE_REQUEST_SOURCE_BRANCH_NAME || env.CI_COMMIT_REF_NAME || env.BITBUCKET_BRANCH, 200);
@@ -257,9 +258,11 @@ export function rpcMessage(text) {
  * Where the service finds the change on GitHub, read from git and the environment only (no local diff: a shallow CI
  * clone has no base): the github.com repository (the origin remote, which is the checkout's own, else
  * GITHUB_REPOSITORY), the pushed HEAD commit and the base branch. `{ repo, ref, base_branch }`, or `{ why }` when
- * there is none. The service reads a public repository, or one with the OhMyBug GitHub App installed.
+ * there is none. The service reads a public repository, or one with the OhMyBug GitHub App installed. With `local`
+ * (the fast hunt, whose diff was made here) the base must be an origin branch at the very commit the local diff used:
+ * the service diffs the branch of that name on GitHub, and another tip is another range.
  */
-export function repoTarget(env, git, base) {
+export function repoTarget(env, git, base, local = false) {
   const server = env.GITHUB_SERVER_URL;
   if (server && !/^https:\/\/github\.com\/?$/.test(server)) return { why: `the service reads repositories on github.com, not on ${server}` };
   let url = "";
@@ -273,13 +276,21 @@ export function repoTarget(env, git, base) {
   const branch = base.replace(/^(refs\/remotes\/)?origin\//, "");
   // A sha or an expression is not sent: the service keys the commit and its deep hunt on a branch name.
   if (/^[0-9a-f]{7,40}$/i.test(branch) || /[~^:\s]|\.\./.test(branch)) return { why: `the base ${base} is not a branch name` };
+  if (local) {
+    const at = (r) => { try { return git("rev-parse", "--verify", "--quiet", `${r}^{commit}`).trim(); } catch { return ""; } };
+    const name = base.replace(/^refs\/remotes\/origin\//, "").replace(/^origin\//, "");
+    if (name === "HEAD" || !at(`refs/remotes/origin/${name}`) || at(`refs/remotes/origin/${name}`) !== at(base)) {
+      return { why: `the base ${base} is not an origin branch at the commit diffed here` };
+    }
+    return { repo, ref, base_branch: name };
+  }
   return { repo, ref, base_branch: branch };
 }
 
 /** The deep hunt's target: repoTarget with the base --base, else $GITHUB_BASE_REF, else main; none is a refusal. */
 export function deepTarget(opts, env, git) {
   const t = repoTarget(env, git, opts.base || env.GITHUB_BASE_REF || "main");
-  if (t.why) throw new Refusal(`--deep needs a pushed commit on GitHub: ${t.why}`);
+  if (t.why) throw new Refusal(`--deep cannot run: ${t.why}`);
   return t;
 }
 
@@ -436,7 +447,6 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
       const change = selectChange(opts, env, git, () => snapshotTree(git, (extra, ...a) => execGit(root, a, extra).toString(), root));
       if (!change.diff.trim()) { out(`Nothing to review: no changes against ${change.base}.`); return 0; }
       read = fileReader(change, gitBuf);
-      const diff = trimDiff(change.diff, log);
       // The reviewers can ask for any file by path; without the list they cannot name a caller to ask for.
       let listing = change.all.join("\n");
       if (Buffer.byteLength(listing) > MAX_TREE) {
@@ -444,25 +454,30 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
         listing = `${listing.slice(0, listing.lastIndexOf("\n"))}\n# (list cut at ${MAX_TREE} bytes)`;
       }
       const tree = { path: ".review-client/tree.txt", content: `# Every file path in this repository at the reviewed head, one per line. Sent by the review client; request any of them.\n${listing}\n` };
-      // Raw and escaped: a quote- or tab-heavy diff can pass the first and not the second. fitBody never drops the
-      // listing, so the diff and the listing together, escaped, leave room for meta (8 KB at most).
-      if (Buffer.byteLength(diff) > MAX_BYTES || Buffer.byteLength(JSON.stringify(diff)) + Buffer.byteLength(JSON.stringify(tree.content)) > MAX_BODY - 64 * 1024) {
-        throw new Refusal(`the diff (${Buffer.byteLength(diff)} bytes) and the file list are over what the service takes once encoded: ${opts.uncommitted ? "commit part of it and review" : "review"} a smaller range with --base`);
-      }
       const meta = { ...ciMeta(env, git), ...storyMeta };
-      const files = [tree, ...pack(read, contextPaths(change.changed, change.all, git, change.rev), MAX_FILES - 1, MAX_BYTES - Buffer.byteLength(diff) - Buffer.byteLength(tree.content))];
-      const payload = () => fitBody({ diff, files, ...(Object.keys(meta).length ? { meta } : {}) });
+      const context = contextPaths(change.changed, change.all, git, change.rev);
+      const files = (budget) => [tree, ...pack(read, context, MAX_FILES - 1, budget - Buffer.byteLength(tree.content))];
+      // The diff is trimmed and its size checked only when it is sent: with the repository the service reads the change itself.
+      const payload = () => {
+        const diff = trimDiff(change.diff, log);
+        // Raw and escaped: a quote- or tab-heavy diff can pass the first and not the second. fitBody never drops the
+        // listing, so the diff and the listing together, escaped, leave room for meta (8 KB at most).
+        if (Buffer.byteLength(diff) > MAX_BYTES || Buffer.byteLength(JSON.stringify(diff)) + Buffer.byteLength(JSON.stringify(tree.content)) > MAX_BODY - 64 * 1024) {
+          throw new Refusal(`the diff (${Buffer.byteLength(diff)} bytes) and the file list are over what the service takes once encoded: ${opts.uncommitted ? "commit part of it and review" : "review"} a smaller range with --base`);
+        }
+        return fitBody({ diff, files: files(MAX_BYTES - Buffer.byteLength(diff)), ...(Object.keys(meta).length ? { meta } : {}) });
+      };
       log(`reviewing ${change.changed.length} changed file(s) against ${change.base}`);
       // With the repository the service runs the full fast hunt; with the diff alone, one engine.
-      const target = opts.uncommitted ? { why: "--uncommitted reviews the working tree, which only this machine has" } : repoTarget(env, git, change.base);
+      const target = opts.uncommitted ? { why: "--uncommitted reviews the working tree, which only this machine has" } : repoTarget(env, git, change.base, true);
       if (target.why) {
         log(`reviewing the diff only, with one engine: ${target.why}`);
         args = payload();
       } else {
         log(`the service reads ${target.repo} at ${target.ref.slice(0, 12)} against ${target.base_branch} from GitHub`);
-        args = fitBody({ diff: "", files, meta: { ...meta, ...target } });
+        args = fitBody({ diff: "", files: files(MAX_BYTES), meta: { ...meta, ...target } });
         fallback = (code) => {
-          log(`the service did not read ${target.repo} (${code}): reviewing the diff only, with one engine${code === "diff_required" ? "; the OhMyBug GitHub App installed on it (read-only) gives the full fast hunt" : ""}`);
+          log(`the service did not take the change from GitHub (${code}): reviewing the diff only, with one engine${code === "diff_required" ? "; the OhMyBug GitHub App installed on the repository (read-only) gives the full fast hunt" : ""}`);
           return payload();
         };
       }
