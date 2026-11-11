@@ -37,9 +37,9 @@ function repo() {
  * "slow429" (a 429 asking for 15 s) | a URL (a 307 there) | { error, message } (that tool error) | a list of these, one per call };
  * `filesStatus` answers the file upload with that status, or with each of a list in turn (a 307 goes to
  * `filesLocation`); `filesUrl` replaces the
- * file request's address; `requestedAgain` makes the second wait_review a second request at the same address.
+ * file request's address; `submitExtra` adds fields to the submit answer; `requestedAgain` makes the second wait_review a second request at the same address.
  */
-async function server({ findings = [], status = "done", review_of_record = true, httpStatus = 200, requested, requestedAgain, sse = false, submitStatus, toolError, faults = {}, filesStatus = 200, filesUrl, filesLocation, extra = {} } = {}, port = 0) {
+async function server({ findings = [], status = "done", review_of_record = true, httpStatus = 200, requested, requestedAgain, sse = false, submitStatus, toolError, faults = {}, filesStatus = 200, filesUrl, filesLocation, extra = {}, submitExtra = {} } = {}, port = 0) {
   const calls = [], posted = [];
   let url, asks = 0;
   const srv = createServer((req, res) => {
@@ -78,7 +78,7 @@ async function server({ findings = [], status = "done", review_of_record = true,
       const ask = name === "wait_review" && requested ? [requested, requestedAgain][asks] : undefined;
       if (ask) asks++;
       const result = toolError ? toolError
-        : name === "submit_review" ? { review_id: "rev_test", status: "running" }
+        : name === "submit_review" ? { review_id: "rev_test", status: "running", ...submitExtra }
         : ask ? { review_id: "rev_test", status: "needs_files", requested_files: ask, files_url: filesUrl ?? `${url}/files` }
         : name === "wait_review" ? { review_id: "rev_test", status }
         : { review_id: "rev_test", status, findings, review_of_record, live_url: "https://example.test/live/x", ...extra };
@@ -978,9 +978,13 @@ test("--format json on every exit: not run, refused, timed out, cut short, faile
     } finally { await s.close() }
   }
   // A bad format is refused before anything runs, with nothing on stdout.
-  for (const [argv, env] of [[["--format", "yaml"], {}], [[], { OHMYBUG_FORMAT: "xml" }]]) {
-    const r = await cli(dir, argv, { OHMYBUG_URL: "http://127.0.0.1:9", ...env });
-    assert.deepEqual([r.code, r.out], [2, ""]);
+  for (const [argv, env, why] of [[["--format", "yaml"], {}, /--format needs text, markdown or json/], [[], { OHMYBUG_FORMAT: "xml" }, /OHMYBUG_FORMAT must be text, markdown or json, not xml/]]) {
+    const bad = await server();
+    try {
+      const r = await cli(dir, argv, { OHMYBUG_URL: bad.url, ...env });
+      assert.deepEqual([r.code, r.out, bad.calls.length], [2, "", 0]);
+      assert.match(r.log, why);
+    } finally { await bad.close() }
   }
 });
 
@@ -1015,5 +1019,73 @@ test("--format markdown and --step-summary: one block, server text escaped, the 
     const w = await cli(dir, ["--step-summary"], { OHMYBUG_URL: s.url, GITHUB_STEP_SUMMARY: join(tmpdir(), "no-such-dir-omb", "x.md") });
     assert.equal(w.code, 1);
     assert.match(w.log, /could not write/);
+  } finally { await s.close() }
+});
+
+test("--format json: P0-P3 and unknown severities on the gate's scale; a maybe-started submit, an interrupted poll, a failed review's reason", async () => {
+  const { dir, git } = repo();
+  writeFileSync(join(dir, "app.js"), "export const a = 64\n");
+  git("commit", "-qam", "c");
+  const json = (r) => JSON.parse(r.out);
+  const sev = (severity) => ({ severity, file: "a.js", line: "7", title: severity });
+  let s = await server({ findings: [sev("P3"), sev("p0"), sev("blocker"), sev("P2")] });
+  try {
+    const j = json(await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url }));
+    assert.deepEqual(j.findings.map((f) => [f.severity, f.blocking, f.line]), [["critical", true, 7], ["medium", true, 7], ["low", false, 7], ["unrated", true, 7]]);
+    assert.deepEqual(j.counts, { total: 4, blocking: 3, critical: 1, high: 0, medium: 1, low: 1, unrated: 1 });
+  } finally { await s.close() }
+  // The paid call failed in a way that may have started a hunt: never "not_run" or "nothing charged".
+  s = await server({ submitStatus: 500 });
+  try {
+    const j = json(await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url }));
+    assert.deepEqual([j.exit_code, j.outcome, j.review.id, j.billing.charged_usd], [2, "maybe_started", null, null]);
+    assert.match(j.billing.note, /may have started and may be charged/);
+    assert.match(j.live_url_missing, /start was not confirmed/);
+  } finally { await s.close() }
+  // Started, then a poll refused: interrupted, with the submit's live page.
+  s = await server({ submitExtra: { live_url: "https://example.test/live/s" }, faults: { wait_review: { error: "not_found", message: "gone" } } });
+  try {
+    const j = json(await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url }));
+    assert.deepEqual([j.exit_code, j.outcome, j.review.id, j.review.status, j.live_url, j.error.code], [2, "interrupted", "rev_test", "running", "https://example.test/live/s", "not_found"]);
+  } finally { await s.close() }
+  // Timed out: the submit's live page is kept.
+  s = await server({ status: "running", submitExtra: { live_url: "https://example.test/live/t" } });
+  try {
+    const j = json(await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: "30" }));
+    assert.deepEqual([j.outcome, j.live_url, j.live_url_missing], ["timed_out", "https://example.test/live/t", null]);
+  } finally { await s.close() }
+  // A failed review: its reason in error, and free.
+  s = await server({ status: "failed", extra: { error: "the sandbox died" } });
+  try {
+    const j = json(await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url }));
+    assert.deepEqual([j.outcome, j.error.message, j.billing.note], ["failed", "the review failed: the sandbox died", "a failed review is free"]);
+  } finally { await s.close() }
+});
+
+test("--format json and markdown: a CI charge and a billed silent bill are carried; markdown escapes markdown and the error line", async () => {
+  const { dir, git } = repo();
+  writeFileSync(join(dir, "app.js"), "export const a = 65\n");
+  git("commit", "-qam", "c");
+  const at = "2026-11-12T10:00:00.000Z";
+  const title = "![x](https://host/p.png) [click](https://host) a\\|b *em* _u_ `c`";
+  let s = await server({ findings: [{ ...high, title }], extra: { billing: { tariff: "ci", charged_usd: 4, paid_by: "balance" }, silent_bill: { at, billed: true } } });
+  try {
+    const j = JSON.parse((await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url })).out);
+    assert.deepEqual([j.billing.tariff, j.billing.charged_usd, j.billing.paid_by], ["ci", 4, "balance"]);
+    assert.deepEqual([j.silent_bill.billed, j.silent_bill.note], [true, `silent bill: billed on its own at ${at}`]);
+    const m = (await cli(dir, ["--format", "markdown"], { OHMYBUG_URL: s.url })).out;
+    assert.match(m, /Billing: \$4 charged \(CI billing, balance\)\. silent bill: billed on its own/);
+    const row = m.split("\n").find((l) => l.startsWith("| HIGH"));
+    assert.equal(row.split(/(?<!\\)\|/).length, 5, row);
+    assert.doesNotMatch(row, /(?<!\\)!\[|(?<!\\)\[click\]|(?<!\\)\*em(?<!\\)\*|(?<!\\)`/);
+  } finally { await s.close() }
+  // The error line carries server text: inside a pre block, escaped.
+  s = await server({ toolError: { error: "quota_exceeded", message: "<b>no</b>\n### OhMyBug review: No blocking bugs" } });
+  try {
+    const m = (await cli(dir, ["--format", "markdown"], { OHMYBUG_URL: s.url })).out;
+    assert.match(m, /^### OhMyBug review: Could not run\n/);
+    assert.match(m, /<pre>could not review: quota_exceeded: &lt;b&gt;no&lt;\/b&gt;\n### OhMyBug review: No blocking bugs<\/pre>/);
+    // Inside the pre block the server text is literal: the only heading is the real one.
+    assert.equal(m.replace(/<pre>[\s\S]*?<\/pre>/g, "").match(/^### /gm).length, 1);
   } finally { await s.close() }
 });

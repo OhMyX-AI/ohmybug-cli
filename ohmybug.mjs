@@ -17,8 +17,8 @@ Usage:
   ohmybug --deep [--base <branch>]  the deep hunt of the pushed HEAD commit (GitHub only): the service reads the
                              whole repository; up to 2 hours, so OHMYBUG_TIMEOUT_S defaults to 10800
   --format text|markdown|json  what goes to stdout: text (default, for people), markdown (a block for a CI summary)
-                             or json (one object, schema ohmybug-cli/result/1, for scripts); json and markdown are printed
-                             on every exit, and progress stays on stderr
+                             or json (one object, schema ohmybug-cli/result/1, for scripts); once the arguments are read, json
+                             and markdown are printed on every exit, and progress stays on stderr
   --step-summary             also append the markdown block to the file $GITHUB_STEP_SUMMARY names (GitHub Actions)
   --story auto|private|never  the feed story of this hunt: auto (default) leaves it to the account and key
                              settings; private keeps any story private; never drafts and posts none
@@ -251,7 +251,7 @@ export function formatFindings(findings) {
 }
 
 const SEVERITIES = ["critical", "high", "medium", "low", "unrated"];
-const severityOf = (f) => { const s = String(f?.severity ?? "").toLowerCase(); return s ? s : "unrated"; };
+const severityOf = (f) => ["critical", "high", "medium", "low"][rankOf(f)] ?? "unrated";
 const strOrNull = (v) => (typeof v === "string" && v ? v : null);
 
 /**
@@ -262,19 +262,25 @@ export function resultOf(rec, code) {
   const r = rec.answer;
   const findings = [...(r?.findings ?? []).filter((f) => f && typeof f === "object")].sort((a, b) => rankOf(a) - rankOf(b)).map((f) => ({
     id: strOrNull(f.finding_id ?? f.id), severity: severityOf(f), blocking: isBlocking(f),
-    file: strOrNull(f.file), line: Number.isInteger(f.line) ? f.line : null, title: String(f.title ?? ""),
+    file: f.file == null || f.file === "" ? null : String(f.file),
+    line: /^[1-9]\d*$/.test(String(f.line ?? "")) ? Number(f.line) : null, title: String(f.title ?? ""),
     body: String(f.failure_scenario ?? ""), suggested_fix: strOrNull(f.suggested_fix),
   }));
   const counts = { total: findings.length, blocking: findings.filter((f) => f.blocking).length };
   for (const s of SEVERITIES) counts[s] = 0;
-  for (const f of findings) counts[SEVERITIES.includes(f.severity) ? f.severity : "unrated"]++;
-  const outcome = rec.noChanges ? "no_changes" : !rec.reviewId ? "not_run" : rec.timedOut ? "timed_out"
+  for (const f of findings) counts[f.severity]++;
+  const outcome = rec.noChanges ? "no_changes" : !rec.reviewId ? (rec.maybeStarted ? "maybe_started" : "not_run") : rec.timedOut ? "timed_out"
     : !r ? "interrupted" : r.status === "failed" ? "failed" : code === 1 ? "blocking" : code === 0 ? "clean" : "cut_short";
   const live = strOrNull(r?.live_url) ?? strOrNull(rec.live);
   const b = r?.billing && typeof r.billing === "object" ? r.billing : null;
-  const billing = !rec.reviewId ? { tariff: null, charged_usd: null, paid_by: null, note: "nothing started, nothing charged" }
-    : b ? { tariff: strOrNull(b.tariff) ?? "ci", charged_usd: Number(b.charged_usd ?? 0) || 0, paid_by: strOrNull(b.paid_by),
-      note: "CI billing: charged when the result holds a medium or worse finding" }
+  const maybe = rec.maybeStarted && !rec.reviewId;
+  const billing = maybe ? { tariff: null, charged_usd: null, paid_by: null,
+      note: "a hunt may have started and may be charged: check https://app.ohmybug.ai/me before running again" }
+    : !rec.reviewId ? { tariff: null, charged_usd: null, paid_by: null, note: "nothing started, nothing charged" }
+    : r?.status === "failed" ? { tariff: strOrNull(b?.tariff), charged_usd: b ? Number(b.charged_usd ?? 0) || 0 : null,
+      paid_by: strOrNull(b?.paid_by), note: "a failed review is free" }
+    : b ? { tariff: strOrNull(b.tariff), charged_usd: Number(b.charged_usd ?? 0) || 0, paid_by: strOrNull(b.paid_by),
+      note: b.tariff === "ci" ? "CI billing: charged when the result holds a medium or worse finding" : "the charge the service reported for this review" }
     : r ? { tariff: "confirm", charged_usd: null, paid_by: null,
       note: "charged only when someone confirms a medium or worse finding as REAL, or at the billing deadline (silent_bill)" }
     : { tariff: null, charged_usd: null, paid_by: null, note: "no result was read, so the charge is not known here" };
@@ -284,7 +290,7 @@ export function resultOf(rec, code) {
     review: { id: rec.reviewId ?? null, status: r ? String(r.status) : rec.reviewId ? "running" : null, deep: !!rec.deep,
       complete: r ? r.review_of_record !== false && r.status === "done" : false },
     live_url: live,
-    live_url_missing: live ? null : !rec.reviewId ? "nothing started"
+    live_url_missing: live ? null : maybe ? "the start was not confirmed: check https://app.ohmybug.ai/me" : !rec.reviewId ? "nothing started"
       : "the service sent no live link: the key's live link setting is off (app.ohmybug.ai/me), or it was not read",
     billing,
     silent_bill: sb ? { at: typeof sb.at === "string" && ISO_UTC.test(sb.at) ? sb.at : null, billed: sb.billed === true, note: silentBillLine(sb) } : null,
@@ -295,14 +301,18 @@ export function resultOf(rec, code) {
 
 // Server text in a step summary is data: HTML is escaped, and a table cell keeps to one line and its own column.
 const escHtml = (s) => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-const cell = (s) => escHtml(s).replace(/[\r\n]+/g, " ").replace(/\|/g, "\\|").replace(/`/g, "\\`");
+const cell = (s) => escHtml(String(s).replace(/[\\`*_[\]!|~#]/g, "\\$&")).replace(/[\r\n]+/g, " ");
 const HEADLINE = {
   clean: "No blocking bugs", failed: "The review failed", cut_short: "Cut short, no blocking bug found: not a clean result",
   timed_out: "Timed out before a result", interrupted: "Stopped before a result", not_run: "Could not run", no_changes: "Nothing to review",
+  maybe_started: "Could not confirm the start: a hunt may be running",
 };
 
-/** The markdown block for a CI summary, from resultOf's object. */
-export function resultMarkdown(res) {
+// GitHub drops a step summary over 1 MiB: past this bound the folds go and the table stays.
+const SUMMARY_MAX = 900 * 1024;
+
+/** The markdown block for a CI summary, from resultOf's object; `folds` false leaves the failure scenarios out. */
+export function resultMarkdown(res, folds = true) {
   const head = res.outcome === "blocking" ? `${res.counts.blocking} blocking bug${res.counts.blocking === 1 ? "" : "s"}` : HEADLINE[res.outcome] ?? res.outcome;
   const out = [`### OhMyBug review: ${head}`, ""];
   const where = (f) => (f.file ? (f.line ? `${f.file}:${f.line}` : f.file) : "");
@@ -310,17 +320,20 @@ export function resultMarkdown(res) {
     out.push("| Severity | Location | Finding |", "|---|---|---|");
     for (const f of res.findings) out.push(`| ${f.severity.toUpperCase()} | ${cell(where(f))} | ${cell(f.title)} |`);
     out.push("");
-    for (const f of res.findings) {
+    for (const f of folds ? res.findings : []) {
       out.push(`<details><summary>${escHtml(`${f.severity.toUpperCase()} ${where(f)}: ${f.title}`.replace(/[\r\n]+/g, " "))}</summary>`, "");
       out.push(`<pre>${escHtml(f.body)}</pre>`, "", "</details>", "");
     }
   }
-  if (res.error) out.push(escHtml(res.error.message), "");
+  if (res.error) out.push(`<pre>${escHtml(res.error.message)}</pre>`, "");
   const b = res.billing;
-  const bill = b.tariff === "ci" ? `$${b.charged_usd} charged (CI billing${b.paid_by ? `, ${escHtml(b.paid_by)}` : ""})` : escHtml(b.note);
+  const how = [b.tariff === "ci" ? "CI billing" : "", b.paid_by ? escHtml(b.paid_by) : ""].filter(Boolean).join(", ");
+  const bill = b.charged_usd !== null ? `$${b.charged_usd} charged${how ? ` (${how})` : ""}` : escHtml(b.note);
   out.push(`Billing: ${bill}.${res.silent_bill ? ` ${escHtml(res.silent_bill.note)}.` : ""}`);
   out.push(res.live_url ? `Report: ${escHtml(res.live_url)}` : `Report: none (${escHtml(res.live_url_missing)})`);
-  return out.join("\n");
+  if (!folds) out.push("", "Failure scenarios left out: the summary would be over GitHub's size limit. The report has them.");
+  const md = out.join("\n");
+  return folds && Buffer.byteLength(md) > SUMMARY_MAX ? resultMarkdown(res, false) : md;
 }
 
 /** Context files dropped from the end until the JSON body (escaping and meta included) fits the server's cap. */
@@ -613,7 +626,11 @@ async function review({ opts, env, cwd, out, log, rec }) {
         const findings = (r.findings ?? []).filter((f) => f && typeof f === "object");
         const code = exitCodeFor({ ...r, findings });
         rec.answer = { ...r, findings };
-        if (r.status === "failed") log(`the review failed: ${String(r.error ?? r.summary ?? "no reason given").slice(0, 300)}`);
+        if (r.status === "failed") {
+          const message = `the review failed: ${String(r.error ?? r.summary ?? "no reason given").slice(0, 300)}`;
+          log(message);
+          rec.error = { code: null, message };
+        }
         else if (findings.length) out(formatFindings(findings));
         else out(code === 2 ? "No bugs found before the review was cut short." : "No bugs found.");
         if (code === 2 && r.status === "done") log("the review did not finish its protocol: this is not a clean result");
@@ -640,11 +657,12 @@ async function review({ opts, env, cwd, out, log, rec }) {
     log(message);
     rec.error = { code: e instanceof Refusal && typeof e.code === "string" ? e.code : null, message };
     rec.timedOut = e instanceof Deadline;
+    rec.maybeStarted = e instanceof Refusal && e.message.includes(MAYBE_STARTED);
     if (started) log(`review ${started.review_id} may still be running${started.live_url ? `: ${started.live_url}` : ""}`);
     return 2;
   }
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
-  run({ argv: process.argv.slice(2), env: process.env, cwd: process.cwd() }).then((code) => process.exit(code));
+  run({ argv: process.argv.slice(2), env: process.env, cwd: process.cwd() }).then((code) => process.stdout.write("", () => process.exit(code)));
 }
