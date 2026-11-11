@@ -34,7 +34,7 @@ function repo() {
  * makes the first wait_review a file request whose answer lands in `posted`; `sse` answers as an event stream;
  * `submitStatus` fails submit_review with that HTTP status; `toolError` answers every tool call with isError;
  * `faults` fails the first call of a tool: { wait_review: 503 | "reset" | "garble" | "internal" | "rate_limited" |
- * "slow429" (a 429 asking for 15 s) | a URL (a 307 there) };
+ * "slow429" (a 429 asking for 15 s) | a URL (a 307 there) | { error, message } (that tool error) };
  * `filesStatus` answers the file upload with that status, or with each of a list in turn (a 307 goes to
  * `filesLocation`); `filesUrl` replaces the
  * file request's address; `requestedAgain` makes the second wait_review a second request at the same address.
@@ -59,9 +59,9 @@ async function server({ findings = [], status = "done", review_of_record = true,
       let fault = faults[name];
       if (fault) {
         delete faults[name];
-        if (fault === "internal" || fault === "rate_limited") {
+        if (fault === "internal" || fault === "rate_limited" || typeof fault === "object") {
           res.writeHead(200, { "content-type": "application/json" });
-          return res.end(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { isError: true, content: [{ type: "text", text: JSON.stringify({ error: fault, message: "blip" }) }] } }));
+          return res.end(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { isError: true, content: [{ type: "text", text: JSON.stringify(typeof fault === "object" ? fault : { error: fault, message: "blip" }) }] } }));
         }
         if (fault === "reset") return req.socket.destroy();
         if (fault === "slow429") { res.writeHead(429, { "retry-after": "15" }); return res.end("slow down"); }
@@ -648,13 +648,13 @@ test("--deep sends the pushed commit's coordinates and no payload; refuses what 
   // Refused before any call: no GitHub repository, a remote that only mentions github.com, an unpushed HEAD,
   // GitHub Enterprise, a base that is not a branch name.
   for (const [setup, env, argv, why] of [
-    [() => {}, {}, [], /needs a GitHub repository/],
-    [() => git("remote", "add", "origin", "https://git.example.com/github.com/acme/app.git"), {}, [], /needs a GitHub repository/],
+    [() => {}, {}, [], /--deep needs a pushed commit on GitHub: no GitHub repository/],
+    [() => git("remote", "add", "origin", "https://git.example.com/github.com/acme/app.git"), {}, [], /--deep needs a pushed commit on GitHub: no GitHub repository/],
     [() => git("remote", "set-url", "origin", "git@github.com:acme/app.git"), {}, [], /push it first/],
     [() => git("update-ref", "refs/remotes/fork/feature", "HEAD"), { GITHUB_SHA: "0".repeat(40) }, [], /push it first/],
     [() => git("update-ref", "refs/remotes/origin/feature", "HEAD"), { GITHUB_SERVER_URL: "https://ghe.example.com" }, [], /not on https:\/\/ghe/],
-    [() => {}, {}, ["--base", head.slice(0, 12)], /base as a branch name/],
-    [() => {}, {}, ["--base", "HEAD~1"], /base as a branch name/],
+    [() => {}, {}, ["--base", head.slice(0, 12)], /is not a branch name/],
+    [() => {}, {}, ["--base", "HEAD~1"], /is not a branch name/],
   ]) {
     setup();
     const s = await server();
@@ -793,4 +793,68 @@ test("a finished hunt with a silent bill prints its line on stderr after the bil
     assert.equal(r.code, 0);
     assert.doesNotMatch(r.log, /silent bill/);
   } finally { await clean.close() }
+});
+
+test("a fast hunt of a pushed GitHub commit lets the service read the repository; a refused read sends the diff; no target sends the diff and says why", async () => {
+  const { dir, git } = repo();
+  writeFileSync(join(dir, "app.js"), "export const a = 41\n");
+  git("commit", "-qam", "c");
+  const head = git("rev-parse", "HEAD").trim();
+  const subs = (s) => s.calls.filter((c) => c.name === "submit_review").map((c) => c.args);
+  // No target: one request with the diff, and the reason on the log.
+  for (const [setup, argv, why] of [
+    [() => {}, [], /diff only, with one engine: no GitHub repository/],
+    [() => git("remote", "add", "origin", "git@github.com:acme/app.git"), [], /diff only, with one engine: HEAD is not pushed/],
+    [() => git("update-ref", "refs/remotes/origin/feature", "HEAD"), ["--base", "HEAD~1"], /diff only, with one engine: the base HEAD~1 is not a branch name/],
+    [() => writeFileSync(join(dir, "app.js"), "export const a = 42\n"), ["--uncommitted"], /diff only, with one engine: --uncommitted/],
+  ]) {
+    setup();
+    const s = await server();
+    try {
+      const r = await cli(dir, argv, { OHMYBUG_URL: s.url });
+      assert.equal(r.code, 0, r.log);
+      assert.match(r.log, why);
+      assert.equal(subs(s).length, 1);
+      assert.match(subs(s)[0].diff, /^diff --git a\/app\.js/);
+      assert.equal(subs(s)[0].meta?.repo, undefined);
+    } finally { await s.close() }
+  }
+  git("checkout", "-q", "app.js");
+  // Readable: one request, an empty diff, the coordinates, the files as before.
+  const s = await server({ findings: [high] });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: s.url });
+    assert.equal(r.code, 1, r.log);
+    const [sub] = subs(s);
+    assert.equal(subs(s).length, 1);
+    assert.equal(sub.diff, "");
+    assert.deepEqual([sub.meta.repo, sub.meta.ref, sub.meta.base_branch, sub.meta.branch], ["acme/app", head, "main", "feature"]);
+    assert.equal(sub.files[0].path, ".review-client/tree.txt");
+    assert.match(r.log, new RegExp(`the service reads acme/app at ${head.slice(0, 12)} against main from GitHub`));
+  } finally { await s.close() }
+  // A refused read: the same hunt again with the diff, said on the log; the App hint only where it helps.
+  for (const code of ["diff_required", "repo_not_listed", "diff_fetch_failed", "empty_compare", "diff_too_large"]) {
+    const s = await server({ faults: { submit_review: { error: code, message: "no" } } });
+    try {
+      const r = await cli(dir, [], { OHMYBUG_URL: s.url });
+      assert.equal(r.code, 0, r.log);
+      const [first, second] = subs(s);
+      assert.equal(subs(s).length, 2);
+      assert.equal(first.diff, "");
+      assert.match(second.diff, /^diff --git a\/app\.js/);
+      assert.equal(second.meta.repo, undefined);
+      assert.deepEqual(second.files, first.files);
+      assert.match(r.log, new RegExp(`did not read acme/app \\(${code}\\): reviewing the diff only, with one engine`));
+      assert.equal(/GitHub App installed/.test(r.log), code === "diff_required");
+    } finally { await s.close() }
+  }
+  // Any other refusal, or no clear answer, is not sent again.
+  for (const fault of [{ error: "commit_required", message: "no" }, "internal", "reset"]) {
+    const s = await server({ faults: { submit_review: fault } });
+    try {
+      const r = await cli(dir, [], { OHMYBUG_URL: s.url });
+      assert.equal(r.code, 2, r.log);
+      assert.equal(subs(s).length, 1);
+    } finally { await s.close() }
+  }
 });

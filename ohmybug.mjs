@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-export const VERSION = "0.4.0";
+export const VERSION = "0.5.0";
 const USAGE = `ohmybug ${VERSION}: review this repository's changes with OhMyBug.
 
 Usage:
@@ -18,6 +18,9 @@ Usage:
                              whole repository; up to 2 hours, so OHMYBUG_TIMEOUT_S defaults to 10800
   --story auto|private|never  the feed story of this hunt: auto (default) leaves it to the account and key
                              settings; private keeps any story private; never drafts and posts none
+
+A pushed HEAD of a github.com repository is read by the service from GitHub (public, or with the OhMyBug
+GitHub App installed), which runs the full fast hunt; otherwise the diff is sent and one engine reviews it.
 
 The base is --base, else $CI_MERGE_REQUEST_TARGET_BRANCH_NAME (GitLab merge request pipelines),
 else origin/main. With --deep it is a branch name: --base, else $GITHUB_BASE_REF, else main.
@@ -49,7 +52,8 @@ const DIFF_FLAGS = ["--no-color", "--no-ext-diff", "--no-textconv", "--src-prefi
 const TRANSIENT_TOOL = new Set(["internal", "rate_limited"]);
 const STORY = new Set(["auto", "private", "never"]);
 
-export class Refusal extends Error {}
+/** A run that cannot go on; `code` is the service's error code when the service refused. */
+export class Refusal extends Error { constructor(message, code) { super(message); this.code = code; } }
 export class Deadline extends Error {}
 
 /** argv → options, or a string to print and exit 2 on. */
@@ -250,25 +254,37 @@ export function rpcMessage(text) {
 }
 
 /**
- * Where the deep hunt finds the change, read from git and the environment only (no local diff: a shallow CI clone
- * has no base): the github.com repository (the origin remote, which is the checkout's own, else GITHUB_REPOSITORY),
- * the pushed HEAD commit and the base branch. The service reads a public repository, or one with the OhMyBug App installed.
+ * Where the service finds the change on GitHub, read from git and the environment only (no local diff: a shallow CI
+ * clone has no base): the github.com repository (the origin remote, which is the checkout's own, else
+ * GITHUB_REPOSITORY), the pushed HEAD commit and the base branch. `{ repo, ref, base_branch }`, or `{ why }` when
+ * there is none. The service reads a public repository, or one with the OhMyBug GitHub App installed.
  */
-export function deepTarget(opts, env, git) {
+export function repoTarget(env, git, base) {
   const server = env.GITHUB_SERVER_URL;
-  if (server && !/^https:\/\/github\.com\/?$/.test(server)) throw new Refusal(`--deep reads repositories on github.com, not on ${server}`);
+  if (server && !/^https:\/\/github\.com\/?$/.test(server)) return { why: `the service reads repositories on github.com, not on ${server}` };
   let url = "";
   try { url = git("remote", "get-url", "origin").trim(); } catch {}
   let repo = url.match(/^(?:[\w.+-]+:\/\/)?(?:[^@/]+@)?github\.com[:/]([\w.-]+\/[\w.-]+?)(?:\.git)?\/?$/)?.[1] ?? "";
   if (!repo && /^[\w.-]+\/[\w.-]+$/.test(env.GITHUB_REPOSITORY ?? "")) repo = env.GITHUB_REPOSITORY;
-  if (!repo) throw new Refusal("--deep needs a GitHub repository: an origin remote on github.com, or GITHUB_REPOSITORY=owner/name");
+  if (!repo) return { why: "no GitHub repository: an origin remote on github.com, or GITHUB_REPOSITORY=owner/name" };
   const ref = git("rev-parse", "HEAD").trim();
   // In Actions the checked-out commit GITHUB_SHA is GitHub's own; any other HEAD must be on an origin branch.
-  if (ref !== env.GITHUB_SHA && !git("branch", "-r", "--list", "origin/*", "--contains", ref).trim()) throw new Refusal("--deep reviews a pushed commit: no remote branch holds HEAD; push it first");
-  const base = (opts.base || env.GITHUB_BASE_REF || "main").replace(/^(refs\/remotes\/)?origin\//, "");
-  if (/^[0-9a-f]{7,40}$/i.test(base) || /[~^:\s]|\.\./.test(base)) throw new Refusal(`--deep needs the base as a branch name, not ${base}`);
-  return { repo, ref, base_branch: base };
+  if (ref !== env.GITHUB_SHA && !git("branch", "-r", "--list", "origin/*", "--contains", ref).trim()) return { why: "HEAD is not pushed: no remote branch holds it; push it first" };
+  const branch = base.replace(/^(refs\/remotes\/)?origin\//, "");
+  // A sha or an expression is not sent: the service keys the commit and its deep hunt on a branch name.
+  if (/^[0-9a-f]{7,40}$/i.test(branch) || /[~^:\s]|\.\./.test(branch)) return { why: `the base ${base} is not a branch name` };
+  return { repo, ref, base_branch: branch };
 }
+
+/** The deep hunt's target: repoTarget with the base --base, else $GITHUB_BASE_REF, else main; none is a refusal. */
+export function deepTarget(opts, env, git) {
+  const t = repoTarget(env, git, opts.base || env.GITHUB_BASE_REF || "main");
+  if (t.why) throw new Refusal(`--deep needs a pushed commit on GitHub: ${t.why}`);
+  return t;
+}
+
+// The service refused to fetch the change from GitHub before starting anything: the diff is sent instead.
+const REPO_REFUSED = new Set(["diff_required", "repo_not_listed", "diff_fetch_failed", "empty_compare", "diff_too_large"]);
 
 /** One review, start to end. Returns the exit code; never calls process.exit itself (the tests drive it). */
 export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s + "\n"), log = (s) => process.stderr.write(`ohmybug: ${s}\n`) }) {
@@ -372,7 +388,7 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
       if (!msg.result?.isError) return body;
       // An internal error may come after the hunt was created: a paid call retries only a rate limit, and says so.
       if (!TRANSIENT_TOOL.has(body.error) || (once && body.error !== "rate_limited")) {
-        throw new Refusal(`${body.error ?? name}: ${body.message ?? raw.slice(0, 300)}${once && body.error === "internal" ? `. ${MAYBE_STARTED}` : ""}`);
+        throw new Refusal(`${body.error ?? name}: ${body.message ?? raw.slice(0, 300)}${once && body.error === "internal" ? `. ${MAYBE_STARTED}` : ""}`, body.error);
       }
       const wait = Math.min(60_000, 5000 * 2 ** attempt);
       log(`${body.error}; retrying in ${wait / 1000}s`);
@@ -403,7 +419,7 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
     return false;
   }
 
-  let started, read;
+  let started, read, fallback;
   try {
     let root;
     try { root = realpathSync(execGit(cwd, ["rev-parse", "--show-toplevel"]).toString().trim()); }
@@ -434,11 +450,30 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
         throw new Refusal(`the diff (${Buffer.byteLength(diff)} bytes) and the file list are over what the service takes once encoded: ${opts.uncommitted ? "commit part of it and review" : "review"} a smaller range with --base`);
       }
       const meta = { ...ciMeta(env, git), ...storyMeta };
-      args = fitBody({ diff, files: [tree, ...pack(read, contextPaths(change.changed, change.all, git, change.rev), MAX_FILES - 1, MAX_BYTES - Buffer.byteLength(diff) - Buffer.byteLength(tree.content))], ...(Object.keys(meta).length ? { meta } : {}) });
+      const files = [tree, ...pack(read, contextPaths(change.changed, change.all, git, change.rev), MAX_FILES - 1, MAX_BYTES - Buffer.byteLength(diff) - Buffer.byteLength(tree.content))];
+      const payload = () => fitBody({ diff, files, ...(Object.keys(meta).length ? { meta } : {}) });
       log(`reviewing ${change.changed.length} changed file(s) against ${change.base}`);
+      // With the repository the service runs the full fast hunt; with the diff alone, one engine.
+      const target = opts.uncommitted ? { why: "--uncommitted reviews the working tree, which only this machine has" } : repoTarget(env, git, change.base);
+      if (target.why) {
+        log(`reviewing the diff only, with one engine: ${target.why}`);
+        args = payload();
+      } else {
+        log(`the service reads ${target.repo} at ${target.ref.slice(0, 12)} against ${target.base_branch} from GitHub`);
+        args = fitBody({ diff: "", files, meta: { ...meta, ...target } });
+        fallback = (code) => {
+          log(`the service did not read ${target.repo} (${code}): reviewing the diff only, with one engine${code === "diff_required" ? "; the OhMyBug GitHub App installed on it (read-only) gives the full fast hunt" : ""}`);
+          return payload();
+        };
+      }
     }
 
-    const sub = await tool("submit_review", args, true);
+    let sub;
+    try { sub = await tool("submit_review", args, true); }
+    catch (e) {
+      if (!fallback || !(e instanceof Refusal) || !REPO_REFUSED.has(e.code)) throw e;
+      sub = await tool("submit_review", fallback(e.code), true);
+    }
     if (!sub.review_id) throw new Refusal(`submit_review answered without a review id: ${JSON.stringify(sub).slice(0, 300)}. ${MAYBE_STARTED}`);
     started = sub;
     log(`review ${sub.review_id} started${sub.recent_median_minutes ? `; recent ones took about ${sub.recent_median_minutes} min` : ""}`);

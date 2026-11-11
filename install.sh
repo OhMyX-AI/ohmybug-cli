@@ -2,7 +2,7 @@
 # Installs the ohmybug CLI: one Node.js file, no dependencies.
 #   curl -fsSL https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/main/install.sh | sh
 # OHMYBUG_INSTALL_DIR picks the folder (default: /usr/local/bin when writable, else ~/.local/bin).
-# OHMYBUG_CLI_URL picks the file (default: main; pin a release with .../ohmybug-cli/v0.4.0/ohmybug.mjs).
+# OHMYBUG_CLI_URL picks the file (default: main; pin a release with .../ohmybug-cli/v0.5.0/ohmybug.mjs).
 set -eu
 src="${OHMYBUG_CLI_URL:-https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/main/ohmybug.mjs}"
 if ! command -v node >/dev/null 2>&1; then
