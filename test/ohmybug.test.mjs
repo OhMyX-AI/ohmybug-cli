@@ -1162,12 +1162,13 @@ test("--mode and OHMYBUG_MODE: sent as the top-level mode of a fast hunt, never 
       assert.equal(subs(s).length, 1);
       assert.equal(subs(s)[0].mode, want, argv.join(" ") + JSON.stringify(env));
       assert.equal(subs(s)[0].meta.hunt_mode, undefined);
-      assert.match(r.log, want ? new RegExp(`review rev_test started in ${want} mode`) : /review rev_test started(?! in)/);
+      // Exactly one start line, and it names the mode only when the service echoed a known one.
+      assert.deepEqual(r.log.match(/review rev_test started[^\n]*/g), [want ? `review rev_test started in ${want} mode` : "review rev_test started"]);
     } finally { await s.close() }
   }
   // A mode the service echoes but this client does not know is not printed.
   const odd = await server({ submitExtra: { hunt_mode: "x\u001b[2J" } });
-  try { assert.match((await cli(dir, [], { OHMYBUG_URL: odd.url })).log, /review rev_test started(?! in)/) } finally { await odd.close() }
+  try { assert.deepEqual((await cli(dir, [], { OHMYBUG_URL: odd.url })).log.match(/review rev_test started[^\n]*/g), ["review rev_test started"]) } finally { await odd.close() }
   // --deep: the env default is not sent (the service refuses a mode with deep).
   const deep = await server();
   try {

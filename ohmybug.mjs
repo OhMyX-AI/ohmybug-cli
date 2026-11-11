@@ -643,7 +643,6 @@ async function review({ opts, env, cwd, out, log, rec }) {
     started = sub;
     rec.reviewId = sub.review_id;
     rec.live = sub.live_url;
-    log(`review ${sub.review_id} started${sub.recent_median_minutes ? `; recent ones took about ${sub.recent_median_minutes} min` : ""}`);
     log(`review ${sub.review_id} started${typeof sub.hunt_mode === "string" && MODES.has(sub.hunt_mode) ? ` in ${sub.hunt_mode} mode` : ""}${sub.recent_median_minutes ? `; recent ones took about ${sub.recent_median_minutes} min` : ""}`);
     if (sub.live_url) log(`live progress: ${sub.live_url}`);
 
