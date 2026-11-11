@@ -30,6 +30,7 @@ Create an API key at [app.ohmybug.ai/me](https://app.ohmybug.ai/me) and put it i
 ohmybug                  # review <base>...HEAD: the commits of this branch
 ohmybug --base develop   # the same against another base
 ohmybug --uncommitted    # review the working tree against HEAD, untracked files included (not ignored ones)
+ohmybug --mode cheap     # a $1 hunt of the pushed HEAD (see Hunt modes)
 ohmybug --deep           # the deep hunt of the pushed HEAD (GitHub, public or with the OhMyBug App): the service reads the whole repository; up to 2 hours
 ```
 
@@ -49,6 +50,7 @@ The CLI prints each finding (severity, file:line, title, failure scenario) and a
 | `OHMYBUG_TIMEOUT_S` | `1800` (`10800` with `--deep`) | how long to wait for the review, 30 to 86400 seconds |
 | `OHMYBUG_URL` | `https://mcp.ohmybug.ai` | the service |
 | `OHMYBUG_STORY` | `auto` | the `--story` value when the flag is not given |
+| `OHMYBUG_MODE` | none | the `--mode` value when the flag is not given; not used with `--deep` |
 
 ## Feed stories
 
@@ -58,7 +60,19 @@ A hunt that found a bug can be told as a short anonymous story on the public fee
 
 ## Billing
 
-A key on **CI billing** (the key setting on [app.ohmybug.ai/me](https://app.ohmybug.ai/me)) pays per hunt with no confirm step: $4 for a fast hunt and $12 for a deep one ($24 on a wide change, one spread over 11 or more folder chunks), only when the result holds a medium or worse bug. A clean or failed hunt is free. The run prints what it was charged.
+## Hunt modes
+
+`--mode` picks how a fast hunt runs; each bills only when it finds a real bug:
+
+| mode | price | time |
+|---|---|---|
+| `cheap` | $1 | about 3 minutes, up to 10 |
+| `ultrafast` | $2 | about 1 minute, up to 2 |
+| `fast` | $4 | up to 15 minutes |
+
+Without `--mode` (or `OHMYBUG_MODE`) the service runs the key's default mode, else the account's, else `fast`; set them on [app.ohmybug.ai/me](https://app.ohmybug.ai/me). The run prints the mode the hunt started in. `cheap` and `ultrafast` read the repository, so they need a pushed GitHub commit the service can read (see below) and do not go with `--uncommitted`; `ultrafast` takes a diff under 1 MB. When the service cannot run the mode asked for, it starts nothing and charges nothing, and the run prints its reason; `--mode fast` always runs. `--mode` does not go with `--deep`, which is its own hunt, and a default mode never applies to it.
+
+A key on **CI billing** (the key setting on [app.ohmybug.ai/me](https://app.ohmybug.ai/me)) pays per hunt with no confirm step: the mode's price for a fast hunt ($1, $2 or $4) and $12 for a deep one ($24 on a wide change, one spread over 11 or more folder chunks), only when the result holds a medium or worse bug. A clean or failed hunt is free. The run prints what it was charged.
 
 Outside CI billing, some fast hunts bill on their own at a deadline unless every medium or worse finding is rejected as not a real bug first (see the [terms](https://ohmybug.ai/terms/), section 2). When a hunt has one, the run prints one `silent bill:` line on stderr after the billing line: `bills on its own at <time> unless every medium or worse finding is rejected (NOT_REAL) first`, `may bill on its own; the deadline could not be read now`, or `billed on its own at <time>`. Reject or confirm the findings on the hunt's page in [app.ohmybug.ai/me](https://app.ohmybug.ai/me) before that time. The exit code does not change.
 
@@ -101,7 +115,7 @@ pipelines:
 
 With `--deep`, no code is sent: only the GitHub repository name (from the origin remote, else `$GITHUB_REPOSITORY`), the HEAD commit, the base branch and the branch name; the service reads the repository from GitHub (public, or with the OhMyBug App installed).
 
-Without `--deep` and `--uncommitted`, when HEAD is pushed to a github.com repository (the origin remote, else `$GITHUB_REPOSITORY`) and the base is an origin branch at the same commit as here, the diff is left out: the repository name, the HEAD commit and the base branch go instead, and the service reads the change from GitHub and runs its full fast hunt. If the service does not take the change from GitHub (it cannot read the repository: a private one without the OhMyBug App installed, or one off the key's repository list; or the compare fails, is empty or is too large), the run says so and sends the same review again with the diff, which the service reviews without the rest of the repository. Otherwise the diff is sent, and the run says why.
+Without `--deep` and `--uncommitted`, when HEAD is pushed to a github.com repository (the origin remote, else `$GITHUB_REPOSITORY`) and the base is an origin branch at the same commit as here, the diff is left out: the repository name, the HEAD commit and the base branch go instead, and the service reads the change from GitHub and runs its full fast hunt. If the service does not take the change from GitHub (it cannot read the repository: a private one without the OhMyBug App installed, or one off the key's repository list; or the compare fails, is empty or is too large), the run says so and sends the same review again with the diff, which the service reviews without the rest of the repository; with `--mode cheap` or `ultrafast` it stops there instead, since those modes need the repository. Otherwise the diff is sent, and the run says why.
 
 The diff (when it is over 2 MiB, per-file entries over 160 KiB, such as lockfiles and generated files, are left out and the run says so), the list of file paths at the reviewed head, and up to 29 related files (the changed files, the project manifests, and files that mention a changed module). During the review the reviewers may ask for more files by path. Every file sent is read from the reviewed commit; with `--uncommitted`, from a snapshot of the working tree taken at the start (untracked files included, nested repositories left out), so edits made while the review runs do not reach it. Only files of the reviewed tree are sent: untracked ignored files, anything under `.git` and anything outside the repository never are (a file committed to the repository is part of it, ignored or not). File requests are answered only to the service's own address, and redirects are not followed. With the review go the branch name and, in a GitLab merge request pipeline, the merge request title and description. With `--story private` or `never` (or `OHMYBUG_STORY`), that value goes too, on fast and deep hunts.
 

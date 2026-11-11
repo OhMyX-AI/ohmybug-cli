@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-export const VERSION = "0.5.1";
+export const VERSION = "0.6.0";
 const USAGE = `ohmybug ${VERSION}: review this repository's changes with OhMyBug.
 
 Usage:
@@ -16,6 +16,10 @@ Usage:
   ohmybug --uncommitted      review the working tree against HEAD, untracked files included
   ohmybug --deep [--base <branch>]  the deep hunt of the pushed HEAD commit (GitHub only): the service reads the
                              whole repository; up to 2 hours, so OHMYBUG_TIMEOUT_S defaults to 10800
+  --mode cheap|ultrafast|fast  the hunt mode: cheap ($1, about 3 min), ultrafast ($2, about 1 min) or fast ($4, up
+                             to 15 min); each bills only when it finds a real bug. Default: the key's default mode, else
+                             the account's, else fast. Cheap and ultrafast need the repository (a pushed GitHub commit),
+                             and ultrafast a diff under 1 MB; not with --deep or --uncommitted
   --story auto|private|never  the feed story of this hunt: auto (default) leaves it to the account and key
                              settings; private keeps any story private; never drafts and posts none
 
@@ -31,6 +35,7 @@ Environment:
   OHMYBUG_URL         default https://mcp.ohmybug.ai
   OHMYBUG_TIMEOUT_S   how long to wait for the review, 30 to 86400 seconds, default 1800 (10800 with --deep)
   OHMYBUG_STORY       the --story value when the flag is not given
+  OHMYBUG_MODE        the --mode value when the flag is not given (not used with --deep)
 
 Behind a proxy: Node's fetch reads HTTPS_PROXY only with NODE_USE_ENV_PROXY=1 (Node 22.21+, 24+).
 
@@ -52,6 +57,8 @@ const MAX_TREE = 1024 * 1024;
 const DIFF_FLAGS = ["--no-color", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/"];
 const TRANSIENT_TOOL = new Set(["internal", "rate_limited"]);
 const STORY = new Set(["auto", "private", "never"]);
+// Modes that read the repository: the service refuses them on a diff alone (mode_needs_repo).
+const MODES = new Set(["cheap", "ultrafast", "fast"]), REPO_MODES = new Set(["cheap", "ultrafast"]);
 
 /** A run that cannot go on; `code` is the service's error code when the service refused. */
 export class Refusal extends Error { constructor(message, code) { super(message); this.code = code; } }
@@ -68,6 +75,11 @@ export function parseArgs(argv) {
     else if (a === "--version") o.version = true;
     else if (a === "--base") { if (!argv[i + 1] || argv[i + 1].startsWith("-")) return "--base needs a ref"; o.base = argv[++i]; }
     else if (a.startsWith("--base=")) { if (!a.slice(7)) return "--base needs a ref"; o.base = a.slice(7); }
+    else if (a === "--mode" || a.startsWith("--mode=")) {
+      const v = a === "--mode" ? argv[++i] : a.slice(7);
+      if (!MODES.has(v)) return "--mode needs cheap, ultrafast or fast";
+      o.mode = v;
+    }
     else if (a === "--story" || a.startsWith("--story=")) {
       const v = a === "--story" ? argv[++i] : a.slice(8);
       if (!STORY.has(v)) return "--story needs auto, private or never";
@@ -76,6 +88,8 @@ export function parseArgs(argv) {
     else return `unknown argument: ${a}`;
   }
   if (o.uncommitted && o.base) return "--uncommitted and --base do not go together";
+  if (o.mode && o.deep) return "--mode picks a fast hunt's mode; --deep is its own hunt: use one of them";
+  if (o.uncommitted && REPO_MODES.has(o.mode)) return `--mode ${o.mode} reads the repository, which --uncommitted cannot send: commit and push, or use --mode fast`;
   if (o.uncommitted && o.deep) return "--deep reviews a pushed commit, not the working tree: commit, push and run ohmybug --deep";
   return o;
 }
@@ -309,6 +323,12 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
   if (!STORY.has(story)) { log(`OHMYBUG_STORY must be auto, private or never, not ${env.OHMYBUG_STORY}`); return 2; }
   // Sent only to narrow: an absent meta.story is the account's and key's settings alone.
   const storyMeta = story === "auto" ? {} : { story };
+  // The env value is a default: never sent with --deep, where the service takes no mode.
+  const mode = opts.deep ? undefined : opts.mode ?? (env.OHMYBUG_MODE || undefined);
+  if (mode !== undefined && !MODES.has(mode)) { log(`OHMYBUG_MODE must be cheap, ultrafast or fast, not ${env.OHMYBUG_MODE}`); return 2; }
+  if (!opts.mode && opts.uncommitted && REPO_MODES.has(mode)) { log(`OHMYBUG_MODE=${mode} reads the repository, which --uncommitted cannot send: commit and push, or set OHMYBUG_MODE=fast`); return 2; }
+  // Absent: the service applies the key's default mode, else the account's, else fast.
+  const modeArg = mode ? { mode } : {};
   const timeoutS = Number(env.OHMYBUG_TIMEOUT_S || (opts.deep ? 10800 : 1800));
   if (!Number.isInteger(timeoutS) || timeoutS < 30 || timeoutS > 86400) { log(`OHMYBUG_TIMEOUT_S must be whole seconds from 30 to 86400, not ${env.OHMYBUG_TIMEOUT_S}`); return 2; }
   const api = (env.OHMYBUG_URL || "https://mcp.ohmybug.ai").replace(/\/$/, "");
@@ -484,14 +504,16 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
     }
 
     let sub;
-    try { sub = await tool("submit_review", args, true); }
+    try { sub = await tool("submit_review", { ...args, ...modeArg }, true); }
     catch (e) {
       if (!fallback || !(e instanceof Refusal) || !REPO_REFUSED.has(e.code)) throw e;
-      sub = await tool("submit_review", fallback(e.code), true);
+      // A diff alone cannot run a mode that reads the repository: say so instead of a second, refused call.
+      if (REPO_MODES.has(mode)) throw new Refusal(`${e.message}; --mode ${mode} needs the repository, so the diff was not sent alone: use --mode fast to review the diff without it`, e.code);
+      sub = await tool("submit_review", { ...fallback(e.code), ...modeArg }, true);
     }
     if (!sub.review_id) throw new Refusal(`submit_review answered without a review id: ${JSON.stringify(sub).slice(0, 300)}. ${MAYBE_STARTED}`);
     started = sub;
-    log(`review ${sub.review_id} started${sub.recent_median_minutes ? `; recent ones took about ${sub.recent_median_minutes} min` : ""}`);
+    log(`review ${sub.review_id} started${typeof sub.hunt_mode === "string" && MODES.has(sub.hunt_mode) ? ` in ${sub.hunt_mode} mode` : ""}${sub.recent_median_minutes ? `; recent ones took about ${sub.recent_median_minutes} min` : ""}`);
     if (sub.live_url) log(`live progress: ${sub.live_url}`);
 
     const answered = new Set();
