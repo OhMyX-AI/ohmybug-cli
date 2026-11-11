@@ -804,18 +804,18 @@ test("a fast hunt of a pushed GitHub commit lets the service read the repository
   const subs = (s) => s.calls.filter((c) => c.name === "submit_review").map((c) => c.args);
   // No target: one request with the diff, and the reason on the log.
   for (const [setup, argv, why, env = {}] of [
-    [() => {}, [], /diff only, with one engine: no GitHub repository/],
-    [() => git("remote", "add", "origin", "git@github.com:acme/app.git"), [], /diff only, with one engine: HEAD is not pushed/],
-    [() => git("update-ref", "refs/remotes/origin/feature", "HEAD"), ["--base", "HEAD~1"], /diff only, with one engine: the base HEAD~1 is not a branch name/],
-    [() => {}, ["--base", git("rev-parse", "HEAD~1").trim()], /diff only, with one engine: the base [0-9a-f]{40} is not a branch name/],
+    [() => {}, [], /diff only, without the repository: no GitHub repository/],
+    [() => git("remote", "add", "origin", "git@github.com:acme/app.git"), [], /diff only, without the repository: HEAD is not pushed/],
+    [() => git("update-ref", "refs/remotes/origin/feature", "HEAD"), ["--base", "HEAD~1"], /diff only, without the repository: the base HEAD~1 is not a branch name/],
+    [() => {}, ["--base", git("rev-parse", "HEAD~1").trim()], /diff only, without the repository: the base [0-9a-f]{40} is not a branch name/],
     // Another remote's branch, a local branch with no origin twin, an origin branch whose local copy moved: GitHub's
     // branch of that name is not the base diffed here.
     [() => git("update-ref", "refs/remotes/upstream/main", "HEAD~1"), ["--base", "upstream/main"], /the base upstream\/main is not an origin branch at the commit diffed here/],
     [() => git("branch", "dev", "HEAD~1"), ["--base", "dev"], /the base dev is not an origin branch/],
     [() => git("branch", "develop", "HEAD~1"), ["--base", "develop", "--story", "never"], null],
     [() => {}, ["--base", "refs/heads/dev"], /the base refs\/heads\/dev is not an origin branch/],
-    [() => {}, [], /diff only, with one engine: the service reads repositories on github.com, not on https:\/\/ghe/, { GITHUB_SERVER_URL: "https://ghe.example.com" }],
-    [() => writeFileSync(join(dir, "app.js"), "export const a = 42\n"), ["--uncommitted"], /diff only, with one engine: --uncommitted/],
+    [() => {}, [], /diff only, without the repository: the service reads repositories on github.com, not on https:\/\/ghe/, { GITHUB_SERVER_URL: "https://ghe.example.com" }],
+    [() => writeFileSync(join(dir, "app.js"), "export const a = 42\n"), ["--uncommitted"], /diff only, without the repository: --uncommitted/],
   ]) {
     setup();
     const s = await server();
@@ -859,7 +859,7 @@ test("a fast hunt of a pushed GitHub commit lets the service read the repository
       assert.match(second.diff, /^diff --git a\/app\.js/);
       assert.equal(second.meta.repo, undefined);
       assert.deepEqual(second.files, first.files);
-      assert.match(r.log, new RegExp(`did not take the change from GitHub \\(${code}\\): reviewing the diff only, with one engine`));
+      assert.match(r.log, new RegExp(`did not take the change from GitHub \\(${code}\\): reviewing the diff only, without the repository`));
       assert.equal(/GitHub App installed/.test(r.log), code === "diff_required");
     } finally { await s.close() }
   }

@@ -17,7 +17,7 @@ curl -fsSL https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/main/install.s
 Or download [`ohmybug.mjs`](ohmybug.mjs) and run it with `node ohmybug.mjs`. The installer takes the latest `main`; to pin a release in CI, name its file:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/main/install.sh | OHMYBUG_CLI_URL=https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/v0.5.0/ohmybug.mjs sh
+curl -fsSL https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/main/install.sh | OHMYBUG_CLI_URL=https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/v0.5.1/ohmybug.mjs sh
 ```
 
 Behind a proxy: Node's `fetch` reads `HTTPS_PROXY` only with `NODE_USE_ENV_PROXY=1` (Node 22.21 or newer, or 24 or newer).
@@ -74,7 +74,7 @@ ohmybug:
     GIT_DEPTH: 0
   script:
     - git fetch origin "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
-    - curl -fsSL https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/v0.5.0/install.sh | OHMYBUG_CLI_URL=https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/v0.5.0/ohmybug.mjs sh
+    - curl -fsSL https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/v0.5.1/install.sh | OHMYBUG_CLI_URL=https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/v0.5.1/ohmybug.mjs sh
     - ohmybug
 ```
 
@@ -93,7 +93,7 @@ pipelines:
           script:
             # The clone tracks one branch: name where the target goes, or origin/<target> does not exist.
             - git fetch origin "+refs/heads/$BITBUCKET_PR_DESTINATION_BRANCH:refs/remotes/origin/$BITBUCKET_PR_DESTINATION_BRANCH"
-            - curl -fsSL https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/v0.5.0/install.sh | OHMYBUG_CLI_URL=https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/v0.5.0/ohmybug.mjs sh
+            - curl -fsSL https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/v0.5.1/install.sh | OHMYBUG_CLI_URL=https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/v0.5.1/ohmybug.mjs sh
             - ohmybug --base "origin/$BITBUCKET_PR_DESTINATION_BRANCH"
 ```
 
@@ -101,7 +101,7 @@ pipelines:
 
 With `--deep`, no code is sent: only the GitHub repository name (from the origin remote, else `$GITHUB_REPOSITORY`), the HEAD commit, the base branch and the branch name; the service reads the repository from GitHub (public, or with the OhMyBug App installed).
 
-Without `--deep` and `--uncommitted`, when HEAD is pushed to a github.com repository (the origin remote, else `$GITHUB_REPOSITORY`) and the base is an origin branch at the same commit as here, the diff is left out: the repository name, the HEAD commit and the base branch go instead, and the service reads the change from GitHub and runs its full fast hunt. If the service does not take the change from GitHub (it cannot read the repository: a private one without the OhMyBug App installed, or one off the key's repository list; or the compare fails, is empty or is too large), the run says so and sends the same review again with the diff, which the service reviews with one engine. Otherwise the diff is sent, and the run says why.
+Without `--deep` and `--uncommitted`, when HEAD is pushed to a github.com repository (the origin remote, else `$GITHUB_REPOSITORY`) and the base is an origin branch at the same commit as here, the diff is left out: the repository name, the HEAD commit and the base branch go instead, and the service reads the change from GitHub and runs its full fast hunt. If the service does not take the change from GitHub (it cannot read the repository: a private one without the OhMyBug App installed, or one off the key's repository list; or the compare fails, is empty or is too large), the run says so and sends the same review again with the diff, which the service reviews without the rest of the repository. Otherwise the diff is sent, and the run says why.
 
 The diff (when it is over 2 MiB, per-file entries over 160 KiB, such as lockfiles and generated files, are left out and the run says so), the list of file paths at the reviewed head, and up to 29 related files (the changed files, the project manifests, and files that mention a changed module). During the review the reviewers may ask for more files by path. Every file sent is read from the reviewed commit; with `--uncommitted`, from a snapshot of the working tree taken at the start (untracked files included, nested repositories left out), so edits made while the review runs do not reach it. Only files of the reviewed tree are sent: untracked ignored files, anything under `.git` and anything outside the repository never are (a file committed to the repository is part of it, ignored or not). File requests are answered only to the service's own address, and redirects are not followed. With the review go the branch name and, in a GitLab merge request pipeline, the merge request title and description. With `--story private` or `never` (or `OHMYBUG_STORY`), that value goes too, on fast and deep hunts.
 

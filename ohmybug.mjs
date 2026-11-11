@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-export const VERSION = "0.5.0";
+export const VERSION = "0.5.1";
 const USAGE = `ohmybug ${VERSION}: review this repository's changes with OhMyBug.
 
 Usage:
@@ -19,9 +19,9 @@ Usage:
   --story auto|private|never  the feed story of this hunt: auto (default) leaves it to the account and key
                              settings; private keeps any story private; never drafts and posts none
 
-Without --uncommitted, a pushed HEAD of a github.com repository whose base is an origin branch (at the same commit
+Without --uncommitted, a pushed HEAD of a github.com repository whose base is an origin branch (at the same commit as
 here) is read by the service from GitHub (public, or with the OhMyBug GitHub App installed), which runs the full fast
-hunt; otherwise, or when the service does not take it from GitHub, the diff is sent and one engine reviews it.
+hunt; otherwise, or when the service does not take it from GitHub, the diff is sent and reviewed without the repository.
 
 The base is --base, else $CI_MERGE_REQUEST_TARGET_BRANCH_NAME (GitLab merge request pipelines),
 else origin/main. With --deep it is a branch name: --base, else $GITHUB_BASE_REF, else main.
@@ -468,16 +468,16 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
         return fitBody({ diff, files: files(MAX_BYTES - Buffer.byteLength(diff)), ...(Object.keys(meta).length ? { meta } : {}) });
       };
       log(`reviewing ${change.changed.length} changed file(s) against ${change.base}`);
-      // With the repository the service runs the full fast hunt; with the diff alone, one engine.
+      // With the repository the service runs the full fast hunt; with the diff alone, a review without it.
       const target = opts.uncommitted ? { why: "--uncommitted reviews the working tree, which only this machine has" } : repoTarget(env, git, change.base, true);
       if (target.why) {
-        log(`reviewing the diff only, with one engine: ${target.why}`);
+        log(`reviewing the diff only, without the repository: ${target.why}`);
         args = payload();
       } else {
         log(`the service reads ${target.repo} at ${target.ref.slice(0, 12)} against ${target.base_branch} from GitHub`);
         args = fitBody({ diff: "", files: files(MAX_BYTES), meta: { ...meta, ...target } });
         fallback = (code) => {
-          log(`the service did not take the change from GitHub (${code}): reviewing the diff only, with one engine${code === "diff_required" ? "; the OhMyBug GitHub App installed on the repository (read-only) gives the full fast hunt" : ""}`);
+          log(`the service did not take the change from GitHub (${code}): reviewing the diff only, without the repository${code === "diff_required" ? "; the OhMyBug GitHub App installed on the repository (read-only) gives the full fast hunt" : ""}`);
           return payload();
         };
       }
