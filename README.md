@@ -76,7 +76,7 @@ exit $code
 | `exit_code` | the run's exit code: 0 no medium or worse bug, 1 at least one, 2 could not run or cut short |
 | `outcome` | `clean`, `blocking`, `failed`, `cut_short`, `timed_out`, `interrupted` (started, then the run could not follow it to the end), `maybe_started` (the start was not confirmed and a hunt may be running: check app.ohmybug.ai/me before running again), `not_run`, `no_changes` |
 | `review` | `{id, status, deep, complete}`: `id` and `status` are null when nothing started; `complete` is true only for a review that finished its whole protocol |
-| `snap_review_id` | the route's snap hunt that ran before the answer (see Hunt modes), else null; `review` is then the fast hunt |
+| `snap_review_id` | the route's snap hunt (see Hunt modes), else null: equal to `review.id` when snap found a medium or worse bug and is the answer; otherwise `review` is the fast hunt after it, or null when that hunt did not start |
 | `live_url` | the report link, or null |
 | `live_url_missing` | why `live_url` is null (for example, the key's live link setting is off), else null |
 | `billing` | `{tariff, charged_usd, paid_by, note}`: on CI billing `tariff` is `ci` and `charged_usd` what was charged; otherwise `tariff` is `confirm` and `charged_usd` null, since the charge comes when someone confirms a medium or worse finding as real, or at the billing deadline; null `tariff` when nothing started or no result was read |

@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-export const VERSION = "0.7.0";
+export const VERSION = "0.8.0";
 const USAGE = `ohmybug ${VERSION}: review this repository's changes with OhMyBug.
 
 Usage:
@@ -20,7 +20,7 @@ Usage:
                              or json (one object, schema ohmybug-cli/result/1, for scripts); once the arguments are read, json
                              and markdown are printed on every exit, and progress stays on stderr
   --step-summary             also append the markdown block to the file $GITHUB_STEP_SUMMARY names (GitHub Actions)
-  --mode lite|snap|fast  the hunt mode, where the service runs it; without it, fast. Each bills only when
+  --mode lite|snap|fast  the hunt mode, where the service runs it; without it, fast (or the snap -> fast route when the service has it on). Each bills only when
                              it finds a real bug, at the mode's price. Lite and snap need the repository (a pushed
                              GitHub commit), and snap a diff under 1 MB; not with --deep or --uncommitted
   --story auto|private|never  the feed story of this hunt: auto (default) leaves it to the account and key
@@ -36,7 +36,7 @@ else origin/main. With --deep it is a branch name: --base, else $GITHUB_BASE_REF
 Environment:
   OHMYBUG_API_KEY     required: a key from https://app.ohmybug.ai/me
   OHMYBUG_URL         default https://mcp.ohmybug.ai
-  OHMYBUG_TIMEOUT_S   how long to wait for the review, 30 to 86400 seconds, default 1800 (10800 with --deep)
+  OHMYBUG_TIMEOUT_S   how long to wait for the review (each hunt of the route), 30 to 86400 seconds, default 1800 (10800 with --deep)
   OHMYBUG_STORY       the --story value when the flag is not given
   OHMYBUG_FORMAT      the --format value when the flag is not given
   OHMYBUG_MODE        the --mode value when the flag is not given (not used with --deep)
@@ -54,6 +54,8 @@ const isBlocking = (f) => rankOf(f) !== 3;
 const MAYBE_STARTED = "A hunt may have started: see https://app.ohmybug.ai/me";
 // Time kept after the paid call for at least one poll and get_findings.
 const POLL_ROOM = 20_000;
+// The route check (get_balance.route) waits this long at most, on its own clock.
+const PROBE_MS = 10_000;
 // Server caps: 30 files and about 10 MiB of diff and files per call; 20 files per answer to a file request.
 const MAX_FILES = 30, MAX_EXTRA = 20, MAX_BYTES = 9 * 1024 * 1024, MAX_BODY = 11_500_000, MAX_FILE = 512 * 1024;
 const MAX_TREE = 1024 * 1024;
@@ -294,6 +296,7 @@ export function resultOf(rec, code) {
   const maybe = rec.maybeStarted && !rec.reviewId;
   const billing = maybe ? { tariff: null, charged_usd: null, paid_by: null,
       note: "a hunt may have started and may be charged: check https://app.ohmybug.ai/me before running again" }
+    : !rec.reviewId && rec.snapId ? { tariff: null, charged_usd: null, paid_by: null, note: "the snap pass ran (snap_review_id; its charge is on stderr), and the fast hunt after it did not start" }
     : !rec.reviewId ? { tariff: null, charged_usd: null, paid_by: null, note: "nothing started, nothing charged" }
     : r?.status === "failed" ? { tariff: b ? "ci" : null, charged_usd: usd(b?.charged_usd), paid_by: strOrNull(b?.paid_by),
       note: usd(b?.charged_usd) ? "the charge the service reported for this review" : "a failed review is free" }
@@ -310,7 +313,7 @@ export function resultOf(rec, code) {
     // The route (get_balance.route): the snap hunt that ran before this answer, or null.
     snap_review_id: rec.snapId ?? null,
     live_url: live,
-    live_url_missing: live ? null : maybe ? "the start was not confirmed: check https://app.ohmybug.ai/me" : !rec.reviewId ? "nothing started"
+    live_url_missing: live ? null : maybe ? "the start was not confirmed: check https://app.ohmybug.ai/me" : !rec.reviewId ? (rec.snapId ? "the fast hunt after the snap pass did not start" : "nothing started")
       : "the service sent no live link: the key's live link setting is off (app.ohmybug.ai/me), or it was not read",
     billing,
     silent_bill: sb ? { at: typeof sb.at === "string" && ISO_UTC.test(sb.at) ? sb.at : null, billed: sb.billed === true, note: silentBillLine(sb) } : null,
@@ -559,20 +562,26 @@ async function review({ opts, env, cwd, out, log, rec }) {
     }
   }
 
-  /** get_balance.route, read once with a short timeout: an optional probe never spends the hunt's clock. */
+  /**
+   * get_balance.route, read once on its own 10 s clock (the hunt's clock starts after it). Anything but a clear answer is
+   * no route, said in one line; an absent route is the normal case and says nothing.
+   */
   async function probeRoute() {
+    const unclear = (why) => { log(`the route check got no clear answer (${why}): running the plain hunt`); return false; };
     try {
       const res = await fetch(`${api}/mcp`, {
-        method: "POST", redirect: "error", signal: AbortSignal.timeout(Math.max(1, Math.min(10_000, deadline - Date.now() - POLL_ROOM))),
+        method: "POST", redirect: "error", signal: AbortSignal.timeout(PROBE_MS),
         headers: { authorization: `Bearer ${env.OHMYBUG_API_KEY}`, "content-type": "application/json", accept: "application/json, text/event-stream" },
         body: JSON.stringify({ jsonrpc: "2.0", id: ++rpcId, method: "tools/call", params: { name: "get_balance", arguments: {} } }),
       });
-      if (!res.ok) return false;
-      const msg = rpcMessage(await res.text());
-      if (msg.error || msg.result?.isError) return false;
+      const text = await res.text();
+      if (!res.ok) return unclear(`HTTP ${res.status}`);
+      const msg = rpcMessage(text);
+      if (msg.error) return unclear(`protocol error: ${msg.error.message}`);
+      if (msg.result?.isError) return unclear("the balance call was refused");
       const route = JSON.parse(msg.result?.content?.[0]?.text ?? "{}")?.route;
       return route?.first === "snap" && route?.then === "fast";
-    } catch { return false; }
+    } catch (e) { return unclear(e.name === "TimeoutError" ? `no answer in ${PROBE_MS / 1000}s` : e.cause?.code ?? e.message); }
   }
 
   /**
@@ -652,24 +661,24 @@ async function review({ opts, env, cwd, out, log, rec }) {
     }
 
     // The client route (get_balance.route, switched on by the service): with no mode and no --deep, a commit the service
-    // reads is hunted as snap first; a snap with no medium or worse bug is followed by an ordinary fast hunt of the same
-    // commit, whose result is the answer. A snap refused for its mode or for the repository, failed or cut short falls
-    // back to that fast hunt too; any other refusal stops the run, as it would without the route.
-    let route = !mode && !opts.deep && serverReads && await probeRoute();
-    const submit = async (asked) => {
+    // reads is hunted as snap first. A snap that finds a medium or worse (or unrated) bug is the answer. Every other way a
+    // snap can end (clean, only lows, failed, cut short, refused for its mode or the repository, timed out, its polling
+    // refused) falls back to the plain hunt the run would have sent without the route, on a clock of its own.
+    const route = !mode && !opts.deep && serverReads && await probeRoute();
+    // The hunt's clock starts after the probe: the probe never spends it.
+    deadline = Date.now() + timeoutS * 1000;
+
+    /** Starts one hunt and makes it the run's current one. `body` is what is sent; a repository refusal on the plain
+     *  hunt falls back to the diff alone. `routed`: the route's snap pass, whose refusals snapPass answers. */
+    const submit = async (body, asked, routed = false) => {
       let sub;
-      try { sub = await tool("submit_review", { ...args, ...asked }, true); }
+      try { sub = await tool("submit_review", { ...body, ...asked }, true); }
       catch (e) {
-        if (route && asked.mode === "snap" && e instanceof Refusal && (String(e.code ?? "").startsWith("mode_") || REPO_REFUSED.has(e.code))) {
-          // The plain hunt the run would have sent without the route: the repository first, the diff only if that is refused.
-          log(`the snap pass was refused (${e.code}): running the fast hunt`);
-          route = false;
-          return submit(modeArg);
-        }
-        if (!fallback || !(e instanceof Refusal) || !REPO_REFUSED.has(e.code)) throw e;
+        // The route's snap handles its own refusals (snapPass); a diff body has nothing left to fall back to.
+        if (routed || !fallback || body !== args || !(e instanceof Refusal) || !REPO_REFUSED.has(e.code)) throw e;
         // A diff alone cannot run a mode that reads the repository: say so instead of a second, refused call.
         if (REPO_MODES.has(mode)) throw new Refusal(`${e.message}; --mode ${mode} needs the repository, so the diff was not sent alone: use --mode fast to review the diff without it`, e.code);
-        sub = await tool("submit_review", { ...fallback(e.code), ...modeArg }, true);
+        sub = await tool("submit_review", { ...fallback(e.code), ...asked }, true);
       }
       if (!sub.review_id) throw new Refusal(`submit_review answered without a review id: ${JSON.stringify(sub).slice(0, 300)}. ${MAYBE_STARTED}`);
       started = sub;
@@ -701,26 +710,50 @@ async function review({ opts, env, cwd, out, log, rec }) {
         if (!r.timed_out) await sleep(5000);
       }
     };
+    /** Everything one hunt reported that the run's answer does not carry: said on stderr, named by its id. */
+    const reportAside = (id, r) => {
+      if (r.status === "failed") log(`${id} failed: ${String(r.error ?? r.summary ?? "no reason given").slice(0, 300)}`);
+      if (r.billing) log(`${id} billing: ${r.billing.charged_usd ? `$${r.billing.charged_usd}` : "nothing"} charged${r.billing.paid_by ? ` (${r.billing.paid_by})` : ""}`);
+      const silent = silentBillLine(r.silent_bill);
+      if (silent) log(`${id} ${silent}`);
+      if (typeof r.story?.note === "string") log(`${id} story: ${r.story.note.replace(/[\x00-\x1f\x7f]+/g, " ").trim().slice(0, 300)}`);
+      if (r.live_url) log(`${id} report: ${r.live_url}`);
+    };
 
-    let r = await finished(await submit(route ? { mode: "snap" } : modeArg));
-    if (route) {
-      const snapCode = exitCodeFor({ ...r, findings: (r.findings ?? []).filter((f) => f && typeof f === "object") });
-      if (snapCode === 1) log("the snap pass found a medium or worse (or unrated) bug: that is the answer, no fast hunt follows");
-      else {
-        // What the snap hunt itself reported, before its answer is replaced: its failure, its charge, its silent bill.
-        const snap = rec.reviewId;
-        if (r.status === "failed") log(`snap pass ${snap} failed: ${String(r.error ?? r.summary ?? "no reason given").slice(0, 300)}`);
-        if (r.billing) log(`snap pass ${snap} billing: ${r.billing.charged_usd ? `$${r.billing.charged_usd}` : "nothing"} charged${r.billing.paid_by ? ` (${r.billing.paid_by})` : ""}`);
-        const snapSilent = silentBillLine(r.silent_bill);
-        if (snapSilent) log(`snap pass ${snap} ${snapSilent}`);
-        log(snapCode === 0 ? `snap pass ${snap}: nothing major; running the full fast hunt` : `snap pass ${snap} did not finish cleanly; running the full fast hunt`);
-        // The next hunt is a new one: nothing of the snap may stand for it if its start fails.
-        rec.snapId = snap;
-        rec.reviewId = rec.live = started = undefined;
-        route = false;
-        deadline = Date.now() + timeoutS * 1000;
-        r = await finished(await submit({}));
+    /** The snap pass: its answer when it IS the answer (a blocking bug), else null with a body for the fast hunt. */
+    const snapPass = async () => {
+      log("the service has the snap -> fast route on: a snap pass first, then the full fast hunt unless snap finds a medium or worse bug (--mode fast skips the route)");
+      let sub;
+      try { sub = await submit(args, { mode: "snap" }, true); }
+      catch (e) {
+        if (!(e instanceof Refusal) || !(String(e.code ?? "").startsWith("mode_") || REPO_REFUSED.has(e.code))) throw e;
+        log(`the snap pass was refused (${e.code}): running the fast hunt`);
+        // The service could not read the repository: the plain hunt goes straight to the diff, not to the same refusal.
+        return { body: REPO_REFUSED.has(e.code) ? fallback(e.code) : args };
       }
+      const id = `snap pass ${sub.review_id}`;
+      rec.snapId = sub.review_id;
+      let r;
+      try { r = await finished(sub); }
+      catch (e) {
+        if (!(e instanceof Deadline) && !(e instanceof Refusal)) throw e;
+        log(`${id} did not finish (${e instanceof Deadline ? "no result within OHMYBUG_TIMEOUT_S" : e.message}): running the full fast hunt`);
+        return { body: args };
+      }
+      const snapCode = exitCodeFor({ ...r, findings: (r.findings ?? []).filter((f) => f && typeof f === "object") });
+      if (snapCode === 1) { log(`${id} found a medium or worse (or unrated) bug: that is the answer, no fast hunt follows`); return { answer: r }; }
+      reportAside(id, r);
+      log(snapCode === 0 ? `${id}: nothing major; running the full fast hunt` : `${id} did not finish cleanly; running the full fast hunt`);
+      return { body: args };
+    };
+
+    let r;
+    const snap = route ? await snapPass() : null;
+    if (snap?.answer) r = snap.answer;
+    else {
+      // A new hunt: nothing of the snap may stand for it if its start fails, and it gets a clock of its own.
+      if (snap) { rec.reviewId = rec.live = started = undefined; deadline = Date.now() + timeoutS * 1000; }
+      r = await finished(await submit(snap?.body ?? args, modeArg));
     }
     const findings = (r.findings ?? []).filter((f) => f && typeof f === "object");
     const code = exitCodeFor({ ...r, findings });
