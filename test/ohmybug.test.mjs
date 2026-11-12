@@ -1136,10 +1136,10 @@ test("a large json result reaches a pipe whole: the CLI process exits after stdo
 });
 test("--mode and OHMYBUG_MODE: sent as the top-level mode of a fast hunt, never with --deep; refused locally where it cannot run", async () => {
   // Parsing: the three modes, both spellings; the rest refused before anything is sent.
-  assert.equal(parseArgs(["--mode", "cheap"]).mode, "cheap");
-  assert.equal(parseArgs(["--mode=ultrafast"]).mode, "ultrafast");
+  assert.equal(parseArgs(["--mode", "lite"]).mode, "lite");
+  assert.equal(parseArgs(["--mode=snap"]).mode, "snap");
   assert.equal(parseArgs(["--mode", "fast", "--uncommitted"]).mode, "fast");
-  for (const argv of [["--mode"], ["--mode", "deep"], ["--mode=full"], ["--mode", "cheap", "--deep"], ["--mode", "fast", "--deep"], ["--mode", "ultrafast", "--uncommitted"]]) {
+  for (const argv of [["--mode"], ["--mode", "deep"], ["--mode=full"], ["--mode", "lite", "--deep"], ["--mode", "fast", "--deep"], ["--mode", "snap", "--uncommitted"]]) {
     assert.equal(typeof parseArgs(argv), "string", argv.join(" "));
   }
   const { dir, git } = repo();
@@ -1149,9 +1149,9 @@ test("--mode and OHMYBUG_MODE: sent as the top-level mode of a fast hunt, never 
   git("update-ref", "refs/remotes/origin/feature", "HEAD");
   const subs = (s) => s.calls.filter((c) => c.name === "submit_review").map((c) => c.args);
   for (const [argv, env, want] of [
-    [["--mode", "cheap"], {}, "cheap"],
-    [[], { OHMYBUG_MODE: "ultrafast" }, "ultrafast"],
-    [["--mode", "fast"], { OHMYBUG_MODE: "cheap" }, "fast"],
+    [["--mode", "lite"], {}, "lite"],
+    [[], { OHMYBUG_MODE: "snap" }, "snap"],
+    [["--mode", "fast"], { OHMYBUG_MODE: "lite" }, "fast"],
     [[], {}, undefined],
     [[], { OHMYBUG_MODE: "" }, undefined],
   ]) {
@@ -1172,16 +1172,16 @@ test("--mode and OHMYBUG_MODE: sent as the top-level mode of a fast hunt, never 
   // --deep: the env default is not sent (the service refuses a mode with deep).
   const deep = await server();
   try {
-    const r = await cli(dir, ["--deep"], { OHMYBUG_URL: deep.url, OHMYBUG_MODE: "cheap" });
+    const r = await cli(dir, ["--deep"], { OHMYBUG_URL: deep.url, OHMYBUG_MODE: "lite" });
     assert.equal(r.code, 0, r.log);
     assert.equal(subs(deep)[0].deep, true);
     assert.equal("mode" in subs(deep)[0], false);
   } finally { await deep.close() }
   // Nothing is sent: a bad env value; a repository mode from the env with --uncommitted.
   for (const [argv, env, why] of [
-    [[], { OHMYBUG_MODE: "turbo" }, /OHMYBUG_MODE must be cheap, ultrafast or fast, not turbo/],
-    [["--uncommitted"], { OHMYBUG_MODE: "cheap" }, /OHMYBUG_MODE=cheap reads the repository/],
-    [["--mode", "cheap", "--uncommitted"], {}, /--mode cheap reads the repository/],
+    [[], { OHMYBUG_MODE: "turbo" }, /OHMYBUG_MODE must be lite, snap or fast, not turbo/],
+    [["--uncommitted"], { OHMYBUG_MODE: "lite" }, /OHMYBUG_MODE=lite reads the repository/],
+    [["--mode", "lite", "--uncommitted"], {}, /--mode lite reads the repository/],
   ]) {
     const s = await server();
     try {
@@ -1200,9 +1200,9 @@ test("--mode and OHMYBUG_MODE: sent as the top-level mode of a fast hunt, never 
     assert.equal(subs(unc)[0].mode, "fast");
     git("checkout", "-q", "app.js");
   } finally { await unc.close() }
-  // A refused GitHub read: cheap and ultrafast are not resent as a diff alone (the service would refuse it);
+  // A refused GitHub read: lite and snap are not resent as a diff alone (the service would refuse it);
   // fast, explicit or by default, is resent with its mode.
-  for (const [argv, resent] of [[["--mode", "cheap"], false], [["--mode", "ultrafast"], false], [["--mode", "fast"], true], [[], true]]) {
+  for (const [argv, resent] of [[["--mode", "lite"], false], [["--mode", "snap"], false], [["--mode", "fast"], true], [[], true]]) {
     const s = await server({ faults: { submit_review: { error: "repo_not_listed", message: "no" } } });
     try {
       const r = await cli(dir, argv, { OHMYBUG_URL: s.url });
@@ -1221,7 +1221,7 @@ test("--mode and OHMYBUG_MODE: sent as the top-level mode of a fast hunt, never 
   for (const code of ["mode_unavailable", "mode_needs_repo", "mode_too_large", "mode_with_deep"]) {
     const s = await server({ faults: { submit_review: { error: code, message: "send mode: fast" } } });
     try {
-      const r = await cli(dir, ["--mode", "ultrafast"], { OHMYBUG_URL: s.url });
+      const r = await cli(dir, ["--mode", "snap"], { OHMYBUG_URL: s.url });
       assert.equal(r.code, 2);
       assert.match(r.log, new RegExp(`${code}: send mode: fast`));
       assert.equal(subs(s).length, 1);

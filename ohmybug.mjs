@@ -20,9 +20,9 @@ Usage:
                              or json (one object, schema ohmybug-cli/result/1, for scripts); once the arguments are read, json
                              and markdown are printed on every exit, and progress stays on stderr
   --step-summary             also append the markdown block to the file $GITHUB_STEP_SUMMARY names (GitHub Actions)
-  --mode cheap|ultrafast|fast  the hunt mode, where the service runs it; without it, fast. Each bills only when
-                             it finds a real bug, at the mode's price. Cheap and ultrafast need the repository (a pushed
-                             GitHub commit), and ultrafast a diff under 1 MB; not with --deep or --uncommitted
+  --mode lite|snap|fast  the hunt mode, where the service runs it; without it, fast. Each bills only when
+                             it finds a real bug, at the mode's price. Lite and snap need the repository (a pushed
+                             GitHub commit), and snap a diff under 1 MB; not with --deep or --uncommitted
   --story auto|private|never  the feed story of this hunt: auto (default) leaves it to the account and key
                              settings; private keeps any story private; never drafts and posts none
 
@@ -64,7 +64,7 @@ const STORY = new Set(["auto", "private", "never"]);
 const FORMATS = new Set(["text", "markdown", "json"]);
 export const RESULT_SCHEMA = "ohmybug-cli/result/1";
 // Modes that read the repository: the service refuses them on a diff alone (mode_needs_repo).
-const MODES = new Set(["cheap", "ultrafast", "fast"]), REPO_MODES = new Set(["cheap", "ultrafast"]);
+const MODES = new Set(["lite", "snap", "fast"]), REPO_MODES = new Set(["lite", "snap"]);
 
 /** A run that cannot go on; `code` is the service's error code when the service refused. */
 export class Refusal extends Error { constructor(message, code) { super(message); this.code = code; } }
@@ -89,7 +89,7 @@ export function parseArgs(argv) {
     }
     else if (a === "--mode" || a.startsWith("--mode=")) {
       const v = a === "--mode" ? argv[++i] : a.slice(7);
-      if (!MODES.has(v)) return "--mode needs cheap, ultrafast or fast";
+      if (!MODES.has(v)) return "--mode needs lite, snap or fast";
       o.mode = v;
     }
     else if (a === "--story" || a.startsWith("--story=")) {
@@ -454,7 +454,7 @@ async function review({ opts, env, cwd, out, log, rec }) {
   const storyMeta = story === "auto" ? {} : { story };
   // The env value is a default: never sent with --deep, where the service takes no mode.
   const mode = opts.deep ? undefined : opts.mode ?? (env.OHMYBUG_MODE || undefined);
-  if (mode !== undefined && !MODES.has(mode)) return fail(`OHMYBUG_MODE must be cheap, ultrafast or fast, not ${env.OHMYBUG_MODE}`);
+  if (mode !== undefined && !MODES.has(mode)) return fail(`OHMYBUG_MODE must be lite, snap or fast, not ${env.OHMYBUG_MODE}`);
   if (!opts.mode && opts.uncommitted && REPO_MODES.has(mode)) return fail(`OHMYBUG_MODE=${mode} reads the repository, which --uncommitted cannot send: commit and push, or set OHMYBUG_MODE=fast`);
   // Absent: a fast hunt.
   const modeArg = mode ? { mode } : {};
