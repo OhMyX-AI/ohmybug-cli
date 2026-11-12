@@ -39,9 +39,10 @@ function repo() {
  * `filesLocation`); `filesUrl` replaces the
  * file request's address; `submitExtra` adds fields to the submit answer; `requestedAgain` makes the second wait_review a second request at the same address.
  */
-async function server({ findings = [], status = "done", review_of_record = true, httpStatus = 200, requested, requestedAgain, sse = false, submitStatus, toolError, faults = {}, filesStatus = 200, filesUrl, filesLocation, extra = {}, submitExtra = {} } = {}, port = 0) {
+async function server({ findings = [], status = "done", review_of_record = true, httpStatus = 200, requested, requestedAgain, sse = false, submitStatus, toolError, faults = {}, filesStatus = 200, filesUrl, filesLocation, extra = {}, submitExtra = {}, balance = {}, byMode } = {}, port = 0) {
   const calls = [], posted = [];
-  let url, asks = 0;
+  // `byMode`: per submitted mode ("fast" when none), { findings, status } for that hunt's answer, and its id rev_<mode>.
+  let url, asks = 0, lastMode = "fast";
   const srv = createServer((req, res) => {
     let body = "";
     req.on("data", (c) => (body += c));
@@ -77,11 +78,15 @@ async function server({ findings = [], status = "done", review_of_record = true,
       }
       const ask = name === "wait_review" && requested ? [requested, requestedAgain][asks] : undefined;
       if (ask) asks++;
+      if (name === "submit_review") lastMode = args.mode ?? "fast";
+      const id = byMode ? `rev_${lastMode}` : "rev_test";
+      const hunt = byMode?.[lastMode] ?? {};
       const result = toolError ? toolError
-        : name === "submit_review" ? { review_id: "rev_test", status: "running", ...submitExtra }
+        : name === "get_balance" ? balance
+        : name === "submit_review" ? { review_id: id, status: "running", ...submitExtra }
         : ask ? { review_id: "rev_test", status: "needs_files", requested_files: ask, files_url: filesUrl ?? `${url}/files` }
-        : name === "wait_review" ? { review_id: "rev_test", status }
-        : { review_id: "rev_test", status, findings, review_of_record, live_url: "https://example.test/live/x", ...extra };
+        : name === "wait_review" ? { review_id: id, status: hunt.status ?? status }
+        : { review_id: id, status: hunt.status ?? status, findings: hunt.findings ?? findings, review_of_record, live_url: "https://example.test/live/x", ...extra };
       const answer = JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: JSON.stringify(result) }], ...(toolError ? { isError: true } : {}) } });
       res.writeHead(200, { "content-type": sse ? "text/event-stream" : "application/json" });
       res.end(sse ? `event: message\ndata: ${answer}\n\n` : answer);
@@ -1227,4 +1232,57 @@ test("--mode and OHMYBUG_MODE: sent as the top-level mode of a fast hunt, never 
       assert.equal(subs(s).length, 1);
     } finally { await s.close() }
   }
+});
+
+test("the route: get_balance.route makes a plain hunt of a readable commit snap first, then the fast hunt when snap leaves no medium or worse", async () => {
+  const { dir, git } = repo();
+  git("remote", "add", "origin", "https://github.com/acme/app.git");
+  writeFileSync(join(dir, "app.js"), "export const a = 61\n");
+  git("commit", "-qam", "c");
+  git("update-ref", "refs/remotes/origin/feature", "HEAD");
+  const ROUTE = { route: { first: "snap", then: "fast" } };
+  const modes = (s) => s.calls.filter((c) => c.name === "submit_review").map((c) => c.args.mode);
+  const asked = (s, name) => s.calls.filter((c) => c.name === name).length;
+  // [server, argv, the submitted modes, exit code, a log line]
+  for (const [opts, argv, want, code, line] of [
+    // A clean snap (or only lows): the fast hunt follows and ITS result is the answer.
+    [{ balance: ROUTE, byMode: { snap: { findings: [low] }, fast: { findings: [high] } } }, [], ["snap", undefined], 1, /quick pass rev_snap: nothing major; running the full fast hunt/],
+    [{ balance: ROUTE, byMode: { snap: { findings: [] }, fast: { findings: [] } } }, [], ["snap", undefined], 0, /review rev_fast started/],
+    // A medium or worse in snap is the answer: no fast hunt.
+    [{ balance: ROUTE, byMode: { snap: { findings: [high] }, fast: { findings: [] } } }, [], ["snap"], 1, /the snap pass found a medium or worse bug/],
+    // A failed snap falls back to the fast hunt.
+    [{ balance: ROUTE, byMode: { snap: { status: "failed" }, fast: { findings: [] } } }, [], ["snap", undefined], 0, /quick pass rev_snap did not finish cleanly/],
+    // A refused snap: the fast hunt, said once.
+    [{ balance: ROUTE, byMode: { fast: { findings: [] } }, faults: { submit_review: { error: "mode_too_large", message: "no" } } }, [], ["snap", undefined], 0, /the snap pass was refused \(mode_too_large\): running the fast hunt/],
+    // No route: one plain hunt; a named mode is the user's word, whatever the route says.
+    [{ byMode: { fast: { findings: [] } } }, [], [undefined], 0, /review rev_fast started/],
+    [{ balance: ROUTE, byMode: { lite: { findings: [] } } }, ["--mode", "lite"], ["lite"], 0, /review rev_lite started/],
+    [{ balance: ROUTE, byMode: { fast: { findings: [] } }, faults: { get_balance: { error: "bad_request", message: "no" } } }, [], [undefined], 0, /review rev_fast started/],
+  ]) {
+    const s = await server(opts);
+    try {
+      const r = await cli(dir, argv, { OHMYBUG_URL: s.url });
+      assert.equal(r.code, code, r.log);
+      assert.deepEqual(modes(s), want, r.log);
+      assert.match(r.log, line);
+      // The balance is read only when the route can apply: no named mode.
+      assert.equal(asked(s, "get_balance"), argv.length ? 0 : 1);
+    } finally { await s.close() }
+  }
+  // Uncommitted work and --deep never read the route.
+  writeFileSync(join(dir, "app.js"), "export const a = 62\n");
+  const s = await server({ balance: ROUTE, byMode: { fast: { findings: [] } } });
+  try {
+    const r = await cli(dir, ["--uncommitted"], { OHMYBUG_URL: s.url });
+    assert.equal(r.code, 0, r.log);
+    assert.deepEqual(modes(s), [undefined]);
+    assert.equal(asked(s, "get_balance"), 0);
+  } finally { await s.close() }
+  git("checkout", "-q", "app.js");
+  const d = await server({ balance: ROUTE });
+  try {
+    const r = await cli(dir, ["--deep"], { OHMYBUG_URL: d.url });
+    assert.equal(r.code, 0, r.log);
+    assert.equal(asked(d, "get_balance"), 0);
+  } finally { await d.close() }
 });

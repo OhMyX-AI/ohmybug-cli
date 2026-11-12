@@ -631,59 +631,86 @@ async function review({ opts, env, cwd, out, log, rec }) {
       }
     }
 
-    let sub;
-    try { sub = await tool("submit_review", { ...args, ...modeArg }, true); }
-    catch (e) {
-      if (!fallback || !(e instanceof Refusal) || !REPO_REFUSED.has(e.code)) throw e;
-      // A diff alone cannot run a mode that reads the repository: say so instead of a second, refused call.
-      if (REPO_MODES.has(mode)) throw new Refusal(`${e.message}; --mode ${mode} needs the repository, so the diff was not sent alone: use --mode fast to review the diff without it`, e.code);
-      sub = await tool("submit_review", { ...fallback(e.code), ...modeArg }, true);
-    }
-    if (!sub.review_id) throw new Refusal(`submit_review answered without a review id: ${JSON.stringify(sub).slice(0, 300)}. ${MAYBE_STARTED}`);
-    started = sub;
-    rec.reviewId = sub.review_id;
-    rec.live = sub.live_url;
-    log(`review ${sub.review_id} started${typeof sub.hunt_mode === "string" && MODES.has(sub.hunt_mode) ? ` in ${sub.hunt_mode} mode` : ""}${sub.recent_median_minutes ? `; recent ones took about ${sub.recent_median_minutes} min` : ""}`);
-    if (sub.live_url) log(`live progress: ${sub.live_url}`);
-
-    const answered = new Set();
-    for (;;) {
-      // The long poll ends before the request's own abort, which is the time left.
-      // 15 s are kept for the get_findings that follows a finished wait.
-      const waitS = Math.min(45, Math.floor((deadline - Date.now()) / 1000) - 15);
-      if (waitS < 1) throw new Deadline("timed out");
-      let r = await tool("wait_review", { review_id: sub.review_id, timeout_s: waitS });
-      // The findings and review_of_record are get_findings'; a finished wait_review carries neither in full.
-      if (r.status === "done" || r.status === "failed") r = await tool("get_findings", { review_id: sub.review_id });
-      if (r.status === "done" || r.status === "failed") {
-        const findings = (r.findings ?? []).filter((f) => f && typeof f === "object");
-        const code = exitCodeFor({ ...r, findings });
-        rec.answer = { ...r, findings };
-        if (r.status === "failed") {
-          const message = `the review failed: ${String(r.error ?? r.summary ?? "no reason given").slice(0, 300)}`;
-          log(message);
-          rec.error = { code: null, message };
+    // The client route (get_balance.route, switched on by the service): with no mode and no --deep, a commit the service
+    // reads is hunted as snap first; a snap with no medium or worse bug is followed by an ordinary fast hunt of the same
+    // commit, whose result is the answer. A snap the service refuses, fails or cuts short falls back to that fast hunt too.
+    let route = !mode && !opts.deep && !!fallback && await tool("get_balance", {}).then((b) => b?.route?.first === "snap", () => false);
+    const submit = async (asked) => {
+      let sub;
+      try { sub = await tool("submit_review", { ...args, ...asked }, true); }
+      catch (e) {
+        if (route && asked.mode === "snap" && e instanceof Refusal && String(e.code ?? "").startsWith("mode_")) {
+          log(`the snap pass was refused (${e.code}): running the fast hunt`);
+          route = false;
+          return submit({});
         }
-        else if (findings.length) out(formatFindings(findings));
-        else out(code === 2 ? "No bugs found before the review was cut short." : "No bugs found.");
-        if (code === 2 && r.status === "done") log("the review did not finish its protocol: this is not a clean result");
-        if (typeof r.story?.note === "string") log(`story: ${r.story.note.replace(/[\x00-\x1f\x7f]+/g, " ").trim().slice(0, 300)}`);
-        if (r.billing) log(`billing: ${r.billing.charged_usd ? `$${r.billing.charged_usd}` : "nothing"} charged${r.billing.paid_by ? ` (${r.billing.paid_by})` : ""}`);
-        const silent = silentBillLine(r.silent_bill);
-        if (silent) log(silent);
-        if (r.live_url) out(`\nReport: ${r.live_url}`);
-        if (code !== 2) out(code === 1 ? `\n${findings.filter(isBlocking).length} blocking bug(s): medium or worse, or unrated.` : "\nNo blocking bugs.");
-        return code;
+        if (!fallback || !(e instanceof Refusal) || !REPO_REFUSED.has(e.code)) throw e;
+        // A diff alone cannot run a mode that reads the repository: say so instead of a second, refused call.
+        if (REPO_MODES.has(mode)) throw new Refusal(`${e.message}; --mode ${mode} needs the repository, so the diff was not sent alone: use --mode fast to review the diff without it`, e.code);
+        // The route reads the repository too: the diff alone goes as the plain hunt.
+        route = false;
+        sub = await tool("submit_review", { ...fallback(e.code), ...modeArg }, true);
       }
-      // One answer per request: the same address may serve a later request for other files. A failed answer is not
-      // marked, so a re-ask is answered again, one poll interval later.
-      const request = r.status === "needs_files" && r.files_url ? `${r.files_url} ${[...(r.requested_files ?? [])].sort().join("\0")}` : null;
-      if (request && !answered.has(request)) {
-        if (await answerFiles(r)) { answered.add(request); continue; }
+      if (!sub.review_id) throw new Refusal(`submit_review answered without a review id: ${JSON.stringify(sub).slice(0, 300)}. ${MAYBE_STARTED}`);
+      started = sub;
+      rec.reviewId = sub.review_id;
+      rec.live = sub.live_url;
+      log(`review ${sub.review_id} started${typeof sub.hunt_mode === "string" && MODES.has(sub.hunt_mode) ? ` in ${sub.hunt_mode} mode` : ""}${sub.recent_median_minutes ? `; recent ones took about ${sub.recent_median_minutes} min` : ""}`);
+      if (sub.live_url) log(`live progress: ${sub.live_url}`);
+      return sub;
+    };
+    /** Waits for the hunt and returns get_findings' answer once it is done or failed. */
+    const finished = async (sub) => {
+      const answered = new Set();
+      for (;;) {
+        // The long poll ends before the request's own abort, which is the time left.
+        // 15 s are kept for the get_findings that follows a finished wait.
+        const waitS = Math.min(45, Math.floor((deadline - Date.now()) / 1000) - 15);
+        if (waitS < 1) throw new Deadline("timed out");
+        let r = await tool("wait_review", { review_id: sub.review_id, timeout_s: waitS });
+        // The findings and review_of_record are get_findings'; a finished wait_review carries neither in full.
+        if (r.status === "done" || r.status === "failed") r = await tool("get_findings", { review_id: sub.review_id });
+        if (r.status === "done" || r.status === "failed") return r;
+        // One answer per request: the same address may serve a later request for other files. A failed answer is not
+        // marked, so a re-ask is answered again, one poll interval later.
+        const request = r.status === "needs_files" && r.files_url ? `${r.files_url} ${[...(r.requested_files ?? [])].sort().join("\0")}` : null;
+        if (request && !answered.has(request)) {
+          if (await answerFiles(r)) { answered.add(request); continue; }
+        }
+        if (Date.now() >= deadline) throw new Deadline("timed out");
+        if (!r.timed_out) await sleep(5000);
       }
-      if (Date.now() >= deadline) throw new Deadline("timed out");
-      if (!r.timed_out) await sleep(5000);
+    };
+
+    let r = await finished(await submit(route ? { mode: "snap" } : modeArg));
+    if (route) {
+      const snapCode = exitCodeFor({ ...r, findings: (r.findings ?? []).filter((f) => f && typeof f === "object") });
+      if (snapCode === 1) log("the snap pass found a medium or worse bug: that is the answer, no fast hunt follows");
+      else {
+        log(snapCode === 0 ? `quick pass ${rec.reviewId}: nothing major; running the full fast hunt` : `quick pass ${rec.reviewId} did not finish cleanly; running the full fast hunt`);
+        rec.snapId = rec.reviewId;
+        route = false;
+        r = await finished(await submit({}));
+      }
     }
+    const findings = (r.findings ?? []).filter((f) => f && typeof f === "object");
+    const code = exitCodeFor({ ...r, findings });
+    rec.answer = { ...r, findings };
+    if (r.status === "failed") {
+      const message = `the review failed: ${String(r.error ?? r.summary ?? "no reason given").slice(0, 300)}`;
+      log(message);
+      rec.error = { code: null, message };
+    }
+    else if (findings.length) out(formatFindings(findings));
+    else out(code === 2 ? "No bugs found before the review was cut short." : "No bugs found.");
+    if (code === 2 && r.status === "done") log("the review did not finish its protocol: this is not a clean result");
+    if (typeof r.story?.note === "string") log(`story: ${r.story.note.replace(/[\x00-\x1f\x7f]+/g, " ").trim().slice(0, 300)}`);
+    if (r.billing) log(`billing: ${r.billing.charged_usd ? `$${r.billing.charged_usd}` : "nothing"} charged${r.billing.paid_by ? ` (${r.billing.paid_by})` : ""}`);
+    const silent = silentBillLine(r.silent_bill);
+    if (silent) log(silent);
+    if (r.live_url) out(`\nReport: ${r.live_url}`);
+    if (code !== 2) out(code === 1 ? `\n${findings.filter(isBlocking).length} blocking bug(s): medium or worse, or unrated.` : "\nNo blocking bugs.");
+    return code;
   } catch (e) {
     const message = e instanceof Refusal ? `could not review: ${e.message}`
       : e instanceof Deadline ? `could not review: no result within OHMYBUG_TIMEOUT_S (${timeoutS}s)` : `could not review: ${e.message ?? e}`;
