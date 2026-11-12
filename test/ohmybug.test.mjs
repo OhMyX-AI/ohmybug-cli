@@ -79,14 +79,16 @@ async function server({ findings = [], status = "done", review_of_record = true,
       const ask = name === "wait_review" && requested ? [requested, requestedAgain][asks] : undefined;
       if (ask) asks++;
       if (name === "submit_review") lastMode = args.mode ?? "fast";
-      const id = byMode ? `rev_${lastMode}` : "rev_test";
-      const hunt = byMode?.[lastMode] ?? {};
+      // Under byMode a poll is answered for the hunt its review_id names (rev_<mode>), never for the latest submit.
+      const polled = byMode && typeof args?.review_id === "string" && args.review_id.startsWith("rev_") ? args.review_id.slice(4) : lastMode;
+      const id = byMode ? `rev_${name === "submit_review" ? lastMode : polled}` : "rev_test";
+      const hunt = byMode?.[name === "submit_review" ? lastMode : polled] ?? {};
       const result = toolError ? toolError
         : name === "get_balance" ? balance
         : name === "submit_review" ? { review_id: id, status: "running", ...submitExtra }
         : ask ? { review_id: "rev_test", status: "needs_files", requested_files: ask, files_url: filesUrl ?? `${url}/files` }
         : name === "wait_review" ? { review_id: id, status: hunt.status ?? status }
-        : { review_id: id, status: hunt.status ?? status, findings: hunt.findings ?? findings, review_of_record, live_url: "https://example.test/live/x", ...extra };
+        : { review_id: id, status: hunt.status ?? status, findings: hunt.findings ?? findings, review_of_record: hunt.review_of_record ?? review_of_record, live_url: "https://example.test/live/x", ...extra };
       const answer = JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: JSON.stringify(result) }], ...(toolError ? { isError: true } : {}) } });
       res.writeHead(200, { "content-type": sse ? "text/event-stream" : "application/json" });
       res.end(sse ? `event: message\ndata: ${answer}\n\n` : answer);
@@ -917,7 +919,7 @@ test("--format json: one object on stdout, the same exit code, every field prese
     assert.equal(r.code, 1);
     assert.equal(r.out.split("\n").length, 1, "one line");
     const j = JSON.parse(r.out);
-    assert.deepEqual(Object.keys(j), ["schema", "cli_version", "exit_code", "outcome", "review", "live_url", "live_url_missing", "billing", "silent_bill", "findings", "counts", "error"]);
+    assert.deepEqual(Object.keys(j), ["schema", "cli_version", "exit_code", "outcome", "review", "snap_review_id", "live_url", "live_url_missing", "billing", "silent_bill", "findings", "counts", "error"]);
     assert.equal(j.schema, "ohmybug-cli/result/1");
     assert.equal(j.cli_version, VERSION);
     assert.deepEqual([j.exit_code, j.outcome], [1, "blocking"]);
@@ -1246,24 +1248,38 @@ test("the route: get_balance.route makes a plain hunt of a readable commit snap 
   // [server, argv, the submitted modes, exit code, a log line]
   for (const [opts, argv, want, code, line] of [
     // A clean snap (or only lows): the fast hunt follows and ITS result is the answer.
-    [{ balance: ROUTE, byMode: { snap: { findings: [low] }, fast: { findings: [high] } } }, [], ["snap", undefined], 1, /quick pass rev_snap: nothing major; running the full fast hunt/],
+    [{ balance: ROUTE, byMode: { snap: { findings: [low] }, fast: { findings: [high] } } }, [], ["snap", undefined], 1, /snap pass rev_snap: nothing major; running the full fast hunt/],
     [{ balance: ROUTE, byMode: { snap: { findings: [] }, fast: { findings: [] } } }, [], ["snap", undefined], 0, /review rev_fast started/],
     // A medium or worse in snap is the answer: no fast hunt.
-    [{ balance: ROUTE, byMode: { snap: { findings: [high] }, fast: { findings: [] } } }, [], ["snap"], 1, /the snap pass found a medium or worse bug/],
+    [{ balance: ROUTE, byMode: { snap: { findings: [high] }, fast: { findings: [] } } }, [], ["snap"], 1, /the snap pass found a medium or worse \(or unrated\) bug: that is the answer, no fast hunt follows/],
     // A failed snap falls back to the fast hunt.
-    [{ balance: ROUTE, byMode: { snap: { status: "failed" }, fast: { findings: [] } } }, [], ["snap", undefined], 0, /quick pass rev_snap did not finish cleanly/],
+    [{ balance: ROUTE, byMode: { snap: { status: "failed" }, fast: { findings: [] } } }, [], ["snap", undefined], 0, /snap pass rev_snap did not finish cleanly/],
+    // A cut-short snap (not of record) falls back to the fast hunt too.
+    [{ balance: ROUTE, byMode: { snap: { findings: [], review_of_record: false }, fast: { findings: [] } } }, [], ["snap", undefined], 0, /snap pass rev_snap did not finish cleanly/],
+    // A snap refused for the repository: the plain fast hunt, from the repository first.
+    [{ balance: ROUTE, byMode: { fast: { findings: [] } }, faults: { submit_review: { error: "repo_not_listed", message: "no" } } }, [], ["snap", undefined], 0, /the snap pass was refused \(repo_not_listed\): running the fast hunt/],
+    // Any other refusal stops the run, as without the route: no second paid call.
+    [{ balance: ROUTE, byMode: { fast: { findings: [] } }, faults: { submit_review: { error: "quota_exceeded", message: "no" } } }, [], ["snap"], 2, /quota_exceeded/],
     // A refused snap: the fast hunt, said once.
     [{ balance: ROUTE, byMode: { fast: { findings: [] } }, faults: { submit_review: { error: "mode_too_large", message: "no" } } }, [], ["snap", undefined], 0, /the snap pass was refused \(mode_too_large\): running the fast hunt/],
     // No route: one plain hunt; a named mode is the user's word, whatever the route says.
     [{ byMode: { fast: { findings: [] } } }, [], [undefined], 0, /review rev_fast started/],
     [{ balance: ROUTE, byMode: { lite: { findings: [] } } }, ["--mode", "lite"], ["lite"], 0, /review rev_lite started/],
     [{ balance: ROUTE, byMode: { fast: { findings: [] } }, faults: { get_balance: { error: "bad_request", message: "no" } } }, [], [undefined], 0, /review rev_fast started/],
+    // A probe the service cannot answer is no route, at once: never a retry loop on the hunt's clock.
+    [{ balance: ROUTE, byMode: { fast: { findings: [] } }, faults: { get_balance: "rpcerror" } }, [], [undefined], 0, /review rev_fast started/],
+    [{ balance: ROUTE, byMode: { fast: { findings: [] } }, faults: { get_balance: 503 } }, [], [undefined], 0, /review rev_fast started/],
+    [{ balance: { route: { first: "snap", then: "lite" } }, byMode: { fast: { findings: [] } } }, [], [undefined], 0, /review rev_fast started/],
   ]) {
     const s = await server(opts);
     try {
+      const t0 = Date.now();
       const r = await cli(dir, argv, { OHMYBUG_URL: s.url });
+      assert.ok(Date.now() - t0 < 15_000, `took ${Date.now() - t0} ms`);
       assert.equal(r.code, code, r.log);
       assert.deepEqual(modes(s), want, r.log);
+      // A route fallback to the repository fast hunt sends no diff: the repository is read, as without the route.
+      if (want.length === 2) assert.equal(s.calls.filter((c) => c.name === "submit_review")[1].args.diff, "", r.log);
       assert.match(r.log, line);
       // The balance is read only when the route can apply: no named mode.
       assert.equal(asked(s, "get_balance"), argv.length ? 0 : 1);
@@ -1285,4 +1301,33 @@ test("the route: get_balance.route makes a plain hunt of a readable commit snap 
     assert.equal(r.code, 0, r.log);
     assert.equal(asked(d, "get_balance"), 0);
   } finally { await d.close() }
+});
+
+test("the route in --format json: the fast hunt is the review, the snap is named; a failed fast start reports no stale snap", async () => {
+  const { dir, git } = repo();
+  git("remote", "add", "origin", "https://github.com/acme/app.git");
+  writeFileSync(join(dir, "app.js"), "export const a = 71\n");
+  git("commit", "-qam", "c");
+  git("update-ref", "refs/remotes/origin/feature", "HEAD");
+  const ROUTE = { route: { first: "snap", then: "fast" } };
+  const ok = await server({ balance: ROUTE, byMode: { snap: { findings: [low] }, fast: { findings: [high] } } });
+  try {
+    const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: ok.url });
+    const j = JSON.parse(r.out);
+    assert.equal(r.code, 1, r.log);
+    assert.equal(j.review.id, "rev_fast");
+    assert.equal(j.snap_review_id, "rev_snap");
+    assert.deepEqual(j.findings.map((f) => f.title), [high.title]);
+  } finally { await ok.close() }
+  // The fast start is refused after a clean snap: nothing of the snap stands for it.
+  const no = await server({ balance: ROUTE, byMode: { snap: { findings: [] } }, faults: { submit_review: [null, { error: "quota_exceeded", message: "no" }] } });
+  try {
+    const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: no.url });
+    const j = JSON.parse(r.out);
+    assert.equal(r.code, 2, r.log);
+    assert.equal(j.outcome, "not_run");
+    assert.equal(j.review.id, null);
+    assert.equal(j.snap_review_id, "rev_snap");
+    assert.doesNotMatch(r.log, /rev_snap may still be running/);
+  } finally { await no.close() }
 });

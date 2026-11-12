@@ -307,6 +307,8 @@ export function resultOf(rec, code) {
     schema: RESULT_SCHEMA, cli_version: VERSION, exit_code: code, outcome,
     review: { id: rec.reviewId ?? null, status: r ? String(r.status) : rec.reviewId ? "running" : null, deep: !!rec.deep,
       complete: r ? r.review_of_record !== false && r.status === "done" : false },
+    // The route (get_balance.route): the snap hunt that ran before this answer, or null.
+    snap_review_id: rec.snapId ?? null,
     live_url: live,
     live_url_missing: live ? null : maybe ? "the start was not confirmed: check https://app.ohmybug.ai/me" : !rec.reviewId ? "nothing started"
       : "the service sent no live link: the key's live link setting is off (app.ohmybug.ai/me), or it was not read",
@@ -467,7 +469,8 @@ async function review({ opts, env, cwd, out, log, rec }) {
   if (apiUrl.protocol !== "https:" && !(apiUrl.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(apiUrl.hostname))) {
     return fail(`OHMYBUG_URL must be https (plain http only to this machine): ${api}`);
   }
-  const deadline = Date.now() + timeoutS * 1000;
+  // Per hunt: the route's fast hunt after snap starts a new one (see review()).
+  let deadline = Date.now() + timeoutS * 1000;
   const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, Math.min(ms, deadline - Date.now()))));
   const execGit = (dir, a, extra) => execFileSync("git", ["-C", dir, ...a], { maxBuffer: 256 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"], ...(extra ? { env: { ...process.env, ...extra } } : {}) });
 
@@ -556,6 +559,22 @@ async function review({ opts, env, cwd, out, log, rec }) {
     }
   }
 
+  /** get_balance.route, read once with a short timeout: an optional probe never spends the hunt's clock. */
+  async function probeRoute() {
+    try {
+      const res = await fetch(`${api}/mcp`, {
+        method: "POST", redirect: "error", signal: AbortSignal.timeout(Math.max(1, Math.min(10_000, deadline - Date.now() - POLL_ROOM))),
+        headers: { authorization: `Bearer ${env.OHMYBUG_API_KEY}`, "content-type": "application/json", accept: "application/json, text/event-stream" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: ++rpcId, method: "tools/call", params: { name: "get_balance", arguments: {} } }),
+      });
+      if (!res.ok) return false;
+      const msg = rpcMessage(await res.text());
+      if (msg.error || msg.result?.isError) return false;
+      const route = JSON.parse(msg.result?.content?.[0]?.text ?? "{}")?.route;
+      return route?.first === "snap" && route?.then === "fast";
+    } catch { return false; }
+  }
+
   /**
    * One try at a file request, never fatal: the service gives up on a request after a few minutes and goes on without
    * the files, so a failed answer costs the reviewers those files, not the run. Files go only to the service's own
@@ -578,7 +597,7 @@ async function review({ opts, env, cwd, out, log, rec }) {
     return false;
   }
 
-  let started, read, fallback;
+  let started, read, fallback, serverReads = false;
   try {
     let root;
     try { root = realpathSync(execGit(cwd, ["rev-parse", "--show-toplevel"]).toString().trim()); }
@@ -623,6 +642,7 @@ async function review({ opts, env, cwd, out, log, rec }) {
         args = payload();
       } else {
         log(`the service reads ${target.repo} at ${target.ref.slice(0, 12)} against ${target.base_branch} from GitHub`);
+        serverReads = true;
         args = fitBody({ diff: "", files: files(MAX_BYTES), meta: { ...meta, ...target } });
         fallback = (code) => {
           log(`the service did not take the change from GitHub (${code}): reviewing the diff only, without the repository${code === "diff_required" ? "; the OhMyBug GitHub App installed on the repository (read-only) gives the full fast hunt" : ""}`);
@@ -633,22 +653,22 @@ async function review({ opts, env, cwd, out, log, rec }) {
 
     // The client route (get_balance.route, switched on by the service): with no mode and no --deep, a commit the service
     // reads is hunted as snap first; a snap with no medium or worse bug is followed by an ordinary fast hunt of the same
-    // commit, whose result is the answer. A snap the service refuses, fails or cuts short falls back to that fast hunt too.
-    let route = !mode && !opts.deep && !!fallback && await tool("get_balance", {}).then((b) => b?.route?.first === "snap", () => false);
+    // commit, whose result is the answer. A snap refused for its mode or for the repository, failed or cut short falls
+    // back to that fast hunt too; any other refusal stops the run, as it would without the route.
+    let route = !mode && !opts.deep && serverReads && await probeRoute();
     const submit = async (asked) => {
       let sub;
       try { sub = await tool("submit_review", { ...args, ...asked }, true); }
       catch (e) {
-        if (route && asked.mode === "snap" && e instanceof Refusal && String(e.code ?? "").startsWith("mode_")) {
+        if (route && asked.mode === "snap" && e instanceof Refusal && (String(e.code ?? "").startsWith("mode_") || REPO_REFUSED.has(e.code))) {
+          // The plain hunt the run would have sent without the route: the repository first, the diff only if that is refused.
           log(`the snap pass was refused (${e.code}): running the fast hunt`);
           route = false;
-          return submit({});
+          return submit(modeArg);
         }
         if (!fallback || !(e instanceof Refusal) || !REPO_REFUSED.has(e.code)) throw e;
         // A diff alone cannot run a mode that reads the repository: say so instead of a second, refused call.
         if (REPO_MODES.has(mode)) throw new Refusal(`${e.message}; --mode ${mode} needs the repository, so the diff was not sent alone: use --mode fast to review the diff without it`, e.code);
-        // The route reads the repository too: the diff alone goes as the plain hunt.
-        route = false;
         sub = await tool("submit_review", { ...fallback(e.code), ...modeArg }, true);
       }
       if (!sub.review_id) throw new Refusal(`submit_review answered without a review id: ${JSON.stringify(sub).slice(0, 300)}. ${MAYBE_STARTED}`);
@@ -685,11 +705,20 @@ async function review({ opts, env, cwd, out, log, rec }) {
     let r = await finished(await submit(route ? { mode: "snap" } : modeArg));
     if (route) {
       const snapCode = exitCodeFor({ ...r, findings: (r.findings ?? []).filter((f) => f && typeof f === "object") });
-      if (snapCode === 1) log("the snap pass found a medium or worse bug: that is the answer, no fast hunt follows");
+      if (snapCode === 1) log("the snap pass found a medium or worse (or unrated) bug: that is the answer, no fast hunt follows");
       else {
-        log(snapCode === 0 ? `quick pass ${rec.reviewId}: nothing major; running the full fast hunt` : `quick pass ${rec.reviewId} did not finish cleanly; running the full fast hunt`);
-        rec.snapId = rec.reviewId;
+        // What the snap hunt itself reported, before its answer is replaced: its failure, its charge, its silent bill.
+        const snap = rec.reviewId;
+        if (r.status === "failed") log(`snap pass ${snap} failed: ${String(r.error ?? r.summary ?? "no reason given").slice(0, 300)}`);
+        if (r.billing) log(`snap pass ${snap} billing: ${r.billing.charged_usd ? `$${r.billing.charged_usd}` : "nothing"} charged${r.billing.paid_by ? ` (${r.billing.paid_by})` : ""}`);
+        const snapSilent = silentBillLine(r.silent_bill);
+        if (snapSilent) log(`snap pass ${snap} ${snapSilent}`);
+        log(snapCode === 0 ? `snap pass ${snap}: nothing major; running the full fast hunt` : `snap pass ${snap} did not finish cleanly; running the full fast hunt`);
+        // The next hunt is a new one: nothing of the snap may stand for it if its start fails.
+        rec.snapId = snap;
+        rec.reviewId = rec.live = started = undefined;
         route = false;
+        deadline = Date.now() + timeoutS * 1000;
         r = await finished(await submit({}));
       }
     }

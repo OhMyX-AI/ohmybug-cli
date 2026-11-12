@@ -47,7 +47,7 @@ The CLI prints each finding (severity, file:line, title, failure scenario) and a
 | Variable | Default | |
 |---|---|---|
 | `OHMYBUG_API_KEY` | required | your key |
-| `OHMYBUG_TIMEOUT_S` | `1800` (`10800` with `--deep`) | how long to wait for the review, 30 to 86400 seconds |
+| `OHMYBUG_TIMEOUT_S` | `1800` (`10800` with `--deep`) | how long to wait for the review (for each hunt of the snap -> fast route), 30 to 86400 seconds |
 | `OHMYBUG_URL` | `https://mcp.ohmybug.ai` | the service |
 | `OHMYBUG_STORY` | `auto` | the `--story` value when the flag is not given |
 | `OHMYBUG_FORMAT` | `text` | the `--format` value when the flag is not given |
@@ -76,6 +76,7 @@ exit $code
 | `exit_code` | the run's exit code: 0 no medium or worse bug, 1 at least one, 2 could not run or cut short |
 | `outcome` | `clean`, `blocking`, `failed`, `cut_short`, `timed_out`, `interrupted` (started, then the run could not follow it to the end), `maybe_started` (the start was not confirmed and a hunt may be running: check app.ohmybug.ai/me before running again), `not_run`, `no_changes` |
 | `review` | `{id, status, deep, complete}`: `id` and `status` are null when nothing started; `complete` is true only for a review that finished its whole protocol |
+| `snap_review_id` | the route's snap hunt that ran before the answer (see Hunt modes), else null; `review` is then the fast hunt |
 | `live_url` | the report link, or null |
 | `live_url_missing` | why `live_url` is null (for example, the key's live link setting is off), else null |
 | `billing` | `{tariff, charged_usd, paid_by, note}`: on CI billing `tariff` is `ci` and `charged_usd` what was charged; otherwise `tariff` is `confirm` and `charged_usd` null, since the charge comes when someone confirms a medium or worse finding as real, or at the billing deadline; null `tariff` when nothing started or no result was read |
@@ -98,9 +99,9 @@ A hunt that found a bug can be told as a short anonymous story on the public fee
 
 `--mode` picks how a fast hunt runs: `lite`, `snap` or `fast` ($4). Each bills only when it finds a real bug, at the price the service sets for the mode; the run prints what it was charged.
 
-Without `--mode` (or `OHMYBUG_MODE`) the hunt is `fast`. The service runs only the modes it lists as live for your key, and a mode it does not run is refused before anything starts. The run prints the mode the hunt started in. `lite` and `snap` read the repository, so they need a pushed GitHub commit the service can read (see below) and do not go with `--uncommitted`; `snap` takes a diff under 1 MB. When the service cannot run the mode asked for, it starts nothing and charges nothing, and the run prints its reason; `--mode fast` always runs. `--mode` does not go with `--deep`, which is its own hunt.
+Without `--mode` (or `OHMYBUG_MODE`) the hunt is `fast`, or the route below when the service has it on. The service runs only the modes it lists as live for your key, and a mode it does not run is refused before anything starts. The run prints the mode the hunt started in. `lite` and `snap` read the repository, so they need a pushed GitHub commit the service can read (see below) and do not go with `--uncommitted`; `snap` takes a diff under 1 MB. When the service cannot run the mode asked for, it starts nothing and charges nothing, and the run prints its reason; `--mode fast` always runs. `--mode` does not go with `--deep`, which is its own hunt.
 
-**The snap -> fast route.** When the service has it switched on, a run with no `--mode`, no `OHMYBUG_MODE` and no `--deep`, of a commit the service reads from GitHub, hunts `snap` first. If snap finds no medium or worse bug, an ordinary fast hunt of the same commit follows, and its result is the answer: the exit code, the findings and the report. If snap finds one, that is the answer, and no fast hunt runs. A snap the service refuses, or that fails or is cut short, falls back to the fast hunt. Both hunts share one `OHMYBUG_TIMEOUT_S`. A named mode, `--uncommitted` and `--deep` never take the route.
+**The snap -> fast route.** When the service has it switched on, a run with no `--mode`, no `OHMYBUG_MODE` and no `--deep`, of a commit the service reads from GitHub, hunts `snap` first (the run asks the service once, briefly, and runs the plain hunt when it gets no clear answer). If snap finds no medium or worse bug, an ordinary fast hunt of the same commit follows, and its result is the answer: the exit code, the findings, the report and `review` in `--format json` (`snap_review_id` names the snap hunt; its lows are not printed). If snap finds one (or an unrated finding), that is the answer, and no fast hunt runs. A snap the service refuses for its mode or for the repository, or that fails or is cut short, falls back to the fast hunt; any other refusal stops the run, as it would without the route. Each hunt bills on its own result: a snap that is the answer at snap's price, a fast hunt after it at fast's; the run prints what each was charged. `OHMYBUG_TIMEOUT_S` applies to each hunt, so a run can take up to twice it. `--mode fast` skips the route; `--uncommitted` and `--deep` never take it.
 
 A key on **CI billing** (the key setting on [app.ohmybug.ai/me](https://app.ohmybug.ai/me)) pays per hunt with no confirm step: the mode's price for a fast hunt ($4 for `fast`) and $12 for a deep one ($24 on a wide change, one spread over 11 or more folder chunks), only when the result holds a medium or worse bug. A clean or failed hunt is free. The run prints what it was charged.
 
