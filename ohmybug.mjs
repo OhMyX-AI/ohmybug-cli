@@ -70,6 +70,8 @@ export const RESULT_SCHEMA = "ohmybug-cli/result/1";
 // The service route: how a continued review is named, how many hunts a chain may hold (the service makes 2: a child never routes),
 // and how often an ended step 1 is read while the service decides (its own tick looks every 10 s).
 const REVIEW_ID = /^rev_[A-Za-z0-9]{1,64}$/;
+// A live link from the service, printed and returned only as one https line with no control characters.
+const liveLink = (u) => (typeof u === "string" && /^https:\/\/[^\s\x00-\x1f\x7f]+$/.test(u) ? u : null);
 const MAX_CHAIN = 2;
 const ROUTE_LOOK_MS = 10_000;
 // The service decides within about 1520 s of step 1's end (its launch clock): the decision wait is never shorter, or a
@@ -287,7 +289,7 @@ const usd = (v) => (v === null || v === undefined || v === "" || !Number.isFinit
 /**
  * The run as one object (schema ohmybug-cli/result/1): fields are only ever added within /1. `rec` is what the run
  * saw: reviewId (the last hunt of a route's chain), continuedFrom (its step 1), routeRefused, routeState (the last
- * route_state read), endedStatus (an ended step 1 the run stopped on without a result), deep, live, answer (the last
+ * route_state read), endedStatus (an ended review the run stopped on without a result), deep, live, answer (the last
  * done/failed body), error, timedOut, maybeStarted, noChanges.
  */
 export function resultOf(rec, code) {
@@ -302,7 +304,7 @@ export function resultOf(rec, code) {
   for (const f of findings) counts[f.severity]++;
   const outcome = rec.noChanges ? "no_changes" : !rec.reviewId ? (rec.maybeStarted ? "maybe_started" : "not_run") : rec.timedOut ? "timed_out"
     : !r ? "interrupted" : r.status === "failed" ? "failed" : code === 1 ? "blocking" : code === 0 ? "clean" : "cut_short";
-  const live = strOrNull(r?.live_url) ?? strOrNull(rec.live);
+  const live = liveLink(r?.live_url) ?? liveLink(rec.live);
   // The service sends a billing block only on CI billing (tariff "ci"); any other block is read as the confirm tariff.
   const b = r?.billing && typeof r.billing === "object" && r.billing.tariff === "ci" ? r.billing : null;
   const sb0 = r?.silent_bill && typeof r.silent_bill === "object";
@@ -366,8 +368,9 @@ export function resultMarkdown(res, folds = true) {
   }
   if (res.error) out.push(`<pre>${escHtml(res.error.message)}</pre>`, "");
   const rv = res.review ?? {};
-  // Ids are held to the review-id pattern before they reach the result; the reason to a plain code.
-  if (rv.continued_from) out.push(`Reviews: ${cell(rv.continued_from)} continued as ${cell(rv.id)}; the result is the last one's.`, "");
+  // Server text: cell() keeps each value to one line and its own code span.
+  const read = ["clean", "blocking", "failed", "cut_short"].includes(res.outcome);
+  if (rv.continued_from) out.push(`Reviews: ${cell(rv.continued_from)} continued as ${cell(rv.id)}${read ? "; the result is the last one's" : ""}.`, "");
   if (rv.route_refused) out.push(`No fast hunt followed the first step: ${cell(rv.route_refused)}.`, "");
   if (rv.route_state === "awaiting_verdicts") out.push("The first step's findings wait for a verdict, which this client does not give: the first step is the result.", "");
   const b = res.billing;
@@ -669,13 +672,13 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS }) {
     if (!sub.review_id) throw new Refusal(`submit_review answered without a review id: ${JSON.stringify(sub).slice(0, 300)}. ${MAYBE_STARTED}`);
     started = sub;
     rec.reviewId = sub.review_id;
-    rec.live = sub.live_url;
+    rec.live = liveLink(sub.live_url) ?? undefined;
     log(`review ${sub.review_id} started${typeof sub.hunt_mode === "string" && MODES.has(sub.hunt_mode) ? ` in ${sub.hunt_mode} mode` : ""}${sub.recent_median_minutes ? `; recent ones took about ${sub.recent_median_minutes} min` : ""}`);
-    if (sub.live_url) log(`live progress: ${sub.live_url}`);
+    if (rec.live) log(`live progress: ${rec.live}`);
 
     const answered = new Set(), chain = [sub.review_id];
     let id = sub.review_id, deciding = false;
-    const liveSeen = new Set(sub.live_url ? [sub.review_id] : []);
+    const liveSeen = new Set(rec.live ? [sub.review_id] : []);
     // Kept for the get_findings that follows a finished wait.
     const READ_RESERVE_S = 15;
     for (;;) {
@@ -687,14 +690,14 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS }) {
       if (r.status === "done" || r.status === "failed") r = await tool("get_findings", { review_id: id });
       // A routed step 1: `final: false` is not the end, whatever its own status and review_of_record say, except
       // awaiting_verdicts, which waits on a confirm this client never sends, so step 1 is its result.
-      const route = typeof r.route_state === "string" ? r.route_state : null;
+      const route = typeof r.route_state === "string" && /^[a-z_]{1,40}$/.test(r.route_state) ? r.route_state : null;
       if (route) rec.routeState = route;
       // A review's link, printed once as soon as a read carries it: a continued hunt's own link comes only from its reads.
-      if (typeof r.live_url === "string" && /^https:\/\/\S+$/.test(r.live_url) && !liveSeen.has(id)) {
+      if (liveLink(r.live_url) && !liveSeen.has(id)) {
         liveSeen.add(id);
         rec.live = r.live_url;
         if (started?.review_id === id) started.live_url = r.live_url;
-        if (id !== sub.review_id) log(`live progress: ${r.live_url}`);
+        log(`live progress: ${r.live_url}`);
       }
       if (route === "continued") {
         const next = r.continued_by;
@@ -759,7 +762,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS }) {
         const silent = silentBillLine(r.silent_bill);
         if (silent) log(silent);
         if (chain.length > 1) out(`\nReviews: ${chain.join(" continued as ")}; the result is review ${id}'s.`);
-        if (r.live_url) out(`\nReport: ${r.live_url}`);
+        if (liveLink(r.live_url)) out(`\nReport: ${r.live_url}`);
         if (code !== 2) out(code === 1 ? `\n${findings.filter(isBlocking).length} blocking bug(s): medium or worse, or unrated.` : "\nNo blocking bugs.");
         return code;
       }
@@ -779,7 +782,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS }) {
     rec.error = { code: e instanceof Refusal && typeof e.code === "string" ? e.code : null, message };
     rec.timedOut = e instanceof Deadline;
     rec.maybeStarted = e instanceof Refusal && e.message.includes(MAYBE_STARTED);
-    if (started) log(`review ${started.review_id} may still be running${started.live_url ? `: ${started.live_url}` : ""}`);
+    if (started) log(`review ${started.review_id} may still be running${liveLink(started.live_url) ? `: ${started.live_url}` : ""}`);
     return 2;
   }
 }

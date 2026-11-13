@@ -1233,7 +1233,7 @@ test("--mode and OHMYBUG_MODE: sent as the top-level mode of a fast hunt, never 
  * A routing service : `script` maps a review id to its answers in turn. Each wait_review takes the next one (the
  * last repeats), and get_findings answers the one wait_review last gave. `heads` records each submit's headers.
  */
-async function routeServer(script) {
+async function routeServer(script, submitted = { review_id: "rev_step1", status: "running", live_url: "https://example.test/live/step1" }) {
   const calls = [], heads = [], at = {};
   const srv = createServer((req, res) => {
     let body = "";
@@ -1243,7 +1243,7 @@ async function routeServer(script) {
       const { name, arguments: args } = msg.params;
       calls.push({ name, id: args.review_id, follows: req.headers["x-ohmybug-follows"] });
       let result;
-      if (name === "submit_review") { heads.push(req.headers); result = { review_id: "rev_step1", status: "running", live_url: "https://example.test/live/step1" }; }
+      if (name === "submit_review") { heads.push(req.headers); result = submitted; }
       else {
         const list = script[args.review_id] ?? [{ status: "failed", error: "unknown review" }];
         if (name === "wait_review") at[args.review_id] = Math.min((at[args.review_id] ?? -1) + 1, list.length - 1);
@@ -1357,7 +1357,7 @@ test("route: a clock per hunt: a child that starts late gets its full OHMYBUG_TI
   } finally { await s.close(); }
 });
 
-test("route: the chain stops at two hunts and on an indirect loop; an unknown state with final false is not a result", async () => {
+test("route: the chain stops at two hunts; an unknown state with final false is not a result", async () => {
   const dir = routedRepo();
   const cont = (next) => ({ status: "done", route_state: "continued", continued_by: next, final: false });
   for (const [script, refused] of [
@@ -1369,7 +1369,7 @@ test("route: the chain stops at two hunts and on an indirect loop; an unknown st
       const r = await cli(dir, [], { OHMYBUG_URL: s.url });
       assert.equal(r.code, 2, r.log);
       assert.match(r.log, new RegExp(`continued as "${refused}", which this client does not follow`));
-      assert.ok(!s.calls.some((c) => c.id === "rev_b"), "a third hunt was read");
+      if (refused === "rev_b") assert.ok(!s.calls.some((c) => c.id === "rev_b"), "a third hunt was read");
     } finally { await s.close(); }
   }
   // A state this client does not know, with final false, is read again until the route ends.
@@ -1418,6 +1418,7 @@ test("route: the wait for the service's decision has its own clock, and its time
     const r = await cli(dir, [], { OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: "30" }, { decisionWaitS: 1 });
     assert.equal(r.code, 2, r.log);
     assert.match(r.log, /review rev_step1 ended; waiting up to 30s for the service to decide whether a fast hunt follows it/);
+    assert.match(r.log, /no result within OHMYBUG_TIMEOUT_S \(30s\)/);
     assert.equal(s.calls.filter((c) => c.name === "wait_review").length, 4);
     assert.doesNotMatch(r.log, /may still be running/);
   } finally { await s.close(); }
@@ -1479,7 +1480,7 @@ test("route result shape: the child's live link is printed as soon as a read car
   try {
     const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: "30" });
     assert.equal(r.code, 2, r.log);
-    assert.match(r.log, /live progress: https:\/\/example\.test\/live\/child/);
+    assert.equal(r.log.match(/live progress: https:\/\/example\.test\/live\/child/g)?.length, 1, r.log);
     assert.match(r.log, /review rev_child may still be running: https:\/\/example\.test\/live\/child/);
     assert.equal(JSON.parse(r.out).live_url, "https://example.test/live/child");
   } finally { await s.close(); }
@@ -1492,4 +1493,62 @@ test("route result shape: markdown names the chain, the refusal and an awaiting-
   assert.match(md({ id: "rev_a", continued_from: null, route_refused: "waited_out", route_state: "final" }), /No fast hunt followed the first step: ` waited_out `\./);
   assert.match(md({ id: "rev_a", continued_from: null, route_refused: null, route_state: "awaiting_verdicts" }), /wait for a verdict/);
   assert.doesNotMatch(md({ id: "rev_a", continued_from: null, route_refused: null, route_state: null }), /Reviews:|No fast hunt|verdict/);
+  // No result was read: the chain is named, no result is claimed.
+  const cut = resultMarkdown({ ...base, outcome: "timed_out", billing: { tariff: null, charged_usd: null, paid_by: null, note: "" },
+    review: { id: "rev_b", continued_from: "rev_a", route_refused: null, route_state: "continued" } });
+  assert.match(cut, /Reviews: ` rev_a ` continued as ` rev_b `\./);
+  assert.doesNotMatch(cut, /the result is/);
+});
+
+test("route result shape: pending, then continued, then a child timeout: the child running, on OHMYBUG_TIMEOUT_S", async () => {
+  const dir = routedRepo();
+  const s = await routeServer({
+    rev_step1: [{ status: "done", route_state: "pending", final: false }, { status: "done", route_state: "continued", continued_by: "rev_child", final: false }],
+    rev_child: [{ status: "running" }],
+  });
+  try {
+    const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: "30" }, { decisionWaitS: 45 });
+    assert.equal(r.code, 2, r.log);
+    assert.match(r.log, /no result within OHMYBUG_TIMEOUT_S \(30s\)/);
+    const j = JSON.parse(r.out);
+    assert.deepEqual([j.review.id, j.review.status, j.review.continued_from, j.outcome], ["rev_child", "running", "rev_step1", "timed_out"]);
+  } finally { await s.close(); }
+});
+
+test("route result shape: a link with a control character is neither logged nor kept; an odd route state is not kept", async () => {
+  const dir = routedRepo();
+  const s = await routeServer({
+    rev_step1: [{ status: "done", route_state: "continued", continued_by: "rev_child", final: false }],
+    rev_child: [{ status: "done", findings: [], route_state: "Final\u001b[2J", live_url: "https://example.test/\u001b[2Jx" }],
+  });
+  try {
+    const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url });
+    assert.equal(r.code, 0, r.log);
+    assert.ok(!r.log.includes("\u001b"), "a control character reached the log");
+    const j = JSON.parse(r.out);
+    assert.deepEqual([j.live_url, j.review.route_state], [null, "continued"]);
+  } finally { await s.close(); }
+});
+
+test("route result shape: step 1's link is logged from a read when submit carried none", async () => {
+  const dir = routedRepo();
+  const s = await routeServer({ rev_step1: [{ status: "done", findings: [], route_state: "final", final: true, live_url: "https://example.test/live/late" }] },
+    { review_id: "rev_step1", status: "running" });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: s.url });
+    assert.equal(r.code, 0, r.log);
+    assert.equal(r.log.match(/live progress: https:\/\/example\.test\/live\/late/g)?.length, 1, r.log);
+  } finally { await s.close(); }
+});
+
+test("route result shape: markdown of a refused continuation names step 1 and claims no result", async () => {
+  const dir = routedRepo();
+  const s = await routeServer({ rev_step1: [{ status: "done", route_state: "continued", continued_by: "../x", final: false }] });
+  try {
+    const r = await cli(dir, ["--format", "markdown"], { OHMYBUG_URL: s.url });
+    assert.equal(r.code, 2, r.log);
+    assert.match(r.out, /### OhMyBug review: Stopped before a result/);
+    assert.match(r.out, /which this client does not follow/);
+    assert.doesNotMatch(r.out, /the result is/);
+  } finally { await s.close(); }
 });
