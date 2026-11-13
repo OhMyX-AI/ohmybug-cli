@@ -916,7 +916,7 @@ test("--format json: one object on stdout, the same exit code, every field prese
     assert.equal(j.schema, "ohmybug-cli/result/1");
     assert.equal(j.cli_version, VERSION);
     assert.deepEqual([j.exit_code, j.outcome], [1, "blocking"]);
-    assert.deepEqual(j.review, { id: "rev_test", status: "done", deep: false, complete: true, continued_from: null, route_refused: null, route_state: null });
+    assert.deepEqual(j.review, { id: "rev_test", status: "done", deep: false, complete: true, continued_from: null, route_refused: null, route_state: null, ended_status: "done" });
     assert.deepEqual([j.live_url, j.live_url_missing], ["https://example.test/live/x", null]);
     assert.deepEqual(j.billing.tariff, "confirm");
     assert.equal(j.billing.charged_usd, null);
@@ -1248,7 +1248,8 @@ async function routeServer(script, submitted = { review_id: "rev_step1", status:
         const list = script[args.review_id] ?? [{ status: "failed", error: "unknown review" }];
         if (name === "wait_review") at[args.review_id] = Math.min((at[args.review_id] ?? -1) + 1, list.length - 1);
         const a = list[at[args.review_id] ?? 0];
-        result = name === "wait_review" ? { review_id: args.review_id, status: a.status, ...(a.live_url ? { live_url: a.live_url } : {}) }
+        const { findings, ...head } = a;
+        result = name === "wait_review" ? { review_id: args.review_id, ...head }
           : { review_id: args.review_id, findings: [], review_of_record: true, ...a };
       }
       res.writeHead(200, { "content-type": "application/json" });
@@ -1360,17 +1361,13 @@ test("route: a clock per hunt: a child that starts late gets its full OHMYBUG_TI
 test("route: the chain stops at two hunts; an unknown state with final false is not a result", async () => {
   const dir = routedRepo();
   const cont = (next) => ({ status: "done", route_state: "continued", continued_by: next, final: false });
-  for (const [script, refused] of [
-    [{ rev_step1: [cont("rev_a")], rev_a: [cont("rev_b")], rev_b: [{ status: "done" }] }, "rev_b"],
-  ]) {
-    const s = await routeServer(script);
-    try {
-      const r = await cli(dir, [], { OHMYBUG_URL: s.url });
-      assert.equal(r.code, 2, r.log);
-      assert.match(r.log, new RegExp(`continued as "${refused}", which this client does not follow`));
-      if (refused === "rev_b") assert.ok(!s.calls.some((c) => c.id === "rev_b"), "a third hunt was read");
-    } finally { await s.close(); }
-  }
+  const s3 = await routeServer({ rev_step1: [cont("rev_a")], rev_a: [cont("rev_b")], rev_b: [{ status: "done" }] });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: s3.url });
+    assert.equal(r.code, 2, r.log);
+    assert.match(r.log, /continued as "rev_b", which this client does not follow/);
+    assert.ok(!s3.calls.some((c) => c.id === "rev_b"), "a third hunt was read");
+  } finally { await s3.close(); }
   // A state this client does not know, with final false, is read again until the route ends.
   const s = await routeServer({ rev_step1: [{ status: "done", findings: [high], route_state: "deciding", final: false }, { status: "done", findings: [low], route_state: "final", final: true }] });
   try {
@@ -1454,7 +1451,7 @@ test("route result shape: a refused continuation reports the ended step 1 as don
     const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url });
     assert.equal(r.code, 2, r.log);
     const j = JSON.parse(r.out);
-    assert.deepEqual([j.review.id, j.review.status, j.review.route_state, j.outcome], ["rev_step1", "done", "continued", "interrupted"]);
+    assert.deepEqual([j.review.id, j.review.status, j.review.ended_status, j.review.route_state, j.outcome], ["rev_step1", "running", "done", "continued", "interrupted"]);
   } finally { await s.close(); }
 });
 
@@ -1466,7 +1463,7 @@ test("route result shape: a decision-wait timeout names the window that ran, and
     assert.equal(r.code, 2, r.log);
     assert.match(r.log, /no result within the service's decision window \(45s\)/);
     const j = JSON.parse(r.out);
-    assert.deepEqual([j.review.status, j.review.route_state, j.outcome], ["done", "pending", "timed_out"]);
+    assert.deepEqual([j.review.status, j.review.ended_status, j.review.route_state, j.outcome], ["running", "done", "pending", "timed_out"]);
   } finally { await s.close(); }
 });
 
@@ -1490,8 +1487,7 @@ test("route result shape: markdown names the chain, the refusal and an awaiting-
   const md = (review) => resultMarkdown({ ...base, review });
   assert.match(md({ id: "rev_b", continued_from: "rev_a", route_refused: null, route_state: "continued" }), /Reviews: ` rev_a ` continued as ` rev_b `; the result is the last one's\./);
   assert.match(md({ id: "rev_a", continued_from: null, route_refused: "waited_out", route_state: "final" }), /No fast hunt followed the first step: ` waited_out `\./);
-  assert.match(md({ id: "rev_a", continued_from: null, route_refused: null, route_state: "awaiting_verdicts" }), /wait for a verdict/);
-  assert.doesNotMatch(md({ id: "rev_a", continued_from: null, route_refused: null, route_state: null }), /Reviews:|No fast hunt|verdict/);
+  assert.doesNotMatch(md({ id: "rev_a", continued_from: null, route_refused: null, route_state: null }), /Reviews:|No fast hunt/);
   // No result was read: the chain is named, no result is claimed.
   const cut = resultMarkdown({ ...base, outcome: "timed_out", billing: { tariff: null, charged_usd: null, paid_by: null, note: "" },
     review: { id: "rev_b", continued_from: "rev_a", route_refused: null, route_state: "continued" } });
@@ -1510,7 +1506,7 @@ test("route result shape: pending, then continued, then a child timeout: the chi
     assert.equal(r.code, 2, r.log);
     assert.match(r.log, /no result within OHMYBUG_TIMEOUT_S \(30s\)/);
     const j = JSON.parse(r.out);
-    assert.deepEqual([j.review.id, j.review.status, j.review.continued_from, j.outcome], ["rev_child", "running", "rev_step1", "timed_out"]);
+    assert.deepEqual([j.review.id, j.review.status, j.review.ended_status, j.review.route_state, j.review.continued_from, j.outcome], ["rev_child", "running", null, null, "rev_step1", "timed_out"]);
   } finally { await s.close(); }
 });
 
@@ -1526,7 +1522,7 @@ test("route result shape: a link with a control character is neither logged nor 
     assert.ok(!r.log.includes("\u001b"), "a control character reached the log");
     const j = JSON.parse(r.out);
     assert.deepEqual([j.live_url, j.review.route_state], [null, null]);
-    assert.equal(j.live_url_missing, "the link the service sent is not a plain https URL");
+    assert.match(j.live_url_missing, /^the service sent no live link/);
   } finally { await s.close(); }
 });
 
@@ -1545,14 +1541,14 @@ test("route result shape: markdown of a child stopped by its clock names the cha
   const dir = routedRepo();
   const s = await routeServer({
     rev_step1: [{ status: "done", route_state: "continued", continued_by: "rev_child", final: false }],
-    rev_child: [{ status: "running", route_state: "awaiting_verdicts" }],
+    rev_child: [{ status: "running" }],
   });
   try {
     const r = await cli(dir, ["--format", "markdown"], { OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: "30" });
     assert.equal(r.code, 2, r.log);
     assert.match(r.out, /### OhMyBug review: Timed out before a result/);
     assert.match(r.out, /Reviews: ` rev_step1 ` continued as ` rev_child `\./);
-    assert.doesNotMatch(r.out, /the result is|first step is the result/);
+    assert.doesNotMatch(r.out, /the result is/);
   } finally { await s.close(); }
 });
 
@@ -1567,23 +1563,65 @@ test("route: a route state that is not a plain code still holds an ended step 1 
   } finally { await s.close(); }
 });
 
-test("live links: a submit or read link that is not a plain https URL is never printed or returned", async () => {
-  const dir = routedRepo();
-  for (const bad of ["http://example.test/x", "javascript:alert(1)", "https://example.test/\u009b2J", "https://example.test/\u202ex", "https://example.test/\u001b[2J", 7]) {
-    // On the submit answer, with a timeout so the "may still be running" line is drawn too.
-    let s = await routeServer({ rev_step1: [{ status: "running" }] }, { review_id: "rev_step1", status: "running", live_url: bad });
-    try {
-      const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: "16" });
-      assert.equal(r.code, 2, r.log);
-      assert.doesNotMatch(r.log, /live progress|example\.test|javascript/, String(bad));
-      assert.equal(JSON.parse(r.out).live_url, null);
-    } finally { await s.close(); }
-    // On a finished read, in text mode: no Report line with it on stdout.
-    s = await routeServer({ rev_step1: [{ status: "done", findings: [], route_state: "final", final: true, live_url: bad }] }, { review_id: "rev_step1", status: "running" });
-    try {
-      const r = await cli(dir, [], { OHMYBUG_URL: s.url });
-      assert.equal(r.code, 0, r.log);
-      assert.doesNotMatch(r.out + r.log, /example\.test|javascript/, String(bad));
-    } finally { await s.close(); }
+test("live links: only a plain ASCII https URL is a link, in the JSON result and in markdown", () => {
+  const bad = ["https://e.test/a b", "https://e.test/a\tb", "https://e.test/\u001b[2J", "https://e.test/\u009b2J", "https://e.test/؜x", "https://e.test/​x", "https://e.test/‎x",
+    "https://e.test/‮x", "https://e.test/⁦x", "https://e.test/﻿x", "https://e.test/é", "https://e.test/a<b", "https://e.test/a>b", "https://e.test/a(b", "https://e.test/a)b",
+    "https://e.test/a[b", "https://e.test/a]b", "https://e.test/a`b", "http://e.test/x", "javascript:alert(1)", "https://", 7];
+  for (const u of bad) {
+    assert.equal(resultOf({ reviewId: "rev_x", live: u }, 2).live_url, null, JSON.stringify(u));
+    assert.equal(resultOf({ reviewId: "rev_x", answer: { status: "done", findings: [], live_url: u } }, 0).live_url, null, JSON.stringify(u));
+    const res = { ...resultOf({ reviewId: "rev_x", answer: { status: "done", findings: [] } }, 0), live_url: u };
+    assert.match(resultMarkdown(res), /Report: none/, JSON.stringify(u));
   }
+  const ok = "https://app.ohmybug.ai/live/aB-_9.~?x=1&y=%20#f";
+  assert.equal(resultOf({ reviewId: "rev_x", live: ok }, 2).live_url, ok);
+  assert.match(resultMarkdown(resultOf({ reviewId: "rev_x", answer: { status: "done", findings: [], live_url: ok } }, 0)), /Report: <https:\/\/app\.ohmybug\.ai\/live\/aB/);
+});
+
+test("live links: a bad link is not printed from the submit answer, a running read or a finished read", async () => {
+  const dir = routedRepo();
+  const bad = "https://example.test/‮x";
+  // Submit: no progress line, and the timeout's "may still be running" line carries no link.
+  let s = await routeServer({ rev_step1: [{ status: "running" }] }, { review_id: "rev_step1", status: "running", live_url: bad });
+  try {
+    const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: "30" });
+    assert.equal(r.code, 2, r.log);
+    assert.match(r.log, /review rev_step1 may still be running$/m);
+    assert.doesNotMatch(r.log, /live progress|example\.test/);
+    assert.equal(JSON.parse(r.out).live_url, null);
+  } finally { await s.close(); }
+  // A running read, then a finished one, in text mode: no progress line, no Report line.
+  s = await routeServer({ rev_step1: [{ status: "running", live_url: bad }, { status: "done", findings: [], route_state: "final", final: true, live_url: bad }] }, { review_id: "rev_step1", status: "running" });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: s.url });
+    assert.equal(r.code, 0, r.log);
+    assert.equal(s.calls.filter((c) => c.name === "wait_review").length, 2);
+    assert.doesNotMatch(r.out + r.log, /live progress|Report:|example\.test/);
+  } finally { await s.close(); }
+});
+
+test("live links: an ended review's link is the report, never logged as live progress", async () => {
+  const dir = routedRepo();
+  const s = await routeServer({ rev_step1: [{ status: "done", findings: [], route_state: "final", final: true, live_url: "https://example.test/live/late" }] }, { review_id: "rev_step1", status: "running" });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: s.url });
+    assert.equal(r.code, 0, r.log);
+    assert.doesNotMatch(r.log, /live progress/);
+    assert.match(r.out, /Report: https:\/\/example\.test\/live\/late/);
+  } finally { await s.close(); }
+});
+
+test("route result shape: route_state and ended_status are the last read's, of the review the result names", async () => {
+  // A child that was never read reports nothing of step 1.
+  const never = resultOf({ reviewId: "rev_child", continuedFrom: "rev_step1", read: { id: "rev_step1", status: "done", route: "continued" } }, 2).review;
+  assert.deepEqual([never.status, never.ended_status, never.route_state], ["running", null, null]);
+  // A running step 1: its state from wait_review, no ended status.
+  const dir = routedRepo();
+  const s = await routeServer({ rev_step1: [{ status: "running", route_state: "snap_running", final: false }] });
+  try {
+    const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: "30" });
+    assert.equal(r.code, 2, r.log);
+    const j = JSON.parse(r.out);
+    assert.deepEqual([j.review.status, j.review.ended_status, j.review.route_state, j.outcome], ["running", null, "snap_running", "timed_out"]);
+  } finally { await s.close(); }
 });
