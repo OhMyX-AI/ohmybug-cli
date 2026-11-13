@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-export const VERSION = "0.7.0";
+export const VERSION = "0.8.0";
 const USAGE = `ohmybug ${VERSION}: review this repository's changes with OhMyBug.
 
 Usage:
@@ -36,8 +36,9 @@ else origin/main. With --deep it is a branch name: --base, else $GITHUB_BASE_REF
 Environment:
   OHMYBUG_API_KEY     required: a key from https://app.ohmybug.ai/me
   OHMYBUG_URL         default https://mcp.ohmybug.ai
-  OHMYBUG_TIMEOUT_S   how long to wait for each review, 30 to 86400 seconds, default 1800 (10800 with --deep); a review
-                      the service continues with another gets its own full wait
+  OHMYBUG_TIMEOUT_S   how long to wait for each review, 30 to 86400 seconds, default 1800 (10800 with --deep). When the
+                      service continues a quick first step with the fast hunt, the wait for its decision (up to about
+                      25 minutes) and the fast hunt each get their own full wait
   OHMYBUG_STORY       the --story value when the flag is not given
   OHMYBUG_FORMAT      the --format value when the flag is not given
   OHMYBUG_MODE        the --mode value when the flag is not given (not used with --deep)
@@ -693,7 +694,7 @@ async function review({ opts, env, cwd, out, log, rec }) {
       // does not know): not a result yet.
       if (route && r.final === false && route !== "awaiting_verdicts" && (r.status === "done" || r.status === "failed")) {
         if (!deciding) {
-          // The service may start the fast hunt up to 15 minutes after step 1 ends: that wait is not step 1's, so it
+          // The service may start the fast hunt up to about 25 minutes after step 1 ends: that wait is not step 1's, so it
           // gets its own clock, and a timeout in it names no ended review as running.
           deciding = true;
           deadline = Date.now() + timeoutS * 1000;
