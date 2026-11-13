@@ -36,7 +36,8 @@ else origin/main. With --deep it is a branch name: --base, else $GITHUB_BASE_REF
 Environment:
   OHMYBUG_API_KEY     required: a key from https://app.ohmybug.ai/me
   OHMYBUG_URL         default https://mcp.ohmybug.ai
-  OHMYBUG_TIMEOUT_S   how long to wait for the review, 30 to 86400 seconds, default 1800 (10800 with --deep)
+  OHMYBUG_TIMEOUT_S   how long to wait for each review, 30 to 86400 seconds, default 1800 (10800 with --deep); a review
+                      the service continues with another gets its own full wait
   OHMYBUG_STORY       the --story value when the flag is not given
   OHMYBUG_FORMAT      the --format value when the flag is not given
   OHMYBUG_MODE        the --mode value when the flag is not given (not used with --deep)
@@ -63,6 +64,11 @@ const TRANSIENT_TOOL = new Set(["internal", "rate_limited"]);
 const STORY = new Set(["auto", "private", "never"]);
 const FORMATS = new Set(["text", "markdown", "json"]);
 export const RESULT_SCHEMA = "ohmybug-cli/result/1";
+// The service route: how a continued review is named, how many hunts a chain may hold (the service makes 2),
+// and how often an ended step 1 is read while the service decides (its own tick looks every 10 s).
+const REVIEW_ID = /^rev_[A-Za-z0-9]{1,64}$/;
+const MAX_CHAIN = 3;
+const ROUTE_LOOK_MS = 10_000;
 // Modes that read the repository: the service refuses them on a diff alone (mode_needs_repo).
 const MODES = new Set(["lite", "snap", "fast"]), REPO_MODES = new Set(["lite", "snap"]);
 
@@ -273,7 +279,8 @@ const usd = (v) => (v === null || v === undefined || v === "" || !Number.isFinit
 
 /**
  * The run as one object (schema ohmybug-cli/result/1): fields are only ever added within /1. `rec` is what the run
- * saw: reviewId, deep, live, answer (the last done/failed body), error, timedOut, maybeStarted, noChanges.
+ * saw: reviewId (the last hunt of a route's chain), continuedFrom (its step 1), routeRefused, deep, live, answer (the last
+ * done/failed body), error, timedOut, maybeStarted, noChanges.
  */
 export function resultOf(rec, code) {
   const r = rec.answer;
@@ -306,7 +313,8 @@ export function resultOf(rec, code) {
   return {
     schema: RESULT_SCHEMA, cli_version: VERSION, exit_code: code, outcome,
     review: { id: rec.reviewId ?? null, status: r ? String(r.status) : rec.reviewId ? "running" : null, deep: !!rec.deep,
-      complete: r ? r.review_of_record !== false && r.status === "done" : false },
+      complete: r ? r.review_of_record !== false && r.status === "done" : false,
+      continued_from: rec.continuedFrom ?? null, route_refused: rec.routeRefused ?? null },
     live_url: live,
     live_url_missing: live ? null : maybe ? "the start was not confirmed: check https://app.ohmybug.ai/me" : !rec.reviewId ? "nothing started"
       : "the service sent no live link: the key's live link setting is off (app.ohmybug.ai/me), or it was not read",
@@ -467,7 +475,8 @@ async function review({ opts, env, cwd, out, log, rec }) {
   if (apiUrl.protocol !== "https:" && !(apiUrl.protocol === "http:" && ["127.0.0.1", "localhost", "[::1]"].includes(apiUrl.hostname))) {
     return fail(`OHMYBUG_URL must be https (plain http only to this machine): ${api}`);
   }
-  const deadline = Date.now() + timeoutS * 1000;
+  // A clock per hunt: a hunt the service continues with another review gives that one a fresh OHMYBUG_TIMEOUT_S.
+  let deadline = Date.now() + timeoutS * 1000;
   const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, Math.min(ms, deadline - Date.now()))));
   const execGit = (dir, a, extra) => execFileSync("git", ["-C", dir, ...a], { maxBuffer: 256 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"], ...(extra ? { env: { ...process.env, ...extra } } : {}) });
 
@@ -525,7 +534,9 @@ async function review({ opts, env, cwd, out, log, rec }) {
     for (let attempt = 0; ; attempt++) {
       const text = await http(`${api}/mcp`, {
         method: "POST",
-        headers: { authorization: `Bearer ${env.OHMYBUG_API_KEY}`, "content-type": "application/json", accept: "application/json, text/event-stream" },
+        // The header says this client follows `continued_by`: the service may run a cheaper step 1 and continue it.
+        headers: { authorization: `Bearer ${env.OHMYBUG_API_KEY}`, "content-type": "application/json", accept: "application/json, text/event-stream",
+          ...(name === "submit_review" ? { "x-ohmybug-follows": "continued_by" } : {}) },
         body: JSON.stringify({ jsonrpc: "2.0", id: ++rpcId, method: "tools/call", params: { name, arguments: args } }),
       }, { once });
       let msg = null, body = null, raw = "";
@@ -646,16 +657,46 @@ async function review({ opts, env, cwd, out, log, rec }) {
     log(`review ${sub.review_id} started${typeof sub.hunt_mode === "string" && MODES.has(sub.hunt_mode) ? ` in ${sub.hunt_mode} mode` : ""}${sub.recent_median_minutes ? `; recent ones took about ${sub.recent_median_minutes} min` : ""}`);
     if (sub.live_url) log(`live progress: ${sub.live_url}`);
 
-    const answered = new Set();
+    const answered = new Set(), chain = [sub.review_id];
+    let id = sub.review_id;
     for (;;) {
       // The long poll ends before the request's own abort, which is the time left.
       // 15 s are kept for the get_findings that follows a finished wait.
       const waitS = Math.min(45, Math.floor((deadline - Date.now()) / 1000) - 15);
       if (waitS < 1) throw new Deadline("timed out");
-      let r = await tool("wait_review", { review_id: sub.review_id, timeout_s: waitS });
+      let r = await tool("wait_review", { review_id: id, timeout_s: waitS });
       // The findings and review_of_record are get_findings'; a finished wait_review carries neither in full.
-      if (r.status === "done" || r.status === "failed") r = await tool("get_findings", { review_id: sub.review_id });
+      if (r.status === "done" || r.status === "failed") r = await tool("get_findings", { review_id: id });
+      // A routed step 1: `final: false` is never the end, whatever its own status and review_of_record say.
+      const route = typeof r.route_state === "string" ? r.route_state : null;
+      if (route === "continued") {
+        const next = r.continued_by;
+        if (typeof next !== "string" || !REVIEW_ID.test(next) || chain.includes(next) || chain.length >= MAX_CHAIN) {
+          throw new Refusal(`review ${id} named a continuation this client cannot follow (${String(next).slice(0, 80)})`);
+        }
+        chain.push(next);
+        log(`review ${id} continues as review ${next}; waiting up to ${timeoutS}s for it`);
+        id = next;
+        started = { review_id: next };
+        rec.reviewId = next;
+        rec.continuedFrom = chain[0];
+        rec.live = undefined;
+        deadline = Date.now() + timeoutS * 1000;
+        continue;
+      }
+      // Step 1 ended and the service is still deciding whether a fast hunt follows: not a result yet.
+      if ((route === "pending" || route === "snap_running") && (r.status === "done" || r.status === "failed")) {
+        // The next read needs its own 15 s reserve (above): a sleep that leaves less ends the wait now.
+        if (Date.now() + ROUTE_LOOK_MS + 16_000 > deadline) throw new Deadline("timed out");
+        await sleep(ROUTE_LOOK_MS);
+        continue;
+      }
       if (r.status === "done" || r.status === "failed") {
+        if (route === "awaiting_verdicts") log(`review ${id}: a fast hunt follows only after its findings are judged; this client does not judge, so this review is the result`);
+        if (route === "final" && typeof r.continuation_refused === "string" && /^[a-z0-9_]{1,60}$/.test(r.continuation_refused)) {
+          rec.routeRefused = r.continuation_refused;
+          log(`review ${id} is the result: no fast hunt followed it (${r.continuation_refused})`);
+        }
         const findings = (r.findings ?? []).filter((f) => f && typeof f === "object");
         const code = exitCodeFor({ ...r, findings });
         rec.answer = { ...r, findings };
@@ -671,6 +712,7 @@ async function review({ opts, env, cwd, out, log, rec }) {
         if (r.billing) log(`billing: ${r.billing.charged_usd ? `$${r.billing.charged_usd}` : "nothing"} charged${r.billing.paid_by ? ` (${r.billing.paid_by})` : ""}`);
         const silent = silentBillLine(r.silent_bill);
         if (silent) log(silent);
+        if (chain.length > 1) out(`\nReviews: ${chain.join(" continued as ")}; the result is review ${id}'s.`);
         if (r.live_url) out(`\nReport: ${r.live_url}`);
         if (code !== 2) out(code === 1 ? `\n${findings.filter(isBlocking).length} blocking bug(s): medium or worse, or unrated.` : "\nNo blocking bugs.");
         return code;

@@ -47,7 +47,7 @@ The CLI prints each finding (severity, file:line, title, failure scenario) and a
 | Variable | Default | |
 |---|---|---|
 | `OHMYBUG_API_KEY` | required | your key |
-| `OHMYBUG_TIMEOUT_S` | `1800` (`10800` with `--deep`) | how long to wait for the review, 30 to 86400 seconds |
+| `OHMYBUG_TIMEOUT_S` | `1800` (`10800` with `--deep`) | how long to wait for each review, 30 to 86400 seconds; when the service continues a review with another one (a quick first step, then the fast hunt), that one gets its own full wait |
 | `OHMYBUG_URL` | `https://mcp.ohmybug.ai` | the service |
 | `OHMYBUG_STORY` | `auto` | the `--story` value when the flag is not given |
 | `OHMYBUG_FORMAT` | `text` | the `--format` value when the flag is not given |

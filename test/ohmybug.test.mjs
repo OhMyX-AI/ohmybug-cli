@@ -916,7 +916,7 @@ test("--format json: one object on stdout, the same exit code, every field prese
     assert.equal(j.schema, "ohmybug-cli/result/1");
     assert.equal(j.cli_version, VERSION);
     assert.deepEqual([j.exit_code, j.outcome], [1, "blocking"]);
-    assert.deepEqual(j.review, { id: "rev_test", status: "done", deep: false, complete: true });
+    assert.deepEqual(j.review, { id: "rev_test", status: "done", deep: false, complete: true, continued_from: null, route_refused: null });
     assert.deepEqual([j.live_url, j.live_url_missing], ["https://example.test/live/x", null]);
     assert.deepEqual(j.billing.tariff, "confirm");
     assert.equal(j.billing.charged_usd, null);
@@ -1227,4 +1227,129 @@ test("--mode and OHMYBUG_MODE: sent as the top-level mode of a fast hunt, never 
       assert.equal(subs(s).length, 1);
     } finally { await s.close() }
   }
+});
+
+/**
+ * A routing service : `script` maps a review id to its answers in turn. Each wait_review takes the next one (the
+ * last repeats), and get_findings answers the one wait_review last gave. `heads` records each submit's headers.
+ */
+async function routeServer(script) {
+  const calls = [], heads = [], at = {};
+  const srv = createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      const msg = JSON.parse(body);
+      const { name, arguments: args } = msg.params;
+      calls.push({ name, id: args.review_id, t: Date.now() });
+      let result;
+      if (name === "submit_review") { heads.push(req.headers); result = { review_id: "rev_step1", status: "running" }; }
+      else {
+        const list = script[args.review_id] ?? [{ status: "failed", error: "unknown review" }];
+        if (name === "wait_review") at[args.review_id] = Math.min((at[args.review_id] ?? -1) + 1, list.length - 1);
+        const a = list[at[args.review_id] ?? 0];
+        result = name === "wait_review" ? { review_id: args.review_id, status: a.status }
+          : { review_id: args.review_id, findings: [], review_of_record: true, ...a };
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: JSON.stringify(result) }] } }));
+    });
+  });
+  srv.keepAliveTimeout = 60_000;
+  await new Promise((r) => srv.listen(0, "127.0.0.1", r));
+  return { url: `http://127.0.0.1:${srv.address().port}`, calls, heads, close: () => new Promise((r) => { srv.close(r); srv.closeIdleConnections?.(); }) };
+}
+
+// A pushed GitHub commit: the submit the service may route.
+function routedRepo() {
+  const { dir, git } = repo();
+  writeFileSync(join(dir, "app.js"), "export const a = 41\n");
+  git("commit", "-qam", "c");
+  git("remote", "add", "origin", "git@github.com:acme/app.git");
+  git("update-ref", "refs/remotes/origin/feature", "HEAD");
+  return dir;
+}
+
+test("route: snap_running, pending, then continued: the child's result and exit code, both reviews named, the header on submit only", async () => {
+  const dir = routedRepo();
+  const s = await routeServer({
+    rev_step1: [
+      { status: "running", route_state: "snap_running", final: false },
+      { status: "done", findings: [low], route_state: "pending", final: false },
+      { status: "done", findings: [low], route_state: "continued", continued_by: "rev_child", final: false },
+    ],
+    rev_child: [{ status: "done", findings: [high], live_url: "https://example.test/live/child" }],
+  });
+  try {
+    const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url });
+    assert.equal(r.code, 1, r.log);
+    const j = JSON.parse(r.out);
+    assert.deepEqual([j.review.id, j.review.continued_from, j.review.route_refused, j.counts.total, j.findings[0].severity, j.live_url],
+      ["rev_child", "rev_step1", null, 1, "high", "https://example.test/live/child"]);
+    assert.match(r.log, /review rev_step1 continues as review rev_child/);
+    assert.equal(s.heads.length, 1);
+    assert.equal(s.heads[0]["x-ohmybug-follows"], "continued_by");
+    const text = await cli(dir, [], { OHMYBUG_URL: s.url });
+    assert.match(text.out, /Reviews: rev_step1 continued as rev_child; the result is review rev_child's\./);
+    assert.doesNotMatch(text.out, /naming/);
+  } finally { await s.close(); }
+});
+
+test("route: final with continuation_refused prints step 1 and its reason; awaiting_verdicts stops on step 1 (this client never judges)", async () => {
+  const dir = routedRepo();
+  let s = await routeServer({ rev_step1: [{ status: "done", findings: [low], route_state: "final", final: true, continuation_refused: "waited_out" }] });
+  try {
+    const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url });
+    assert.equal(r.code, 0, r.log);
+    const j = JSON.parse(r.out);
+    assert.deepEqual([j.review.id, j.review.continued_from, j.review.route_refused, j.counts.low], ["rev_step1", null, "waited_out", 1]);
+    assert.match(r.log, /no fast hunt followed it \(waited_out\)/);
+  } finally { await s.close(); }
+  s = await routeServer({ rev_step1: [{ status: "done", findings: [high], route_state: "awaiting_verdicts", final: false }] });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: s.url });
+    assert.equal(r.code, 1, r.log);
+    assert.match(r.log, /this client does not judge/);
+    assert.equal(s.calls.filter((c) => c.name === "get_findings").length, 1);
+  } finally { await s.close(); }
+});
+
+test("route: a failed step 1 the service continues is not the result; a continuation that loops or is malformed is refused", async () => {
+  const dir = routedRepo();
+  let s = await routeServer({
+    rev_step1: [{ status: "failed", route_state: "continued", continued_by: "rev_child", final: false }],
+    rev_child: [{ status: "done", findings: [] }],
+  });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: s.url });
+    assert.equal(r.code, 0, r.log);
+    assert.doesNotMatch(r.log, /the review failed/);
+  } finally { await s.close(); }
+  for (const next of ["rev_step1", "../x", 7]) {
+    s = await routeServer({ rev_step1: [{ status: "done", route_state: "continued", continued_by: next, final: false }] });
+    try {
+      const r = await cli(dir, [], { OHMYBUG_URL: s.url });
+      assert.equal(r.code, 2, `${next}: ${r.log}`);
+      assert.match(r.log, /named a continuation this client cannot follow/);
+    } finally { await s.close(); }
+  }
+});
+
+test("route: a clock per hunt: a child that starts late gets its full OHMYBUG_TIMEOUT_S, though step 1's has run out", async () => {
+  const dir = routedRepo();
+  // Step 1 is read pending at once and continues 10 s later; the child then runs about 20 s. One 40 s clock for both
+  // would end the wait at about 25 s, when 15 s are left (the reserve for the last read).
+  const s = await routeServer({
+    rev_step1: [
+      { status: "done", route_state: "pending", final: false },
+      { status: "done", route_state: "continued", continued_by: "rev_child", final: false },
+    ],
+    rev_child: [{ status: "running" }, { status: "running" }, { status: "running" }, { status: "running" }, { status: "done", findings: [] }],
+  });
+  try {
+    const t0 = Date.now();
+    const r = await cli(dir, [], { OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: "40" });
+    assert.equal(r.code, 0, r.log);
+    assert.ok(Date.now() - t0 > 26_000, `the run ended before one shared clock would have (${Date.now() - t0} ms): the test proves nothing`);
+  } finally { await s.close(); }
 });
