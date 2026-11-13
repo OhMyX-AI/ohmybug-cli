@@ -1318,7 +1318,7 @@ test("route: final with continuation_refused prints step 1 and its reason; await
 test("route: a failed step 1 the service continues is not the result; a continuation that loops or is malformed is refused", async () => {
   const dir = routedRepo();
   let s = await routeServer({
-    rev_step1: [{ status: "failed", route_state: "continued", continued_by: "rev_child", final: false }],
+    rev_step1: [{ status: "failed", route_state: "pending", final: false }, { status: "failed", route_state: "continued", continued_by: "rev_child", final: false }],
     rev_child: [{ status: "done", findings: [] }],
   });
   try {
@@ -1326,13 +1326,14 @@ test("route: a failed step 1 the service continues is not the result; a continua
     assert.equal(r.code, 0, r.log);
     assert.doesNotMatch(r.log, /the review failed/);
   } finally { await s.close(); }
-  for (const next of ["rev_step1", "../x", 7]) {
+  for (const next of ["rev_step1", "../x", 7, "\u001b[2Jrev"]) {
     s = await routeServer({ rev_step1: [{ status: "done", route_state: "continued", continued_by: next, final: false }] });
     try {
       const r = await cli(dir, [], { OHMYBUG_URL: s.url });
       assert.equal(r.code, 2, `${next}: ${r.log}`);
       assert.match(r.log, /which this client does not follow/);
       assert.doesNotMatch(r.log, /may still be running/);
+      assert.ok(!r.log.includes("\u001b"), "a control character reached the log");
     } finally { await s.close(); }
   }
 });
@@ -1406,5 +1407,18 @@ test("route: a child still running at its clock names the child, not step 1, and
     assert.deepEqual([j.outcome, j.review.id, j.review.continued_from, j.live_url], ["timed_out", "rev_child", "rev_step1", null]);
     assert.match(r.log, /review rev_child may still be running/);
     assert.doesNotMatch(r.log, /review rev_step1 may still be running/);
+  } finally { await s.close(); }
+});
+
+test("route: the wait for the service's decision has its own clock, and its timeout names no ended review as running", async () => {
+  const dir = routedRepo();
+  // Step 1 ends at about 10 s of a 30 s clock: on step 1's clock no 10 s look would fit; on its own one, one does.
+  const s = await routeServer({ rev_step1: [{ status: "running" }, { status: "running" }, { status: "done", route_state: "pending", final: false }] });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: "30" });
+    assert.equal(r.code, 2, r.log);
+    assert.match(r.log, /review rev_step1 ended; waiting up to 30s for the service to decide whether a fast hunt follows it/);
+    assert.equal(s.calls.filter((c) => c.name === "wait_review").length, 4);
+    assert.doesNotMatch(r.log, /may still be running/);
   } finally { await s.close(); }
 });

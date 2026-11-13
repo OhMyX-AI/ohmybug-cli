@@ -658,16 +658,18 @@ async function review({ opts, env, cwd, out, log, rec }) {
     if (sub.live_url) log(`live progress: ${sub.live_url}`);
 
     const answered = new Set(), chain = [sub.review_id];
-    let id = sub.review_id;
+    let id = sub.review_id, deciding = false;
+    // Kept for the get_findings that follows a finished wait.
+    const READ_RESERVE_S = 15;
     for (;;) {
       // The long poll ends before the request's own abort, which is the time left.
-      // 15 s are kept for the get_findings that follows a finished wait.
-      const waitS = Math.min(45, Math.floor((deadline - Date.now()) / 1000) - 15);
+      const waitS = Math.min(45, Math.floor((deadline - Date.now()) / 1000) - READ_RESERVE_S);
       if (waitS < 1) throw new Deadline("timed out");
       let r = await tool("wait_review", { review_id: id, timeout_s: waitS });
       // The findings and review_of_record are get_findings'; a finished wait_review carries neither in full.
       if (r.status === "done" || r.status === "failed") r = await tool("get_findings", { review_id: id });
-      // A routed step 1: `final: false` is never the end, whatever its own status and review_of_record say.
+      // A routed step 1: `final: false` is not the end, whatever its own status and review_of_record say, except
+      // awaiting_verdicts, which waits on a confirm this client never sends, so step 1 is its result.
       const route = typeof r.route_state === "string" ? r.route_state : null;
       if (route === "continued") {
         const next = r.continued_by;
@@ -675,7 +677,7 @@ async function review({ opts, env, cwd, out, log, rec }) {
           // Not a result: the service continued this review. The id is escaped, and the "may still be running" line
           // must not name the review that ended.
           started = undefined;
-          throw new Refusal(`review ${id} ended and was continued as ${JSON.stringify(String(next).slice(0, 80))}, which this client does not follow: see https://app.ohmybug.ai/me for that hunt`);
+          throw new Refusal(`review ${id} ended and was continued as ${typeof next === "string" ? JSON.stringify(next.slice(0, 80)) : "no review id"}, which this client does not follow: see https://app.ohmybug.ai/me for that hunt`);
         }
         chain.push(next);
         log(`review ${id} continues as review ${next}; waiting up to ${timeoutS}s for it`);
@@ -688,10 +690,18 @@ async function review({ opts, env, cwd, out, log, rec }) {
         continue;
       }
       // Step 1 ended and the service is still deciding whether a fast hunt follows (pending, or any state this client
-      // does not know): not a result yet. awaiting_verdicts waits on a confirm this client never sends.
+      // does not know): not a result yet.
       if (route && r.final === false && route !== "awaiting_verdicts" && (r.status === "done" || r.status === "failed")) {
-        // The next read needs its own 15 s reserve (above): a sleep that leaves less ends the wait now.
-        if (Date.now() + ROUTE_LOOK_MS + 16_000 > deadline) throw new Deadline("timed out");
+        if (!deciding) {
+          // The service may start the fast hunt up to 15 minutes after step 1 ends: that wait is not step 1's, so it
+          // gets its own clock, and a timeout in it names no ended review as running.
+          deciding = true;
+          deadline = Date.now() + timeoutS * 1000;
+          started = undefined;
+          log(`review ${id} ended; waiting up to ${timeoutS}s for the service to decide whether a fast hunt follows it`);
+        }
+        // The next read needs its own reserve (above): a sleep that leaves less ends the wait now.
+        if (Date.now() + ROUTE_LOOK_MS + (READ_RESERVE_S + 1) * 1000 > deadline) throw new Deadline("timed out");
         await sleep(ROUTE_LOOK_MS);
         continue;
       }
@@ -723,7 +733,7 @@ async function review({ opts, env, cwd, out, log, rec }) {
       }
       // One answer per request: the same address may serve a later request for other files. A failed answer is not
       // marked, so a re-ask is answered again, one poll interval later.
-      const request = r.status === "needs_files" && r.files_url ? `${r.files_url} ${[...(r.requested_files ?? [])].sort().join("\0")}` : null;
+      const request = r.status === "needs_files" && r.files_url ? `${id} ${r.files_url} ${[...(r.requested_files ?? [])].sort().join("\0")}` : null;
       if (request && !answered.has(request)) {
         if (await answerFiles(r)) { answered.add(request); continue; }
       }
