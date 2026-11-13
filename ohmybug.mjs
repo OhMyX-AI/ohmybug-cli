@@ -36,9 +36,10 @@ else origin/main. With --deep it is a branch name: --base, else $GITHUB_BASE_REF
 Environment:
   OHMYBUG_API_KEY     required: a key from https://app.ohmybug.ai/me
   OHMYBUG_URL         default https://mcp.ohmybug.ai
-  OHMYBUG_TIMEOUT_S   how long to wait for each review, 30 to 86400 seconds, default 1800 (10800 with --deep). When the
-                      service continues a quick first step with the fast hunt, the wait for its decision (up to about
-                      25 minutes) and the fast hunt each get their own full wait
+  OHMYBUG_TIMEOUT_S   how long to wait for each review, 30 to 86400 seconds, default 1800 (10800 with --deep). The
+                      service may run a quick first step and continue it with the fast hunt: then the first step and
+                      the fast hunt each get this wait, and the service's decision between them up to 26 minutes (or
+                      this value, if longer). Give a CI job twice this value plus 30 minutes. --deep is never continued
   OHMYBUG_STORY       the --story value when the flag is not given
   OHMYBUG_FORMAT      the --format value when the flag is not given
   OHMYBUG_MODE        the --mode value when the flag is not given (not used with --deep)
@@ -70,6 +71,9 @@ export const RESULT_SCHEMA = "ohmybug-cli/result/1";
 const REVIEW_ID = /^rev_[A-Za-z0-9]{1,64}$/;
 const MAX_CHAIN = 3;
 const ROUTE_LOOK_MS = 10_000;
+// The service decides within about 25 min 20 s of step 1's end (its launch clock): the decision wait is never shorter,
+// or a short OHMYBUG_TIMEOUT_S would leave the fast hunt it starts running with nobody following it.
+export const DECISION_WAIT_S = 1560;
 // Modes that read the repository: the service refuses them on a diff alone (mode_needs_repo).
 const MODES = new Set(["lite", "snap", "fast"]), REPO_MODES = new Set(["lite", "snap"]);
 
@@ -431,7 +435,7 @@ export function deepTarget(opts, env, git) {
 const REPO_REFUSED = new Set(["diff_required", "repo_not_listed", "diff_fetch_failed", "empty_compare", "diff_too_large"]);
 
 /** One review, start to end. Returns the exit code; never calls process.exit itself (the tests drive it). */
-export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s + "\n"), log = (s) => process.stderr.write(`ohmybug: ${s}\n`) }) {
+export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s + "\n"), log = (s) => process.stderr.write(`ohmybug: ${s}\n`), decisionWaitS = DECISION_WAIT_S }) {
   const opts = parseArgs(argv);
   if (typeof opts === "string") { log(opts); log("see ohmybug --help"); return 2; }
   if (opts.help) { out(USAGE); return 0; }
@@ -440,7 +444,7 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
   if (!FORMATS.has(format)) { log(`OHMYBUG_FORMAT must be text, markdown or json, not ${env.OHMYBUG_FORMAT}`); return 2; }
   const rec = { deep: opts.deep };
   // The text lines go to stdout only in text; the other formats print the one result below.
-  const code = await review({ opts, env, cwd, out: format === "text" ? out : () => {}, log, rec });
+  const code = await review({ opts, env, cwd, out: format === "text" ? out : () => {}, log, rec, decisionWaitS });
   const res = format === "text" && !opts.stepSummary ? null : resultOf(rec, code);
   if (format === "json") out(JSON.stringify(res));
   if (format === "markdown") out(resultMarkdown(res));
@@ -452,7 +456,7 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
   return code;
 }
 
-async function review({ opts, env, cwd, out, log, rec }) {
+async function review({ opts, env, cwd, out, log, rec, decisionWaitS }) {
   // A run that stops before a hunt says why in the result too.
   const fail = (message) => { log(message); rec.error = { code: null, message }; return 2; };
   if (!env.OHMYBUG_API_KEY) return fail("OHMYBUG_API_KEY is not set: create a key at https://app.ohmybug.ai/me");
@@ -695,11 +699,12 @@ async function review({ opts, env, cwd, out, log, rec }) {
       if (route && r.final === false && route !== "awaiting_verdicts" && (r.status === "done" || r.status === "failed")) {
         if (!deciding) {
           // The service may start the fast hunt up to about 25 minutes after step 1 ends: that wait is not step 1's, so it
-          // gets its own clock, and a timeout in it names no ended review as running.
+          // gets its own clock, never shorter than the service's window, and a timeout in it names no ended review as running.
           deciding = true;
-          deadline = Date.now() + timeoutS * 1000;
+          const waitS = Math.max(timeoutS, decisionWaitS);
+          deadline = Date.now() + waitS * 1000;
           started = undefined;
-          log(`review ${id} ended; waiting up to ${timeoutS}s for the service to decide whether a fast hunt follows it`);
+          log(`review ${id} ended; waiting up to ${waitS}s for the service to decide whether a fast hunt follows it`);
         }
         // The next read needs its own reserve (above): a sleep that leaves less ends the wait now.
         if (Date.now() + ROUTE_LOOK_MS + (READ_RESERVE_S + 1) * 1000 > deadline) throw new Deadline("timed out");

@@ -7,7 +7,7 @@ import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync, readFileSync } from
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ciMeta, exitCodeFor, fitBody, parseArgs, resolveBase, resultMarkdown, resultOf, rpcMessage, run, silentBillLine, trimDiff, VERSION } from "../ohmybug.mjs";
+import { ciMeta, DECISION_WAIT_S, exitCodeFor, fitBody, parseArgs, resolveBase, resultMarkdown, resultOf, rpcMessage, run, silentBillLine, trimDiff, VERSION } from "../ohmybug.mjs";
 
 // The tests own their git config: a developer's or a runner's own (a git-lfs filter, say) would change what they see.
 process.env.GIT_CONFIG_GLOBAL = "/dev/null";
@@ -94,9 +94,9 @@ async function server({ findings = [], status = "done", review_of_record = true,
   return { url, calls, posted, close: () => new Promise((r) => { srv.close(r); srv.closeIdleConnections?.(); }) };
 }
 
-async function cli(dir, argv, env) {
+async function cli(dir, argv, env, extra = {}) {
   const out = [], log = [];
-  const code = await run({ argv, env: { OHMYBUG_API_KEY: "test-key", OHMYBUG_TIMEOUT_S: "60", ...env }, cwd: dir, out: (s) => out.push(s), log: (s) => log.push(s) });
+  const code = await run({ argv, env: { OHMYBUG_API_KEY: "test-key", OHMYBUG_TIMEOUT_S: "60", ...env }, cwd: dir, out: (s) => out.push(s), log: (s) => log.push(s), ...extra });
   return { code, out: out.join("\n"), log: log.join("\n") };
 }
 
@@ -1415,10 +1415,24 @@ test("route: the wait for the service's decision has its own clock, and its time
   // Step 1 ends at about 10 s of a 30 s clock: on step 1's clock no 10 s look would fit; on its own one, one does.
   const s = await routeServer({ rev_step1: [{ status: "running" }, { status: "running" }, { status: "done", route_state: "pending", final: false }] });
   try {
-    const r = await cli(dir, [], { OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: "30" });
+    const r = await cli(dir, [], { OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: "30" }, { decisionWaitS: 1 });
     assert.equal(r.code, 2, r.log);
     assert.match(r.log, /review rev_step1 ended; waiting up to 30s for the service to decide whether a fast hunt follows it/);
     assert.equal(s.calls.filter((c) => c.name === "wait_review").length, 4);
     assert.doesNotMatch(r.log, /may still be running/);
+  } finally { await s.close(); }
+});
+
+test("route: the decision wait is never shorter than the service's window, whatever OHMYBUG_TIMEOUT_S says", async () => {
+  // The service's worst case is about 1520 s from step 1's end; the floor must cover it.
+  assert.ok(DECISION_WAIT_S >= 1520 && DECISION_WAIT_S <= 1800, `${DECISION_WAIT_S}`);
+  const dir = routedRepo();
+  const s = await routeServer({ rev_step1: [{ status: "done", route_state: "pending", final: false }, { status: "done", route_state: "pending", final: false }, { status: "done", route_state: "final", final: true }] });
+  try {
+    // On a 30 s clock the second pending read (at 10 s) leaves no room for another 10 s look; on the 45 s floor it does,
+    // and the route ends final.
+    const r = await cli(dir, [], { OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: "30" }, { decisionWaitS: 45 });
+    assert.equal(r.code, 0, r.log);
+    assert.match(r.log, /waiting up to 45s for the service to decide/);
   } finally { await s.close(); }
 });
