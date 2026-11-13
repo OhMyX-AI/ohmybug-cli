@@ -8,7 +8,7 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
 
-export const VERSION = "0.9.0";
+export const VERSION = "0.10.0";
 const USAGE = `ohmybug ${VERSION}: review this repository's changes with OhMyBug.
 
 Usage:
@@ -61,6 +61,8 @@ const POLL_ROOM = 20_000;
 // Server caps: 30 files and about 10 MiB of diff and files per call; 20 files per answer to a file request.
 const MAX_FILES = 30, MAX_EXTRA = 20, MAX_BYTES = 9 * 1024 * 1024, MAX_BODY = 11_500_000, MAX_FILE = 512 * 1024;
 const MAX_TREE = 1024 * 1024;
+// The service takes a repository snapshot up to 128 MiB compressed.
+const MAX_SNAPSHOT = 128 * 1024 * 1024;
 // Pinned diff format, whatever the user's git config says (noprefix, mnemonicPrefix, textconv drivers).
 const DIFF_FLAGS = ["--no-color", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/"];
 const TRANSIENT_TOOL = new Set(["internal", "rate_limited"]);
@@ -521,7 +523,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS }) {
    * would go to wherever it points.
    */
   let reached = false;
-  async function http(url, init, { once = false } = {}) {
+  async function http(url, init, { once = false, okStatus = [] } = {}) {
     for (let attempt = 0; ; attempt++) {
       const left = deadline - Date.now();
       if (left <= 0) throw new Deadline("timed out");
@@ -531,10 +533,16 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS }) {
         const res = await fetch(url, { ...init, redirect: "error", signal: AbortSignal.timeout(once ? left - POLL_ROOM : Math.min(60_000, left)) });
         reached = true;
         const text = await res.text();
-        if (res.ok) return text;
+        if (res.ok || okStatus.includes(res.status)) return text;
         if (res.status === 401 || res.status === 403) throw new Refusal(`the API key was refused, or the request blocked (HTTP ${res.status} ${text.slice(0, 200)})`);
         const retryable = res.status === 429 || (!once && (res.status === 408 || res.status >= 500));
-        if (!retryable) throw new Refusal(`HTTP ${res.status} ${text.slice(0, 300)}${once && res.status >= 500 ? `. ${MAYBE_STARTED}` : ""}`);
+        if (!retryable) {
+          // The upload doors answer {error, code}: the error is printed whole (it can carry a link), the code kept.
+          let j = null;
+          try { j = JSON.parse(text); } catch {}
+          const said = typeof j?.error === "string" ? j.error : text.slice(0, 300);
+          throw new Refusal(`HTTP ${res.status} ${said}${once && res.status >= 500 ? `. ${MAYBE_STARTED}` : ""}`, typeof j?.code === "string" ? j.code : undefined);
+        }
         why = `HTTP ${res.status}`;
         const after = res.headers.get("retry-after");
         retryAfter = Math.max(0, Number(after) * 1000 || Date.parse(after) - Date.now() || 0);
@@ -631,7 +639,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS }) {
     try { root = realpathSync(execGit(cwd, ["rev-parse", "--show-toplevel"]).toString().trim()); }
     catch { throw new Refusal("this folder is not inside a git repository"); }
     const gitBuf = (...a) => execGit(root, a), git = (...a) => gitBuf(...a).toString();
-    let args;
+    let args, change;
     if (opts.deep) {
       // The service fetches the repository and the diff itself: only where to find them goes up.
       read = () => null;
@@ -639,7 +647,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS }) {
       log(`deep hunt of ${args.meta.repo} at ${args.meta.ref.slice(0, 12)} against ${args.meta.base_branch}; waiting up to ${timeoutS}s`);
       if (timeoutS < 7200) log("a deep hunt takes up to 2 hours: OHMYBUG_TIMEOUT_S under 7200 may end the wait before the result");
     } else {
-      const change = selectChange(opts, env, git, () => snapshotTree(git, (extra, ...a) => execGit(root, a, extra).toString(), root));
+      change = selectChange(opts, env, git, () => snapshotTree(git, (extra, ...a) => execGit(root, a, extra).toString(), root));
       if (!change.diff.trim()) { out(`Nothing to review: no changes against ${change.base}.`); rec.noChanges = true; return 0; }
       read = fileReader(change, gitBuf);
       // The reviewers can ask for any file by path; without the list they cannot name a caller to ask for.
@@ -678,13 +686,42 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS }) {
       }
     }
 
+    /**
+     * A diff sent alone that the service refuses with snapshot_required (an account not set to diff-only reviews) goes
+     * again by upload: a ticket, the repository at the reviewed tree as a tar.gz, then the same diff and files. Nothing
+     * was started by the refusal. The snapshot is sent only on that refusal and never when the ticket says
+     * `snapshot: "off"`, so a diff-only account never uploads its repository.
+     */
+    const submit = async (a) => {
+      try { return await tool("submit_review", { ...a, ...modeArg }, true); }
+      catch (e) {
+        if (!(e instanceof Refusal) || e.code !== "snapshot_required" || !a.diff) throw e;
+        log("the service reviews this change with a snapshot of the repository: uploading it with the diff");
+        const t = await tool("submit_review", { upload: true, ...(a.meta ? { meta: a.meta } : {}), ...modeArg }, true);
+        let url;
+        try { url = new URL(t.upload_url, api); } catch {}
+        if (!t.review_id || !url || url.origin !== apiUrl.origin) throw new Refusal(`submit_review answered without a usable upload address: ${JSON.stringify(t).slice(0, 300)}. ${MAYBE_STARTED}`);
+        if (t.snapshot !== "off") {
+          let tgz;
+          try { tgz = gitBuf("archive", "--format=tar.gz", change.rev); }
+          catch (err) { throw new Refusal(`could not pack the repository snapshot (${err.code === "ENOBUFS" ? "over 256 MiB" : err.message}); ${e.message}`, e.code); }
+          if (tgz.length > MAX_SNAPSHOT) throw new Refusal(`the repository snapshot is ${Math.ceil(tgz.length / 1048576)} MiB compressed, over the service's 128 MiB; ${e.message}`, e.code);
+          log(`uploading the repository snapshot (${Math.ceil(tgz.length / 1024)} KiB)`);
+          // 409: this ticket already has its snapshot (an earlier try of this upload arrived).
+          await http(`${url.href}/repo`, { method: "POST", headers: { "content-type": "application/gzip" }, body: tgz }, { okStatus: [409] });
+        }
+        // The review starts on this body: sent once.
+        await http(url.href, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ diff: a.diff, files: a.files ?? [] }) }, { once: true });
+        return t;
+      }
+    };
     let sub;
-    try { sub = await tool("submit_review", { ...args, ...modeArg }, true); }
+    try { sub = await submit(args); }
     catch (e) {
       if (!fallback || !(e instanceof Refusal) || !REPO_REFUSED.has(e.code)) throw e;
       // A diff alone cannot run a mode that reads the repository: say so instead of a second, refused call.
       if (REPO_MODES.has(mode)) throw new Refusal(`${e.message}; --mode ${mode} needs the repository, so the diff was not sent alone: use --mode fast to review the diff without it`, e.code);
-      sub = await tool("submit_review", { ...fallback(e.code), ...modeArg }, true);
+      sub = await submit(fallback(e.code));
     }
     if (!sub.review_id) throw new Refusal(`submit_review answered without a review id: ${JSON.stringify(sub).slice(0, 300)}. ${MAYBE_STARTED}`);
     started = sub;
