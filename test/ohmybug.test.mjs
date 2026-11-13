@@ -916,7 +916,7 @@ test("--format json: one object on stdout, the same exit code, every field prese
     assert.equal(j.schema, "ohmybug-cli/result/1");
     assert.equal(j.cli_version, VERSION);
     assert.deepEqual([j.exit_code, j.outcome], [1, "blocking"]);
-    assert.deepEqual(j.review, { id: "rev_test", status: "done", deep: false, complete: true, continued_from: null, route_refused: null });
+    assert.deepEqual(j.review, { id: "rev_test", status: "done", deep: false, complete: true, continued_from: null, route_refused: null, route_state: null });
     assert.deepEqual([j.live_url, j.live_url_missing], ["https://example.test/live/x", null]);
     assert.deepEqual(j.billing.tariff, "confirm");
     assert.equal(j.billing.charged_usd, null);
@@ -1248,7 +1248,7 @@ async function routeServer(script) {
         const list = script[args.review_id] ?? [{ status: "failed", error: "unknown review" }];
         if (name === "wait_review") at[args.review_id] = Math.min((at[args.review_id] ?? -1) + 1, list.length - 1);
         const a = list[at[args.review_id] ?? 0];
-        result = name === "wait_review" ? { review_id: args.review_id, status: a.status }
+        result = name === "wait_review" ? { review_id: args.review_id, status: a.status, ...(a.live_url ? { live_url: a.live_url } : {}) }
           : { review_id: args.review_id, findings: [], review_of_record: true, ...a };
       }
       res.writeHead(200, { "content-type": "application/json" });
@@ -1357,11 +1357,11 @@ test("route: a clock per hunt: a child that starts late gets its full OHMYBUG_TI
   } finally { await s.close(); }
 });
 
-test("route: the chain stops at three hunts and on an indirect loop; an unknown state with final false is not a result", async () => {
+test("route: the chain stops at two hunts and on an indirect loop; an unknown state with final false is not a result", async () => {
   const dir = routedRepo();
   const cont = (next) => ({ status: "done", route_state: "continued", continued_by: next, final: false });
   for (const [script, refused] of [
-    [{ rev_step1: [cont("rev_a")], rev_a: [cont("rev_b")], rev_b: [cont("rev_c")], rev_c: [{ status: "done" }] }, "rev_c"],
+    [{ rev_step1: [cont("rev_a")], rev_a: [cont("rev_b")], rev_b: [{ status: "done" }] }, "rev_b"],
     [{ rev_step1: [cont("rev_a")], rev_a: [cont("rev_step1")] }, "rev_step1"],
   ]) {
     const s = await routeServer(script);
@@ -1369,7 +1369,7 @@ test("route: the chain stops at three hunts and on an indirect loop; an unknown 
       const r = await cli(dir, [], { OHMYBUG_URL: s.url });
       assert.equal(r.code, 2, r.log);
       assert.match(r.log, new RegExp(`continued as "${refused}", which this client does not follow`));
-      assert.ok(!s.calls.some((c) => c.id === "rev_c"), "the fourth hunt was read");
+      assert.ok(!s.calls.some((c) => c.id === "rev_b"), "a third hunt was read");
     } finally { await s.close(); }
   }
   // A state this client does not know, with final false, is read again until the route ends.
@@ -1445,4 +1445,51 @@ test("route: with nothing injected, the decision wait is the default floor, not 
     assert.equal(r.code, 0, r.log);
     assert.match(r.log, new RegExp(`waiting up to ${DECISION_WAIT_S}s for the service to decide`));
   } finally { await s.close(); }
+});
+
+test("route result shape: a refused continuation reports the ended step 1 as done, with its route state", async () => {
+  const dir = routedRepo();
+  const s = await routeServer({ rev_step1: [{ status: "done", route_state: "continued", continued_by: "../x", final: false }] });
+  try {
+    const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url });
+    assert.equal(r.code, 2, r.log);
+    const j = JSON.parse(r.out);
+    assert.deepEqual([j.review.id, j.review.status, j.review.route_state, j.outcome], ["rev_step1", "done", "continued", "interrupted"]);
+  } finally { await s.close(); }
+});
+
+test("route result shape: a decision-wait timeout names the window that ran, and step 1 as done", async () => {
+  const dir = routedRepo();
+  const s = await routeServer({ rev_step1: [{ status: "done", route_state: "pending", final: false }] });
+  try {
+    const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: "30" }, { decisionWaitS: 45 });
+    assert.equal(r.code, 2, r.log);
+    assert.match(r.log, /no result within the service's decision window \(45s\)/);
+    const j = JSON.parse(r.out);
+    assert.deepEqual([j.review.status, j.review.route_state, j.outcome], ["done", "pending", "timed_out"]);
+  } finally { await s.close(); }
+});
+
+test("route result shape: the child's live link is printed as soon as a read carries it, and kept on a timeout", async () => {
+  const dir = routedRepo();
+  const s = await routeServer({
+    rev_step1: [{ status: "done", route_state: "continued", continued_by: "rev_child", final: false }],
+    rev_child: [{ status: "running", live_url: "https://example.test/live/child" }],
+  });
+  try {
+    const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: "30" });
+    assert.equal(r.code, 2, r.log);
+    assert.match(r.log, /live progress: https:\/\/example\.test\/live\/child/);
+    assert.match(r.log, /review rev_child may still be running: https:\/\/example\.test\/live\/child/);
+    assert.equal(JSON.parse(r.out).live_url, "https://example.test/live/child");
+  } finally { await s.close(); }
+});
+
+test("route result shape: markdown names the chain, the refusal and an awaiting-verdicts first step", () => {
+  const base = { outcome: "clean", counts: { blocking: 0 }, findings: [], error: null, billing: { tariff: "ci", charged_usd: 0, paid_by: null, note: "" }, silent_bill: null, live_url: null, live_url_missing: "x" };
+  const md = (review) => resultMarkdown({ ...base, review });
+  assert.match(md({ id: "rev_b", continued_from: "rev_a", route_refused: null, route_state: "continued" }), /Reviews: ` rev_a ` continued as ` rev_b `; the result is the last one's\./);
+  assert.match(md({ id: "rev_a", continued_from: null, route_refused: "waited_out", route_state: "final" }), /No fast hunt followed the first step: ` waited_out `\./);
+  assert.match(md({ id: "rev_a", continued_from: null, route_refused: null, route_state: "awaiting_verdicts" }), /wait for a verdict/);
+  assert.doesNotMatch(md({ id: "rev_a", continued_from: null, route_refused: null, route_state: null }), /Reviews:|No fast hunt|verdict/);
 });

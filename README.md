@@ -42,7 +42,7 @@ The CLI prints each finding (severity, file:line, title, failure scenario) and a
 |---|---|
 | 0 | no medium or worse bug (lows are printed, and do not fail the job) |
 | 1 | at least one medium or worse bug, or a finding whose severity the CLI does not know (the gate fails closed) |
-| 2 | the review could not run: no key, a refused key, network, a failed review, or a run cut short with no medium or worse bug (lows found by a cut-short run do not make it clean) |
+| 2 | the review could not run: no key, a refused key, network, a failed review, a continuation the service named that this client does not follow, or a run cut short with no medium or worse bug (lows found by a cut-short run do not make it clean) |
 
 | Variable | Default | |
 |---|---|---|
@@ -75,7 +75,7 @@ exit $code
 | `cli_version` | this CLI's version |
 | `exit_code` | the run's exit code: 0 no medium or worse bug, 1 at least one, 2 could not run or cut short |
 | `outcome` | `clean`, `blocking`, `failed`, `cut_short`, `timed_out`, `interrupted` (started, then the run could not follow it to the end), `maybe_started` (the start was not confirmed and a hunt may be running: check app.ohmybug.ai/me before running again), `not_run`, `no_changes` |
-| `review` | `{id, status, deep, complete, continued_from, route_refused}`: `id` and `status` are null when nothing started; `complete` is true only for a review that finished its whole protocol; when the service continued a quick first step with the fast hunt, `id` is the last review (the result) and `continued_from` the first; `route_refused` is the service's reason when no fast hunt followed the first step |
+| `review` | `{id, status, deep, complete, continued_from, route_refused, route_state}`: `id` and `status` are null when nothing started; `complete` is true only for a review that finished its whole protocol; when the service continued a quick first step with the fast hunt, `id` is the last review (the result) and `continued_from` the first; `route_refused` is the service's code for why no fast hunt could follow a final first step (null otherwise, also when the code is not a plain one); `route_state` is the last route state the service reported (`final`, `continued`, `awaiting_verdicts`, `pending`), null off the route |
 | `live_url` | the report link, or null |
 | `live_url_missing` | why `live_url` is null (for example, the key's live link setting is off), else null |
 | `billing` | `{tariff, charged_usd, paid_by, note}`: on CI billing `tariff` is `ci` and `charged_usd` what was charged; otherwise `tariff` is `confirm` and `charged_usd` null, since the charge comes when someone confirms a medium or worse finding as real, or at the billing deadline; null `tariff` when nothing started or no result was read |
@@ -98,7 +98,7 @@ A hunt that found a bug can be told as a short anonymous story on the public fee
 
 `--mode` picks how a fast hunt runs: `lite`, `snap` or `fast` ($4). Each bills only when it finds a real bug, at the price the service sets for the mode; the run prints what it was charged.
 
-Without `--mode` (or `OHMYBUG_MODE`) the hunt is `fast`. The service runs only the modes it lists as live for your key, and a mode it does not run is refused before anything starts. The run prints the mode the hunt started in. `lite` and `snap` read the repository, so they need a pushed GitHub commit the service can read (see below) and do not go with `--uncommitted`; `snap` takes a diff under 1 MB. When the service cannot run the mode asked for, it starts nothing and charges nothing, and the run prints its reason; `--mode fast` always runs. `--mode` does not go with `--deep`, which is its own hunt.
+Without `--mode` (or `OHMYBUG_MODE`) the hunt is `fast`, and on a pushed commit the service may run it as a quick first step (`snap`) and continue it with the fast hunt when the first step leaves no medium or worse bug. The run follows it, names both reviews, and its result and bill are the last hunt's; when the first step's bug ends the route, the first step is the result at its price. A named `--mode` is never continued. The service runs only the modes it lists as live for your key, and a mode it does not run is refused before anything starts. The run prints the mode the hunt started in. `lite` and `snap` read the repository, so they need a pushed GitHub commit the service can read (see below) and do not go with `--uncommitted`; `snap` takes a diff under 1 MB. When the service cannot run the mode asked for, it starts nothing and charges nothing, and the run prints its reason; `--mode fast` always runs. `--mode` does not go with `--deep`, which is its own hunt.
 
 A key on **CI billing** (the key setting on [app.ohmybug.ai/me](https://app.ohmybug.ai/me)) pays per hunt with no confirm step: the mode's price for a fast hunt ($4 for `fast`) and $12 for a deep one ($24 on a wide change, one spread over 11 or more folder chunks), only when the result holds a medium or worse bug. A clean or failed hunt is free. The run prints what it was charged.
 
