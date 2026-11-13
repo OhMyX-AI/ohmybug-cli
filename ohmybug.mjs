@@ -71,6 +71,8 @@ export const RESULT_SCHEMA = "ohmybug-cli/result/1";
 // and how often an ended step 1 is read while the service decides (its own tick looks every 10 s).
 const REVIEW_ID = /^rev_[A-Za-z0-9]{1,64}$/;
 const MAX_CHAIN = 2;
+// A server code kept in the result or a log line: lower-case letters, digits and underscores.
+const PLAIN_CODE = /^[a-z0-9_]{1,60}$/;
 const ROUTE_LOOK_MS = 10_000;
 // The service decides within about 1520 s of step 1's end (its launch clock): the decision wait is never shorter, or a
 // short OHMYBUG_TIMEOUT_S would leave the fast hunt it starts running with nobody following it. On top of 1520 s: the
@@ -78,6 +80,9 @@ const ROUTE_LOOK_MS = 10_000;
 export const DECISION_WAIT_S = 1620;
 // A live link is printed and returned only as a plain https URL of printable ASCII, without the characters markdown reads.
 const liveLink = (u) => (typeof u === "string" && /^https:\/\/[!-~]+$/.test(u) && !/[<>()[\]`]/.test(u) ? u : null);
+// One read as resultOf uses it: the review it is of, its status, and its route state when that is a plain code (never
+// on --deep, which the service does not route).
+const readOf = (id, r, deep) => ({ id, status: r.status, route: !deep && typeof r.route_state === "string" && PLAIN_CODE.test(r.route_state) ? r.route_state : null });
 // Modes that read the repository: the service refuses them on a diff alone (mode_needs_repo).
 const MODES = new Set(["lite", "snap", "fast"]), REPO_MODES = new Set(["lite", "snap"]);
 
@@ -172,10 +177,11 @@ function snapshotTree(git, gitWith, root) {
     // would make it trust the stat and miss a same-size edit made in that second.
     // Stat first: if the index is replaced in between, the copy looks older, which only makes git re-read more. The
     // time is floored to whole seconds for the same reason.
+    const fail = (e) => new Refusal(`could not snapshot the working tree for --uncommitted: ${e?.message ?? e}`);
     let sec = null;
-    try { sec = Math.floor(statSync(src).mtimeMs / 1000); copyFileSync(src, index); }
-    catch (e) { if (e?.code !== "ENOENT") throw e; sec = null; } // no index yet: start empty
-    if (sec !== null) utimesSync(index, sec, sec);
+    try { sec = Math.floor(statSync(src).mtimeMs / 1000); }
+    catch (e) { if (e?.code !== "ENOENT") throw fail(e); } // no index yet: start empty
+    if (sec !== null) { try { copyFileSync(src, index); utimesSync(index, sec, sec); } catch (e) { throw fail(e); } }
     // Without --directory, git lists every untracked file and stops at a nested repository at any depth as `dir/`.
     const nested = git("ls-files", "--others", "--exclude-standard", "-z").split("\0").filter((p) => p.endsWith("/"));
     gitWith({ GIT_INDEX_FILE: index }, "add", "-A", "--", ".", ...nested.map((p) => `:(exclude,top,literal)${p}`));
@@ -478,6 +484,7 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
 }
 
 async function review({ opts, env, cwd, out, log, rec, decisionWaitS }) {
+  if (!Number.isSafeInteger(decisionWaitS) || decisionWaitS < 1) throw new TypeError(`decisionWaitS must be a whole number of seconds, got ${decisionWaitS}`);
   // A run that stops before a hunt says why in the result too.
   const fail = (message) => { log(message); rec.error = { code: null, message }; return 2; };
   if (!env.OHMYBUG_API_KEY) return fail("OHMYBUG_API_KEY is not set: create a key at https://app.ohmybug.ai/me");
@@ -692,16 +699,17 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS }) {
     const READ_RESERVE_S = 15;
     for (;;) {
       // The long poll ends before the request's own abort, which is the time left.
-      const waitS = Math.min(45, Math.floor((deadline - Date.now()) / 1000) - READ_RESERVE_S);
-      if (waitS < 1) throw new Deadline("timed out");
-      let r = await tool("wait_review", { review_id: id, timeout_s: waitS });
+      const pollS = Math.min(45, Math.floor((deadline - Date.now()) / 1000) - READ_RESERVE_S);
+      if (pollS < 1) throw new Deadline("timed out");
+      let r = await tool("wait_review", { review_id: id, timeout_s: pollS });
+      rec.read = readOf(id, r, opts.deep);
       // The findings and review_of_record are get_findings'; a finished wait_review carries neither in full.
       if (r.status === "done" || r.status === "failed") r = await tool("get_findings", { review_id: id });
       // A routed step 1: `final: false` is not the end, whatever its own status and review_of_record say, except
       // awaiting_verdicts, which waits on a confirm this client never sends, so step 1 is its result.
-      const route = typeof r.route_state === "string" && r.route_state ? r.route_state : null;
+      const route = !opts.deep && typeof r.route_state === "string" && r.route_state ? r.route_state : null;
       // The last read, whole: resultOf uses it only for the review it names. Only a plain code is kept as the state.
-      rec.read = { id, status: r.status, route: route && /^[a-z0-9_]{1,40}$/.test(route) ? route : null };
+      rec.read = readOf(id, r, opts.deep);
       if (route === "continued") {
         const next = r.continued_by;
         if (typeof next !== "string" || !REVIEW_ID.test(next) || chain.includes(next) || chain.length >= MAX_CHAIN) {
@@ -742,7 +750,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS }) {
       }
       if (r.status === "done" || r.status === "failed") {
         if (route === "awaiting_verdicts") log(`review ${id}: a fast hunt follows only after its findings are judged; this client does not judge, so this review is the result`);
-        if (route === "final" && typeof r.continuation_refused === "string" && /^[a-z0-9_]{1,60}$/.test(r.continuation_refused)) {
+        if (route === "final" && typeof r.continuation_refused === "string" && PLAIN_CODE.test(r.continuation_refused)) {
           rec.routeRefused = r.continuation_refused;
           log(`review ${id} is the result: no fast hunt followed it (${r.continuation_refused})`);
         }
@@ -762,7 +770,8 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS }) {
         const silent = silentBillLine(r.silent_bill);
         if (silent) log(silent);
         if (chain.length > 1) out(`\nReviews: ${chain.join(" continued as ")}; the result is review ${id}'s.`);
-        if (liveLink(r.live_url)) out(`\nReport: ${r.live_url}`);
+        const report = liveLink(r.live_url) ?? rec.live;
+        if (report) out(`\nReport: ${report}`);
         if (code !== 2) out(code === 1 ? `\n${findings.filter(isBlocking).length} blocking bug(s): medium or worse, or unrated.` : "\nNo blocking bugs.");
         return code;
       }

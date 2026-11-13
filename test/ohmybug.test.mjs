@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync, readFileSync, utimesSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync, readFileSync, utimesSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -54,7 +54,7 @@ async function server({ findings = [], status = "done", review_of_record = true,
       }
       const msg = JSON.parse(body);
       const { name, arguments: args } = msg.params;
-      calls.push({ name, args, auth: req.headers.authorization });
+      calls.push({ name, args, auth: req.headers.authorization, follows: req.headers["x-ohmybug-follows"] });
       if (name === "submit_review" && submitStatus) { res.writeHead(submitStatus); return res.end("boom"); }
       // A list fails the calls of that tool in turn (null lets one through).
       let fault = Array.isArray(faults[name]) ? faults[name].shift() : faults[name];
@@ -346,8 +346,10 @@ test("--uncommitted sees a same-size edit made in the second of the last index w
   git("add", "app.js");
   writeFileSync(app, "export const a = 7\n");
   utimesSync(app, t, t);
-  // A later atime, as an index read often but written rarely has: only its mtime may count.
-  utimesSync(join(dir, ".git", "index"), new Date(t.getTime() + 30_000), t);
+  // A later atime, as an index read often but written rarely has: only its mtime may count. The mtime is T and a
+  // fraction: the copy must keep second T, not round up. Limit: git also compares ctime, so a second boundary inside
+  // this test, or a git built with nanoseconds, lets it pass without the race.
+  utimesSync(join(dir, ".git", "index"), new Date(t.getTime() + 30_000), new Date(t.getTime() + 600));
   assert.match(git("diff", "HEAD"), /\+export const a = 7/, "git itself does not see the edit: the setup proves nothing");
   const s = await server();
   try {
@@ -1348,7 +1350,7 @@ test("route: a failed step 1 the service continues is not the result; a continua
     assert.equal(r.code, 0, r.log);
     assert.doesNotMatch(r.log, /the review failed/);
   } finally { await s.close(); }
-  for (const next of ["rev_step1", "../x", 7, "\u001b[2Jrev"]) {
+  for (const next of ["rev_step1", "../x", 7, "\u001b[2Jrev", "rev_child/../x"]) {
     s = await routeServer({ rev_step1: [{ status: "done", route_state: "continued", continued_by: next, final: false }] });
     try {
       const r = await cli(dir, [], { OHMYBUG_URL: s.url });
@@ -1503,12 +1505,16 @@ test("route result shape: the child's live link is printed as soon as a read car
   } finally { await s.close(); }
 });
 
-test("route result shape: markdown names the chain, the refusal and an awaiting-verdicts first step", () => {
+test("route result shape: markdown names the chain and the refusal, and claims the result only for an outcome that has one", () => {
   const base = { outcome: "clean", counts: { blocking: 0 }, findings: [], error: null, billing: { tariff: "ci", charged_usd: 0, paid_by: null, note: "" }, silent_bill: null, live_url: null, live_url_missing: "x" };
   const md = (review) => resultMarkdown({ ...base, review });
   assert.match(md({ id: "rev_b", continued_from: "rev_a", route_refused: null, route_state: "continued" }), /Reviews: ` rev_a ` continued as ` rev_b `; the result is the last one's\./);
   assert.match(md({ id: "rev_a", continued_from: null, route_refused: "waited_out", route_state: "final" }), /No fast hunt followed the first step: ` waited_out `\./);
   assert.doesNotMatch(md({ id: "rev_a", continued_from: null, route_refused: null, route_state: null }), /Reviews:|No fast hunt/);
+  for (const outcome of ["blocking", "failed", "cut_short"]) {
+    const m = resultMarkdown({ ...base, outcome, counts: { blocking: 1 }, review: { id: "rev_b", continued_from: "rev_a", route_refused: null, route_state: "final" } });
+    assert.match(m, /the result is the last one's/, outcome);
+  }
   // No result was read: the chain is named, no result is claimed.
   const cut = resultMarkdown({ ...base, outcome: "timed_out", billing: { tariff: null, charged_usd: null, paid_by: null, note: "" },
     review: { id: "rev_b", continued_from: "rev_a", route_refused: null, route_state: "continued" } });
@@ -1531,7 +1537,7 @@ test("route result shape: pending, then continued, then a child timeout: the chi
   } finally { await s.close(); }
 });
 
-test("route result shape: a link with a control character is neither logged nor kept; an odd route state is not kept", async () => {
+test("route result shape: a link with a control character is not kept in the result; an odd route state is not kept", async () => {
   const dir = routedRepo();
   const s = await routeServer({
     rev_step1: [{ status: "done", route_state: "continued", continued_by: "rev_child", final: false }],
@@ -1645,4 +1651,104 @@ test("route result shape: route_state and ended_status are the last read's, of t
     const j = JSON.parse(r.out);
     assert.deepEqual([j.review.status, j.review.ended_status, j.review.route_state, j.outcome], ["running", null, "snap_running", "timed_out"]);
   } finally { await s.close(); }
+});
+
+test("route: the chain cap's refusal reports the child, step 1, the child's ended status and route state", async () => {
+  const dir = routedRepo();
+  const cont = (next) => ({ status: "done", route_state: "continued", continued_by: next, final: false });
+  const s = await routeServer({ rev_step1: [cont("rev_a")], rev_a: [cont("rev_b")] });
+  try {
+    const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url });
+    assert.equal(r.code, 2, r.log);
+    const j = JSON.parse(r.out);
+    assert.deepEqual([j.review.id, j.review.continued_from, j.review.status, j.review.ended_status, j.review.route_state, j.outcome],
+      ["rev_a", "rev_step1", "running", "done", "continued", "interrupted"]);
+  } finally { await s.close(); }
+});
+
+test("route result shape: a failed review reports ended_status failed", async () => {
+  const dir = routedRepo();
+  const s = await routeServer({ rev_step1: [{ status: "failed", route_state: "final", final: true }] });
+  try {
+    const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url });
+    assert.equal(r.code, 2, r.log);
+    const j = JSON.parse(r.out);
+    assert.deepEqual([j.review.status, j.review.ended_status, j.outcome], ["failed", "failed", "failed"]);
+  } finally { await s.close(); }
+});
+
+test("a wait_review that showed the review ended is kept when the get_findings after it fails", async () => {
+  const { dir } = repo();
+  writeFileSync(join(dir, "app.js"), "export const a = 9\n");
+  const s = await server({ faults: { get_findings: { error: "not_found", message: "gone" } } });
+  try {
+    const r = await cli(dir, ["--uncommitted", "--format", "json"], { OHMYBUG_URL: s.url });
+    assert.equal(r.code, 2, r.log);
+    const j = JSON.parse(r.out);
+    assert.deepEqual([j.review.status, j.review.ended_status, j.outcome], ["running", "done", "interrupted"]);
+  } finally { await s.close() }
+});
+
+test("text mode: the Report line falls back to the hunt's link from a running read", async () => {
+  const dir = routedRepo();
+  const s = await routeServer({ rev_step1: [{ status: "running", live_url: "https://example.test/live/r" }, { status: "done", findings: [], route_state: "final", final: true }] },
+    { review_id: "rev_step1", status: "running" });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: s.url });
+    assert.equal(r.code, 0, r.log);
+    assert.match(r.out, /Report: https:\/\/example\.test\/live\/r/);
+  } finally { await s.close(); }
+});
+
+test("--deep ignores route fields: a deep review the service marks continued is still the result", async () => {
+  const dir = routedRepo();
+  const s = await routeServer({ rev_step1: [{ status: "done", findings: [], route_state: "continued", continued_by: "rev_child", final: false }] });
+  try {
+    const r = await cli(dir, ["--deep", "--format", "json"], { OHMYBUG_URL: s.url });
+    assert.equal(r.code, 0, r.log);
+    assert.ok(!s.calls.some((c) => c.id === "rev_child"), "a deep review was followed");
+    const j = JSON.parse(r.out);
+    assert.deepEqual([j.review.id, j.review.route_state, j.review.continued_from], ["rev_step1", null, null]);
+  } finally { await s.close(); }
+});
+
+test("every submit carries the follows header: --mode, --deep and the diff-only resend; no other call does", async () => {
+  const dir = routedRepo();
+  const check = (s) => {
+    const subs = s.calls.filter((c) => c.name === "submit_review");
+    assert.ok(subs.length >= 1);
+    assert.deepEqual(subs.map((c) => c.follows), subs.map(() => "continued_by"));
+    assert.deepEqual(s.calls.filter((c) => c.name !== "submit_review" && c.follows !== undefined), []);
+  };
+  for (const [argv, faults, n] of [[["--mode", "fast"], {}, 1], [["--deep"], {}, 1], [[], { submit_review: { error: "diff_required", message: "no" } }, 2]]) {
+    const s = await server({ faults });
+    try {
+      const r = await cli(dir, argv, { OHMYBUG_URL: s.url });
+      assert.equal(r.code, 0, `${argv.join(" ")}: ${r.log}`);
+      assert.equal(s.calls.filter((c) => c.name === "submit_review").length, n);
+      check(s);
+    } finally { await s.close() }
+  }
+});
+
+test("--uncommitted: an index that cannot be read is a refusal, never a review of an empty index", async () => {
+  // A directory fails the copy; a link to itself fails the stat (ELOOP).
+  for (const broken of [(p) => mkdirSync(p), (p) => symlinkSync(p, p)]) {
+    const { dir } = repo();
+    writeFileSync(join(dir, "app.js"), "export const a = 3\n");
+    rmSync(join(dir, ".git", "index"));
+    broken(join(dir, ".git", "index"));
+    const s = await server();
+    try {
+      const r = await cli(dir, ["--uncommitted"], { OHMYBUG_URL: s.url });
+      assert.equal(r.code, 2, r.log);
+      assert.match(r.log, /could not snapshot the working tree for --uncommitted/);
+      assert.ok(!s.calls.some((c) => c.name === "submit_review"));
+    } finally { await s.close() }
+  }
+});
+
+test("the decision floor seam refuses a value that would disable the deadline", async () => {
+  const { dir } = repo();
+  for (const bad of [NaN, 0, 1.5, "45"]) await assert.rejects(cli(dir, [], {}, { decisionWaitS: bad }), /decisionWaitS must be a whole number/);
 });
