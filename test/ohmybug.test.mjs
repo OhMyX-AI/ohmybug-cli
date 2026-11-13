@@ -51,7 +51,7 @@ async function server({ findings = [], status = "done", review_of_record = true,
       // The upload doors: `ticket.repo` and `ticket.payload` answer with those statuses in turn (200 when the list is out).
       if (req.url.startsWith("/u/")) {
         const door = req.url.endsWith("/repo") ? "repo" : "payload";
-        uploads.push({ door, type: req.headers["content-type"], body: Buffer.concat(chunks) });
+        uploads.push({ door, path: req.url, type: req.headers["content-type"], body: Buffer.concat(chunks) });
         const st = (ticket?.[door] ?? []).shift() ?? 200;
         res.writeHead(st, { "content-type": "application/json" });
         return res.end(JSON.stringify(st === 200 ? { ok: true } : { error: `${door} refused: see https://app.ohmybug.ai/me/policy`, ...(st === 409 && door === "payload" ? { code: "snapshot_required" } : {}) }));
@@ -87,7 +87,7 @@ async function server({ findings = [], status = "done", review_of_record = true,
       const ask = name === "wait_review" && requested ? [requested, requestedAgain][asks] : undefined;
       if (ask) asks++;
       const result = toolError ? toolError
-        : name === "submit_review" && args.upload ? { review_id: "rev_test", status: "awaiting_upload", upload_url: ticket?.url ?? `${url}/u/tok`, ...(ticket?.snapshot ? { snapshot: ticket.snapshot } : {}) }
+        : name === "submit_review" && args.upload ? { review_id: "rev_test", status: "awaiting_upload", ...(ticket?.url === null ? {} : { upload_url: ticket?.url ?? `${url}/u/tok${ticket?.slash ? "/" : ""}` }), ...(ticket?.snapshot ? { snapshot: ticket.snapshot } : {}) }
         : name === "submit_review" ? { review_id: "rev_test", status: "running", ...submitExtra }
         : ask ? { review_id: "rev_test", status: "needs_files", requested_files: ask, files_url: filesUrl ?? `${url}/files` }
         : name === "wait_review" ? { review_id: "rev_test", status }
@@ -1807,16 +1807,21 @@ test("snapshot_required with --uncommitted: the snapshot is the working tree, un
   } finally { await s.close() }
 });
 
-test("a ticket that says snapshot off gets the diff and files only: the repository is never uploaded", async () => {
+test("a ticket that does not say snapshot required (off, or no flag) gets the diff and files only: the repository is never uploaded", async () => {
   const { dir, git } = repo();
   writeFileSync(join(dir, "app.js"), "export const a = 2\n");
   git("commit", "-qam", "change");
-  const s = await server({ faults: { ...NEEDS_SNAPSHOT }, ticket: { snapshot: "off" } });
+  for (const snapshot of ["off", undefined]) {
+  const s = await server({ faults: { ...NEEDS_SNAPSHOT }, ticket: { snapshot } });
   try {
-    const r = await cli(dir, [], { OHMYBUG_URL: s.url });
+    const r = await cli(dir, ["--mode", "fast"], { OHMYBUG_URL: s.url });
     assert.equal(r.code, 0, r.log);
-    assert.deepEqual(s.uploads.map((u) => u.door), ["payload"]);
+    assert.deepEqual(s.uploads.map((u) => u.door), ["payload"], String(snapshot));
+    assert.equal(s.calls.filter((c) => c.name === "submit_review")[1].args.mode, "fast");
+    assert.match(r.log, /the repository is not uploaded/);
+    assert.doesNotMatch(r.log, /uploading the repository snapshot/);
   } finally { await s.close() }
+  }
 });
 
 test("the snapshot door: 409 (already has it) goes on to the diff; a refusal is printed whole and the diff is not sent", async () => {
@@ -1829,7 +1834,7 @@ test("the snapshot door: 409 (already has it) goes on to the diff; a refusal is 
     assert.equal(r.code, 0, r.log);
     assert.deepEqual(s.uploads.map((u) => u.door), ["repo", "payload"]);
   } finally { await s.close() }
-  for (const st of [413, 410]) {
+  for (const st of [413, 410, 403]) {
     s = await server({ faults: { ...NEEDS_SNAPSHOT }, ticket: { snapshot: "required", repo: [st] } });
     try {
       const r = await cli(dir, [], { OHMYBUG_URL: s.url });
@@ -1847,9 +1852,10 @@ test("the diff upload refused with snapshot_required is final: printed whole, ne
   git("commit", "-qam", "change");
   const s = await server({ faults: { ...NEEDS_SNAPSHOT }, ticket: { snapshot: "required", payload: [409] } });
   try {
-    const r = await cli(dir, [], { OHMYBUG_URL: s.url });
+    const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url });
     assert.equal(r.code, 2);
     assert.match(r.log, /HTTP 409 payload refused: see https:\/\/app\.ohmybug\.ai\/me\/policy/);
+    assert.equal(JSON.parse(r.out).error.code, "snapshot_required");
     assert.deepEqual(s.uploads.map((u) => u.door), ["repo", "payload"]);
     assert.equal(s.calls.filter((c) => c.name === "submit_review").length, 2);
     assert.equal(s.calls.filter((c) => c.name === "wait_review").length, 0);
@@ -1862,14 +1868,23 @@ test("an upload address on another host is refused before the repository leaves 
   git("commit", "-qam", "change");
   const s = await server({ faults: { ...NEEDS_SNAPSHOT }, ticket: { snapshot: "required", url: "https://elsewhere.example/u/tok" } });
   try {
-    const r = await cli(dir, [], { OHMYBUG_URL: s.url });
+    const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url });
     assert.equal(r.code, 2);
     assert.match(r.log, /without a usable upload address/);
     assert.equal(s.uploads.length, 0);
+    assert.equal(JSON.parse(r.out).outcome, "not_run");
   } finally { await s.close() }
+  // No address at all: `new URL(undefined, base)` would resolve to <base>/undefined.
+  const s2 = await server({ faults: { ...NEEDS_SNAPSHOT }, ticket: { snapshot: "required", url: null } });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: s2.url });
+    assert.equal(r.code, 2);
+    assert.match(r.log, /without a usable upload address/);
+    assert.equal(s2.uploads.length, 0);
+  } finally { await s2.close() }
 });
 
-test("without snapshot_required nothing changes: a diff the service takes is sent once, inline, and no ticket is asked for", async () => {
+test("without snapshot_required nothing changes: a diff refused for another reason is not sent again and no ticket is asked for", async () => {
   const { dir, git } = repo();
   writeFileSync(join(dir, "app.js"), "export const a = 2\n");
   git("commit", "-qam", "change");
@@ -1879,5 +1894,91 @@ test("without snapshot_required nothing changes: a diff the service takes is sen
     assert.equal(r.code, 2);
     assert.equal(s.calls.filter((c) => c.name === "submit_review").length, 1);
     assert.equal(s.uploads.length, 0);
+  } finally { await s.close() }
+});
+
+test("the snapshot door: a 503 or 429 is sent again; a trailing slash on the ticket address still reaches /repo", async () => {
+  const { dir, git } = repo();
+  writeFileSync(join(dir, "app.js"), "export const a = 2\n");
+  git("commit", "-qam", "change");
+  const s = await server({ faults: { ...NEEDS_SNAPSHOT }, ticket: { snapshot: "required", repo: [503, 429] } });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: s.url });
+    assert.equal(r.code, 0, r.log);
+    assert.deepEqual(s.uploads.map((u) => u.door), ["repo", "repo", "repo", "payload"]);
+  } finally { await s.close() }
+  const s2 = await server({ faults: { ...NEEDS_SNAPSHOT }, ticket: { snapshot: "required", slash: true } });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: s2.url });
+    assert.equal(r.code, 0, r.log);
+    assert.deepEqual(s2.uploads.map((u) => [u.door, u.path]), [["repo", "/u/tok/repo"], ["payload", "/u/tok/"]]);
+  } finally { await s2.close() }
+});
+
+test("the diff upload starts the hunt: a 503 or a reset there is never sent again, and the run names the review that may be running", async () => {
+  const { dir, git } = repo();
+  writeFileSync(join(dir, "app.js"), "export const a = 2\n");
+  git("commit", "-qam", "change");
+  const s = await server({ faults: { ...NEEDS_SNAPSHOT }, ticket: { snapshot: "required", payload: [503] } });
+  try {
+    const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url });
+    assert.equal(r.code, 2);
+    assert.deepEqual(s.uploads.map((u) => u.door), ["repo", "payload"]);
+    assert.match(r.log, /A hunt may have started/);
+    assert.match(r.log, /review rev_test may still be running/);
+    assert.equal(JSON.parse(r.out).review.id, "rev_test");
+  } finally { await s.close() }
+});
+
+test("a diff resent after a refused GitHub read takes the snapshot path too; a GitHub submit refused with snapshot_required uploads nothing", async () => {
+  const dir = routedRepo();
+  const s = await server({ faults: { submit_review: [{ error: "diff_required", message: "no app" }, NEEDS_SNAPSHOT.submit_review] }, ticket: { snapshot: "required" } });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: s.url });
+    assert.equal(r.code, 0, r.log);
+    const subs = s.calls.filter((c) => c.name === "submit_review");
+    assert.deepEqual(subs.map((c) => [!!c.args.meta?.repo, !!c.args.diff, !!c.args.upload]), [[true, false, false], [false, true, false], [false, false, true]]);
+    assert.deepEqual(s.uploads.map((u) => u.door), ["repo", "payload"]);
+  } finally { await s.close() }
+  const s2 = await server({ faults: { ...NEEDS_SNAPSHOT }, ticket: { snapshot: "required" } });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: s2.url });
+    assert.equal(r.code, 2);
+    assert.equal(s2.calls.filter((c) => c.name === "submit_review").length, 1);
+    assert.equal(s2.uploads.length, 0);
+  } finally { await s2.close() }
+});
+
+test("a snapshot over the limit is refused before a ticket is asked for: nothing is uploaded and nothing started", async () => {
+  const { dir, git } = repo();
+  writeFileSync(join(dir, "app.js"), "export const a = 2\n");
+  git("commit", "-qam", "change");
+  const s = await server({ faults: { ...NEEDS_SNAPSHOT }, ticket: { snapshot: "required" } });
+  try {
+    const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url }, { maxSnapshot: 10 });
+    assert.equal(r.code, 2);
+    assert.match(r.log, /the repository snapshot is 1 MiB compressed, over the 0 MiB the service takes; nothing was started/);
+    assert.equal(s.calls.filter((c) => c.name === "submit_review").length, 1);
+    assert.equal(s.uploads.length, 0);
+    const j = JSON.parse(r.out);
+    assert.deepEqual([j.outcome, j.error.code], ["not_run", "snapshot_required"]);
+  } finally { await s.close() }
+});
+
+// GIT_ATTR_SOURCE is read by recent git (2.42 here, to be safe); an older git applies the tree's export-ignore.
+const gitVersion = execFileSync("git", ["--version"]).toString().match(/(\d+)\.(\d+)/).slice(1).map(Number);
+test("export-ignore does not leave a reviewed file out of the snapshot", { skip: gitVersion[0] < 2 || (gitVersion[0] === 2 && gitVersion[1] < 42) ? "git before 2.42" : false }, async () => {
+  const { dir, git } = repo();
+  writeFileSync(join(dir, ".gitattributes"), "tests/ export-ignore\n");
+  mkdirSync(join(dir, "tests"));
+  writeFileSync(join(dir, "tests", "a.test.js"), "test\n");
+  writeFileSync(join(dir, "app.js"), "export const a = 2\n");
+  git("add", ".");
+  git("commit", "-qm", "change");
+  const s = await server({ faults: { ...NEEDS_SNAPSHOT }, ticket: { snapshot: "required" } });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: s.url });
+    assert.equal(r.code, 0, r.log);
+    assert.ok(tarList(s.uploads[0].body).includes("tests/a.test.js"), tarList(s.uploads[0].body).join(","));
   } finally { await s.close() }
 });
