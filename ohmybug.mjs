@@ -70,8 +70,9 @@ export const RESULT_SCHEMA = "ohmybug-cli/result/1";
 // The service route: how a continued review is named, how many hunts a chain may hold (the service makes 2: a child never routes),
 // and how often an ended step 1 is read while the service decides (its own tick looks every 10 s).
 const REVIEW_ID = /^rev_[A-Za-z0-9]{1,64}$/;
-// A live link from the service, printed and returned only as one https line with no control characters.
-const liveLink = (u) => (typeof u === "string" && /^https:\/\/[^\s\x00-\x1f\x7f]+$/.test(u) ? u : null);
+// A live link from the service is printed and returned only as one plain https URL: no whitespace, no C0 or C1
+// control, no bidi mark, nothing markdown reads.
+const liveLink = (u) => (typeof u === "string" && /^https:\/\/[^\s\x00-\x1f\x7f-\x9f\u200e\u200f\u202a-\u202e\u2066-\u2069<>()[\]`]+$/.test(u) ? u : null);
 const MAX_CHAIN = 2;
 const ROUTE_LOOK_MS = 10_000;
 // The service decides within about 1520 s of step 1's end (its launch clock): the decision wait is never shorter, or a
@@ -327,6 +328,7 @@ export function resultOf(rec, code) {
       continued_from: rec.continuedFrom ?? null, route_refused: rec.routeRefused ?? null, route_state: rec.routeState ?? null },
     live_url: live,
     live_url_missing: live ? null : maybe ? "the start was not confirmed: check https://app.ohmybug.ai/me" : !rec.reviewId ? "nothing started"
+      : r?.live_url || rec.badLink ? "the link the service sent is not a plain https URL"
       : "the service sent no live link: the key's live link setting is off (app.ohmybug.ai/me), or it was not read",
     billing,
     silent_bill: sb ? { at: typeof sb.at === "string" && ISO_UTC.test(sb.at) ? sb.at : null, billed: sb.billed === true, note: silentBillLine(sb) } : null,
@@ -372,13 +374,13 @@ export function resultMarkdown(res, folds = true) {
   const read = ["clean", "blocking", "failed", "cut_short"].includes(res.outcome);
   if (rv.continued_from) out.push(`Reviews: ${cell(rv.continued_from)} continued as ${cell(rv.id)}${read ? "; the result is the last one's" : ""}.`, "");
   if (rv.route_refused) out.push(`No fast hunt followed the first step: ${cell(rv.route_refused)}.`, "");
-  if (rv.route_state === "awaiting_verdicts") out.push("The first step's findings wait for a verdict, which this client does not give: the first step is the result.", "");
+  if (read && rv.route_state === "awaiting_verdicts") out.push("The first step's findings wait for a verdict, which this client does not give: the first step is the result.", "");
   const b = res.billing;
   const how = [b.tariff === "ci" ? "CI billing" : "", b.paid_by ? cell(b.paid_by) : ""].filter(Boolean).join(", ");
   const bill = b.charged_usd !== null ? `$${b.charged_usd} charged${how ? ` (${how})` : ""}` : escHtml(b.note);
   out.push(`Billing: ${bill}.${res.silent_bill ? ` ${escHtml(res.silent_bill.note)}.` : ""}`, "");
   // The link is drawn only as a plain https URL: anything else is not a link to follow.
-  const link = /^https:\/\/[^\s<>()[\]`]+$/.test(res.live_url ?? "") ? res.live_url : null;
+  const link = liveLink(res.live_url);
   out.push(link ? `Report: <${link}>` : `Report: none (${escHtml(res.live_url_missing ?? "the link the service sent is not a plain https URL")})`);
   if (!folds) out.push("", `Failure scenarios left out: the summary would be over GitHub's size limit.${link ? " The report has them." : ""}`);
   const md = out.join("\n");
@@ -673,6 +675,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS }) {
     started = sub;
     rec.reviewId = sub.review_id;
     rec.live = liveLink(sub.live_url) ?? undefined;
+    if (sub.live_url && !rec.live) rec.badLink = true;
     log(`review ${sub.review_id} started${typeof sub.hunt_mode === "string" && MODES.has(sub.hunt_mode) ? ` in ${sub.hunt_mode} mode` : ""}${sub.recent_median_minutes ? `; recent ones took about ${sub.recent_median_minutes} min` : ""}`);
     if (rec.live) log(`live progress: ${rec.live}`);
 
@@ -690,15 +693,17 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS }) {
       if (r.status === "done" || r.status === "failed") r = await tool("get_findings", { review_id: id });
       // A routed step 1: `final: false` is not the end, whatever its own status and review_of_record say, except
       // awaiting_verdicts, which waits on a confirm this client never sends, so step 1 is its result.
-      const route = typeof r.route_state === "string" && /^[a-z_]{1,40}$/.test(r.route_state) ? r.route_state : null;
-      if (route) rec.routeState = route;
+      const route = typeof r.route_state === "string" && r.route_state ? r.route_state : null;
+      rec.routeState = route && /^[a-z0-9_]{1,40}$/.test(route) ? route : null;
+      // Set again below only while this read is an ended review the run may stop on.
+      rec.endedStatus = undefined;
       // A review's link, printed once as soon as a read carries it: a continued hunt's own link comes only from its reads.
       if (liveLink(r.live_url) && !liveSeen.has(id)) {
         liveSeen.add(id);
         rec.live = r.live_url;
         if (started?.review_id === id) started.live_url = r.live_url;
-        log(`live progress: ${r.live_url}`);
-      }
+        if (r.status !== "done" && r.status !== "failed") log(`live progress: ${r.live_url}`);
+      } else if (r.live_url && !liveLink(r.live_url)) rec.badLink = true;
       if (route === "continued") {
         const next = r.continued_by;
         if (typeof next !== "string" || !REVIEW_ID.test(next) || chain.includes(next) || chain.length >= MAX_CHAIN) {
@@ -715,6 +720,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS }) {
         rec.reviewId = next;
         rec.continuedFrom = chain[0];
         rec.live = undefined;
+        rec.badLink = false;
         rec.endedStatus = undefined;
         deciding = false;
         waiting = `OHMYBUG_TIMEOUT_S (${timeoutS}s)`;
