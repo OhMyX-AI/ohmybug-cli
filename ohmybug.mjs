@@ -3,7 +3,7 @@
 // One file, no dependencies, Node 18+. Exit 0: no medium or worse bug. 1: at least one. 2: the review could not run,
 // or was cut short with no medium or worse bug.
 import { execFileSync } from "node:child_process";
-import { appendFileSync, copyFileSync, realpathSync, rmSync } from "node:fs";
+import { appendFileSync, copyFileSync, realpathSync, rmSync, statSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -167,7 +167,12 @@ function snapshotTree(git, gitWith, root) {
   const index = join(tmpdir(), `ohmybug-index-${process.pid}-${Date.now()}`);
   try {
     const real = git("rev-parse", "--git-path", "index").trim();
-    try { copyFileSync(isAbsolute(real) ? real : join(root, real), index); } catch {} // no index yet: start empty
+    const src = isAbsolute(real) ? real : join(root, real);
+    // The copy keeps the index's mtime: git re-reads an entry as old as the index itself (a racy one), and a fresh mtime
+    // would make it trust the stat and miss a same-size edit made in that second.
+    let copied = true;
+    try { copyFileSync(src, index); } catch { copied = false; } // no index yet: start empty
+    if (copied) { const st = statSync(src); utimesSync(index, st.atime, st.mtime); }
     // Without --directory, git lists every untracked file and stops at a nested repository at any depth as `dir/`.
     const nested = git("ls-files", "--others", "--exclude-standard", "-z").split("\0").filter((p) => p.endsWith("/"));
     gitWith({ GIT_INDEX_FILE: index }, "add", "-A", "--", ".", ...nested.map((p) => `:(exclude,top,literal)${p}`));

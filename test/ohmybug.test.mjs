@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync, readFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync, readFileSync, utimesSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -333,6 +333,26 @@ test("--uncommitted reviews the working tree, untracked files included", async (
     const diff = s.calls.find((c) => c.name === "submit_review").args.diff;
     assert.match(diff, /\+export const a = 7/);
     assert.match(diff, /\+export const n = 1/);
+  } finally { await s.close() }
+});
+
+test("--uncommitted sees a same-size edit made in the second of the last index write (a racy entry)", async () => {
+  // A whole-second clock, as git compares without nanoseconds: the entry, the file and the index all at T. Git
+  // itself must re-read such an entry; a copied index with a fresh mtime would make it trust the stat and miss the edit.
+  const { dir, git } = repo();
+  const t = new Date(Math.floor(Date.now() / 1000) * 1000 - 60_000);
+  const app = join(dir, "app.js");
+  utimesSync(app, t, t);
+  git("add", "app.js");
+  writeFileSync(app, "export const a = 7\n");
+  utimesSync(app, t, t);
+  utimesSync(join(dir, ".git", "index"), t, t);
+  assert.match(git("diff", "HEAD"), /\+export const a = 7/, "git itself does not see the edit: the setup proves nothing");
+  const s = await server();
+  try {
+    const r = await cli(dir, ["--uncommitted"], { OHMYBUG_URL: s.url });
+    assert.equal(r.code, 0, r.log);
+    assert.match(s.calls.find((c) => c.name === "submit_review").args.diff, /\+export const a = 7/);
   } finally { await s.close() }
 });
 
