@@ -17,7 +17,7 @@ curl -fsSL https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/main/install.s
 Or download [`ohmybug.mjs`](ohmybug.mjs) and run it with `node ohmybug.mjs`. The installer takes the latest `main`; to pin a release in CI, name its file:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/main/install.sh | OHMYBUG_CLI_URL=https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/v0.8.0/ohmybug.mjs sh
+curl -fsSL https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/main/install.sh | OHMYBUG_CLI_URL=https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/v0.9.0/ohmybug.mjs sh
 ```
 
 Behind a proxy: Node's `fetch` reads `HTTPS_PROXY` only with `NODE_USE_ENV_PROXY=1` (Node 22.21 or newer, or 24 or newer).
@@ -117,7 +117,7 @@ ohmybug:
     GIT_DEPTH: 0
   script:
     - git fetch origin "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"
-    - curl -fsSL https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/v0.8.0/install.sh | OHMYBUG_CLI_URL=https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/v0.8.0/ohmybug.mjs sh
+    - curl -fsSL https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/v0.9.0/install.sh | OHMYBUG_CLI_URL=https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/v0.9.0/ohmybug.mjs sh
     - ohmybug
 ```
 
@@ -137,7 +137,7 @@ pipelines:
           script:
             # The clone tracks one branch: name where the target goes, or origin/<target> does not exist.
             - git fetch origin "+refs/heads/$BITBUCKET_PR_DESTINATION_BRANCH:refs/remotes/origin/$BITBUCKET_PR_DESTINATION_BRANCH"
-            - curl -fsSL https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/v0.8.0/install.sh | OHMYBUG_CLI_URL=https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/v0.8.0/ohmybug.mjs sh
+            - curl -fsSL https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/v0.9.0/install.sh | OHMYBUG_CLI_URL=https://raw.githubusercontent.com/OhMyX-AI/ohmybug-cli/v0.9.0/ohmybug.mjs sh
             - ohmybug --base "origin/$BITBUCKET_PR_DESTINATION_BRANCH"
 ```
 
