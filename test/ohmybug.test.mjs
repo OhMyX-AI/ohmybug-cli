@@ -346,7 +346,8 @@ test("--uncommitted sees a same-size edit made in the second of the last index w
   git("add", "app.js");
   writeFileSync(app, "export const a = 7\n");
   utimesSync(app, t, t);
-  utimesSync(join(dir, ".git", "index"), t, t);
+  // A later atime, as an index read often but written rarely has: only its mtime may count.
+  utimesSync(join(dir, ".git", "index"), new Date(t.getTime() + 30_000), t);
   assert.match(git("diff", "HEAD"), /\+export const a = 7/, "git itself does not see the edit: the setup proves nothing");
   const s = await server();
   try {

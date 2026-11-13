@@ -170,9 +170,12 @@ function snapshotTree(git, gitWith, root) {
     const src = isAbsolute(real) ? real : join(root, real);
     // The copy keeps the index's mtime: git re-reads an entry as old as the index itself (a racy one), and a fresh mtime
     // would make it trust the stat and miss a same-size edit made in that second.
-    let copied = true;
-    try { copyFileSync(src, index); } catch { copied = false; } // no index yet: start empty
-    if (copied) { const st = statSync(src); utimesSync(index, st.atime, st.mtime); }
+    // Stat first: if the index is replaced in between, the copy looks older, which only makes git re-read more. The
+    // time is floored to whole seconds for the same reason.
+    let sec = null;
+    try { sec = Math.floor(statSync(src).mtimeMs / 1000); copyFileSync(src, index); }
+    catch (e) { if (e?.code !== "ENOENT") throw e; sec = null; } // no index yet: start empty
+    if (sec !== null) utimesSync(index, sec, sec);
     // Without --directory, git lists every untracked file and stops at a nested repository at any depth as `dir/`.
     const nested = git("ls-files", "--others", "--exclude-standard", "-z").split("\0").filter((p) => p.endsWith("/"));
     gitWith({ GIT_INDEX_FILE: index }, "add", "-A", "--", ".", ...nested.map((p) => `:(exclude,top,literal)${p}`));
