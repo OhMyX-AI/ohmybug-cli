@@ -75,7 +75,7 @@ exit $code
 | `cli_version` | this CLI's version |
 | `exit_code` | the run's exit code: 0 no medium or worse bug, 1 at least one, 2 could not run or cut short |
 | `outcome` | `clean`, `blocking`, `failed`, `cut_short`, `timed_out`, `interrupted` (started, then the run could not follow it to the end), `maybe_started` (the start was not confirmed and a hunt may be running: check app.ohmybug.ai/me before running again), `not_run`, `no_changes` |
-| `review` | `{id, status, deep, complete}`: `id` and `status` are null when nothing started; `complete` is true only for a review that finished its whole protocol |
+| `review` | `{id, status, deep, complete, continued_from, route_refused}`: `id` and `status` are null when nothing started; `complete` is true only for a review that finished its whole protocol; when the service continued a quick first step with the fast hunt, `id` is the last review (the result) and `continued_from` the first; `route_refused` is the service's reason when no fast hunt followed the first step |
 | `live_url` | the report link, or null |
 | `live_url_missing` | why `live_url` is null (for example, the key's live link setting is off), else null |
 | `billing` | `{tariff, charged_usd, paid_by, note}`: on CI billing `tariff` is `ci` and `charged_usd` what was charged; otherwise `tariff` is `confirm` and `charged_usd` null, since the charge comes when someone confirms a medium or worse finding as real, or at the billing deadline; null `tariff` when nothing started or no result was read |

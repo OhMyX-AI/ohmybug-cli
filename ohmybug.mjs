@@ -672,7 +672,10 @@ async function review({ opts, env, cwd, out, log, rec }) {
       if (route === "continued") {
         const next = r.continued_by;
         if (typeof next !== "string" || !REVIEW_ID.test(next) || chain.includes(next) || chain.length >= MAX_CHAIN) {
-          throw new Refusal(`review ${id} named a continuation this client cannot follow (${String(next).slice(0, 80)})`);
+          // Not a result: the service continued this review. The id is escaped, and the "may still be running" line
+          // must not name the review that ended.
+          started = undefined;
+          throw new Refusal(`review ${id} ended and was continued as ${JSON.stringify(String(next).slice(0, 80))}, which this client does not follow: see https://app.ohmybug.ai/me for that hunt`);
         }
         chain.push(next);
         log(`review ${id} continues as review ${next}; waiting up to ${timeoutS}s for it`);
@@ -684,8 +687,9 @@ async function review({ opts, env, cwd, out, log, rec }) {
         deadline = Date.now() + timeoutS * 1000;
         continue;
       }
-      // Step 1 ended and the service is still deciding whether a fast hunt follows: not a result yet.
-      if ((route === "pending" || route === "snap_running") && (r.status === "done" || r.status === "failed")) {
+      // Step 1 ended and the service is still deciding whether a fast hunt follows (pending, or any state this client
+      // does not know): not a result yet. awaiting_verdicts waits on a confirm this client never sends.
+      if (route && r.final === false && route !== "awaiting_verdicts" && (r.status === "done" || r.status === "failed")) {
         // The next read needs its own 15 s reserve (above): a sleep that leaves less ends the wait now.
         if (Date.now() + ROUTE_LOOK_MS + 16_000 > deadline) throw new Deadline("timed out");
         await sleep(ROUTE_LOOK_MS);

@@ -1241,9 +1241,9 @@ async function routeServer(script) {
     req.on("end", () => {
       const msg = JSON.parse(body);
       const { name, arguments: args } = msg.params;
-      calls.push({ name, id: args.review_id, t: Date.now() });
+      calls.push({ name, id: args.review_id, follows: req.headers["x-ohmybug-follows"] });
       let result;
-      if (name === "submit_review") { heads.push(req.headers); result = { review_id: "rev_step1", status: "running" }; }
+      if (name === "submit_review") { heads.push(req.headers); result = { review_id: "rev_step1", status: "running", live_url: "https://example.test/live/step1" }; }
       else {
         const list = script[args.review_id] ?? [{ status: "failed", error: "unknown review" }];
         if (name === "wait_review") at[args.review_id] = Math.min((at[args.review_id] ?? -1) + 1, list.length - 1);
@@ -1270,7 +1270,7 @@ function routedRepo() {
   return dir;
 }
 
-test("route: snap_running, pending, then continued: the child's result and exit code, both reviews named, the header on submit only", async () => {
+test("route: a running step 1, pending, then continued: the child's result and exit code, both reviews named, the header on submit only", async () => {
   const dir = routedRepo();
   const s = await routeServer({
     rev_step1: [
@@ -1288,7 +1288,8 @@ test("route: snap_running, pending, then continued: the child's result and exit 
       ["rev_child", "rev_step1", null, 1, "high", "https://example.test/live/child"]);
     assert.match(r.log, /review rev_step1 continues as review rev_child/);
     assert.equal(s.heads.length, 1);
-    assert.equal(s.heads[0]["x-ohmybug-follows"], "continued_by");
+    assert.deepEqual(s.calls.map((c) => [c.name, c.follows ?? null]).filter(([n, f]) => n === "submit_review" ? f !== "continued_by" : f !== null), []);
+    assert.ok(s.calls.some((c) => c.name === "get_findings"));
     const text = await cli(dir, [], { OHMYBUG_URL: s.url });
     assert.match(text.out, /Reviews: rev_step1 continued as rev_child; the result is review rev_child's\./);
     assert.doesNotMatch(text.out, /naming/);
@@ -1330,7 +1331,8 @@ test("route: a failed step 1 the service continues is not the result; a continua
     try {
       const r = await cli(dir, [], { OHMYBUG_URL: s.url });
       assert.equal(r.code, 2, `${next}: ${r.log}`);
-      assert.match(r.log, /named a continuation this client cannot follow/);
+      assert.match(r.log, /which this client does not follow/);
+      assert.doesNotMatch(r.log, /may still be running/);
     } finally { await s.close(); }
   }
 });
@@ -1351,5 +1353,58 @@ test("route: a clock per hunt: a child that starts late gets its full OHMYBUG_TI
     const r = await cli(dir, [], { OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: "40" });
     assert.equal(r.code, 0, r.log);
     assert.ok(Date.now() - t0 > 26_000, `the run ended before one shared clock would have (${Date.now() - t0} ms): the test proves nothing`);
+  } finally { await s.close(); }
+});
+
+test("route: the chain stops at three hunts and on an indirect loop; an unknown state with final false is not a result", async () => {
+  const dir = routedRepo();
+  const cont = (next) => ({ status: "done", route_state: "continued", continued_by: next, final: false });
+  for (const [script, refused] of [
+    [{ rev_step1: [cont("rev_a")], rev_a: [cont("rev_b")], rev_b: [cont("rev_c")], rev_c: [{ status: "done" }] }, "rev_c"],
+    [{ rev_step1: [cont("rev_a")], rev_a: [cont("rev_step1")] }, "rev_step1"],
+  ]) {
+    const s = await routeServer(script);
+    try {
+      const r = await cli(dir, [], { OHMYBUG_URL: s.url });
+      assert.equal(r.code, 2, r.log);
+      assert.match(r.log, new RegExp(`continued as "${refused}", which this client does not follow`));
+      assert.ok(!s.calls.some((c) => c.id === "rev_c"), "the fourth hunt was read");
+    } finally { await s.close(); }
+  }
+  // A state this client does not know, with final false, is read again until the route ends.
+  const s = await routeServer({ rev_step1: [{ status: "done", findings: [high], route_state: "deciding", final: false }, { status: "done", findings: [low], route_state: "final", final: true }] });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: s.url });
+    assert.equal(r.code, 0, r.log);
+    assert.equal(s.calls.filter((c) => c.name === "wait_review").length, 2);
+  } finally { await s.close(); }
+});
+
+test("route: a malformed or absent refusal reason stays out of the log and the result", async () => {
+  const dir = routedRepo();
+  for (const reason of ["\u001b[2Jbad", "Waited Out", 7, undefined]) {
+    const s = await routeServer({ rev_step1: [{ status: "done", route_state: "final", final: true, ...(reason === undefined ? {} : { continuation_refused: reason }) }] });
+    try {
+      const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url });
+      assert.equal(r.code, 0, r.log);
+      assert.equal(JSON.parse(r.out).review.route_refused, null);
+      assert.doesNotMatch(r.log, /no fast hunt followed/);
+    } finally { await s.close(); }
+  }
+});
+
+test("route: a child still running at its clock names the child, not step 1, and no step 1 link", async () => {
+  const dir = routedRepo();
+  const s = await routeServer({
+    rev_step1: [{ status: "done", route_state: "continued", continued_by: "rev_child", final: false }],
+    rev_child: [{ status: "running" }],
+  });
+  try {
+    const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: "30" });
+    assert.equal(r.code, 2, r.log);
+    const j = JSON.parse(r.out);
+    assert.deepEqual([j.outcome, j.review.id, j.review.continued_from, j.live_url], ["timed_out", "rev_child", "rev_step1", null]);
+    assert.match(r.log, /review rev_child may still be running/);
+    assert.doesNotMatch(r.log, /review rev_step1 may still be running/);
   } finally { await s.close(); }
 });
