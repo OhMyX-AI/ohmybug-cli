@@ -38,8 +38,9 @@ Environment:
   OHMYBUG_URL         default https://mcp.ohmybug.ai
   OHMYBUG_TIMEOUT_S   how long to wait for each review, 30 to 86400 seconds, default 1800 (10800 with --deep). The
                       service may run a quick first step and continue it with the fast hunt: then the first step and
-                      the fast hunt each get this wait, and the service's decision between them up to 26 minutes (or
-                      this value, if longer). Give a CI job twice this value plus 30 minutes. --deep is never continued
+                      the fast hunt each get this wait, and the service's decision between them up to 27 minutes (or
+                      this value, if longer). Give a CI job three times this value, or twice it plus 30 minutes if that
+                      is longer, plus the time to clone and install. The service never continues --deep
   OHMYBUG_STORY       the --story value when the flag is not given
   OHMYBUG_FORMAT      the --format value when the flag is not given
   OHMYBUG_MODE        the --mode value when the flag is not given (not used with --deep)
@@ -71,9 +72,10 @@ export const RESULT_SCHEMA = "ohmybug-cli/result/1";
 const REVIEW_ID = /^rev_[A-Za-z0-9]{1,64}$/;
 const MAX_CHAIN = 3;
 const ROUTE_LOOK_MS = 10_000;
-// The service decides within about 25 min 20 s of step 1's end (its launch clock): the decision wait is never shorter,
-// or a short OHMYBUG_TIMEOUT_S would leave the fast hunt it starts running with nobody following it.
-export const DECISION_WAIT_S = 1560;
+// The service decides within about 1520 s of step 1's end (its launch clock): the decision wait is never shorter, or a
+// short OHMYBUG_TIMEOUT_S would leave the fast hunt it starts running with nobody following it. On top of 1520 s: the
+// loop's own stop before its deadline (READ_RESERVE_S + 1 s), one look (ROUTE_LOOK_MS), and a minute of slack.
+export const DECISION_WAIT_S = 1620;
 // Modes that read the repository: the service refuses them on a diff alone (mode_needs_repo).
 const MODES = new Set(["lite", "snap", "fast"]), REPO_MODES = new Set(["lite", "snap"]);
 

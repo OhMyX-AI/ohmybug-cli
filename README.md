@@ -47,7 +47,7 @@ The CLI prints each finding (severity, file:line, title, failure scenario) and a
 | Variable | Default | |
 |---|---|---|
 | `OHMYBUG_API_KEY` | required | your key |
-| `OHMYBUG_TIMEOUT_S` | `1800` (`10800` with `--deep`) | how long to wait for each review, 30 to 86400 seconds. The service may run a quick first step and continue it with the fast hunt: then the first step and the fast hunt each get this wait, and the service's decision between them up to 26 minutes (or this value, if longer). Give a CI job twice this value plus 30 minutes: 90 minutes at the default, which the GitLab and Bitbucket jobs below set. `--deep` is never continued |
+| `OHMYBUG_TIMEOUT_S` | `1800` (`10800` with `--deep`) | how long to wait for each review, 30 to 86400 seconds. The service may run a quick first step and continue it with the fast hunt: then the first step and the fast hunt each get this wait, and the service's decision between them up to 27 minutes (or this value, if longer). Give a CI job three times this value, or twice it plus 30 minutes if that is longer, plus the time to clone and install: the GitLab and Bitbucket jobs below allow two hours, enough at the default. The service never continues `--deep` |
 | `OHMYBUG_URL` | `https://mcp.ohmybug.ai` | the service |
 | `OHMYBUG_STORY` | `auto` | the `--story` value when the flag is not given |
 | `OHMYBUG_FORMAT` | `text` | the `--format` value when the flag is not given |

@@ -1424,8 +1424,8 @@ test("route: the wait for the service's decision has its own clock, and its time
 });
 
 test("route: the decision wait is never shorter than the service's window, whatever OHMYBUG_TIMEOUT_S says", async () => {
-  // The service's worst case is about 1520 s from step 1's end; the floor must cover it.
-  assert.ok(DECISION_WAIT_S >= 1520 && DECISION_WAIT_S <= 1800, `${DECISION_WAIT_S}`);
+  // The service's worst case is about 1520 s from step 1's end; the floor covers it and the loop's last look before it.
+  assert.ok(DECISION_WAIT_S >= 1520 + 16 + 10 && DECISION_WAIT_S <= 1800, `${DECISION_WAIT_S}`);
   const dir = routedRepo();
   const s = await routeServer({ rev_step1: [{ status: "done", route_state: "pending", final: false }, { status: "done", route_state: "pending", final: false }, { status: "done", route_state: "final", final: true }] });
   try {
@@ -1434,5 +1434,15 @@ test("route: the decision wait is never shorter than the service's window, whate
     const r = await cli(dir, [], { OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: "30" }, { decisionWaitS: 45 });
     assert.equal(r.code, 0, r.log);
     assert.match(r.log, /waiting up to 45s for the service to decide/);
+  } finally { await s.close(); }
+});
+
+test("route: with nothing injected, the decision wait is the default floor, not OHMYBUG_TIMEOUT_S", async () => {
+  const dir = routedRepo();
+  const s = await routeServer({ rev_step1: [{ status: "done", route_state: "pending", final: false }, { status: "done", route_state: "pending", final: false }, { status: "done", route_state: "final", final: true }] });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: "30" });
+    assert.equal(r.code, 0, r.log);
+    assert.match(r.log, new RegExp(`waiting up to ${DECISION_WAIT_S}s for the service to decide`));
   } finally { await s.close(); }
 });
