@@ -90,6 +90,7 @@ async function server({ huntMs = 0, findings = [], status = "done", review_of_re
           return res.end(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { isError: true, content: [{ type: "text", text: JSON.stringify(typeof fault === "object" ? fault : { error: fault, message: "blip" }) }] } }));
         }
         if (fault === "reset") return req.socket.destroy();
+        if (fault === "slow1") { res.writeHead(429, { "retry-after": "1" }); return res.end("slow down"); }
         if (fault === "slow429") { res.writeHead(429, { "retry-after": "15" }); return res.end("slow down"); }
         if (fault === "hour429") { res.writeHead(429, { "retry-after": "3600" }); return res.end("slow down"); }
         if (fault === "rpcerror") {
@@ -137,7 +138,7 @@ test("parseArgs refuses unknown flags and --base with --uncommitted", () => {
   assert.equal(typeof parseArgs(["--base"]), "string");
   assert.equal(typeof parseArgs(["--base", "x", "--uncommitted"]), "string");
   assert.deepEqual(parseArgs(["--base=dev"]), { base: "dev", uncommitted: false, deep: false, help: false, version: false });
-  assert.equal(typeof parseArgs(["--deep", "--uncommitted"]), "string");
+  assert.match(parseArgs(["--deep", "--uncommitted"]), /commit, then push and run ohmybug --deep on GitHub, or run ohmybug --deep --snapshot off github\.com/);
 });
 
 test("the base: --base, then the merge request target (remote-tracking when present), then origin/main", () => {
@@ -478,21 +479,28 @@ test("submit_review: a 429 is sent again and starts one hunt; a reset or an inte
   const { dir, git } = repo();
   writeFileSync(join(dir, "app.js"), "export const a = 14\n");
   git("commit", "-qam", "c");
-  for (const [opts, code, submits] of [
+  for (const [opts, code, submits, outcome = "maybe_started"] of [
     [{ faults: { submit_review: 429 } }, 0, 2],
     [{ faults: { submit_review: "rate_limited" } }, 0, 2],
     [{ faults: { submit_review: "garble" } }, 2, 1],
     [{ submitStatus: 502 }, 2, 1],
     [{ faults: { submit_review: "reset" } }, 2, 1],
     [{ toolError: { error: "internal", message: "late failure" } }, 2, 1],
+    [{ submitExtra: { review_id: undefined } }, 2, 1],
+    // A refusal that only quotes the sentence is not a maybe: the fate decides, not the text.
+    [{ toolError: { error: "bad_input", message: "A hunt may have started: see https://app.ohmybug.ai/me" } }, 2, 1, "not_run"],
   ]) {
     const s = await server(opts);
     try {
-      const r = await cli(dir, [], { OHMYBUG_URL: s.url });
+      const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url });
       assert.equal(r.code, code, JSON.stringify(opts) + r.log);
       assert.equal(s.calls.filter((c) => c.name === "submit_review").length, submits, JSON.stringify(opts));
-      // The server counts what it received: one hunt, however many attempts reached it.
-      if (code === 2) assert.match(r.log, /A hunt may have started/);
+      // The server counts what it received: one hunt, however many attempts reached it. The result says so too: a
+      // refusal's fate, not its text, makes the outcome (a dropped fate on any of these throws reads not_run).
+      if (code === 2) {
+        assert.match(r.log, /A hunt may have started/);
+        assert.equal(JSON.parse(r.out).outcome, outcome, JSON.stringify(opts));
+      }
     } finally { await s.close() }
   }
 });
@@ -729,6 +737,22 @@ test("a Retry-After longer than the time left stops at once, before a hunt start
     assert.match(r.log, /asks to wait 3600s.*nothing was started/);
     assert.ok(Date.now() - t < 10_000);
   } finally { await s.close() }
+  // No Retry-After: the wait is this client's own backoff, and the text does not say the service asked for it.
+  const bare = await server({ submitStatus: 429 });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: bare.url, OHMYBUG_TIMEOUT_S: "30" });
+    assert.equal(r.code, 2, r.log);
+    assert.match(r.log, /HTTP 429: the next try would be in \d+s, more than OHMYBUG_TIMEOUT_S leaves; nothing was started/);
+    assert.doesNotMatch(r.log, /asks to wait/);
+  } finally { await bare.close() }
+  // A Retry-After shorter than the backoff it lost to is not the service's ask either.
+  const short = await server({ faults: { submit_review: ["slow1", "slow1", "slow1", "slow1"] } });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: short.url, OHMYBUG_TIMEOUT_S: "30" });
+    assert.equal(r.code, 2, r.log);
+    assert.match(r.log, /the next try would be in \d+s/);
+    assert.doesNotMatch(r.log, /asks to wait/);
+  } finally { await short.close() }
 });
 
 test("a file over 512 KiB is not sent, as context or on request", async () => {
@@ -788,8 +812,10 @@ test("--deep sends the pushed commit's coordinates and no payload; refuses what 
   } finally { await s.close() }
   // An https origin; Actions' base branch; --base wins over it; the origin wins over GITHUB_REPOSITORY, which is only
   // the fallback; in Actions GITHUB_SHA stands for the push.
+  // --snapshot on a github.com repository is said to be unused.
   git("remote", "set-url", "origin", "https://github.com/acme/web");
   for (const [setup, env, argv, want] of [
+    [() => {}, {}, ["--snapshot"], `acme/web ${head} main`],
     [() => {}, { GITHUB_BASE_REF: "develop", GITHUB_SERVER_URL: "https://github.com" }, [], `acme/web ${head} develop`],
     [() => {}, { GITHUB_BASE_REF: "develop" }, ["--base", "origin/release"], `acme/web ${head} release`],
     [() => git("update-ref", "-d", "refs/remotes/origin/feature"), { GITHUB_REPOSITORY: "acme/other", GITHUB_SHA: head }, [], `acme/web ${head} main`],
@@ -801,6 +827,7 @@ test("--deep sends the pushed commit's coordinates and no payload; refuses what 
       const r = await cli(dir, ["--deep", ...argv], { OHMYBUG_URL: s.url, ...env });
       assert.equal(r.code, 0, r.log);
       assert.equal(target(s), want);
+      assert.equal(/--snapshot is not used: the service reads this repository from GitHub/.test(r.log), argv.includes("--snapshot"), r.log);
     } finally { await s.close() }
   }
   // The service turning the deep hunt down is a refusal: exit 2, its words, nothing polled.
@@ -1982,7 +2009,7 @@ test("--deep off github.com: a deep ticket that does not ask for the snapshot is
   try {
     const r = await cli(dir, ["--deep", "--snapshot"], { OHMYBUG_URL: s.url }, SNAP);
     assert.equal(r.code, 2, r.log);
-    assert.match(r.log, /the deep upload ticket did not ask for the repository snapshot; nothing was sent and nothing started\. The upload ticket \(review rev_test\) is still open/);
+    assert.match(r.log, /the deep upload ticket did not ask for the repository snapshot; nothing was uploaded and nothing started\. The upload ticket \(review rev_test\) is still open/);
     assert.deepEqual(s.uploads, []);
     assert.deepEqual(s.calls.map((c) => c.name), ["submit_review"]);
   } finally { await s.close() }
@@ -2167,7 +2194,7 @@ test("--deep --snapshot: the ticket has its own clock, so a slow ticket leaves t
 
 test("--deep --snapshot: an unclear ticket answer from the tool says a ticket, not a hunt, may be open; the fast payload's 503 is not sent again", { skip: !hasTar && "no tar" }, async () => {
   const { dir } = changed();
-  for (const fault of ["garble", "internal"]) {
+  for (const fault of ["garble", "internal", "reset"]) {
     const s = await server({ faults: { submit_review: fault }, ticket: { snapshot: "required" } });
     try {
       const r = await cli(dir, DEEP, { OHMYBUG_URL: s.url }, SNAP);
@@ -2408,6 +2435,16 @@ test("a snapshot that never lands stops on its own clock with a snapshot refusal
     assert.ok(s.uploads.length <= 3, String(s.uploads.length));
     assert.equal(JSON.parse(r.out).outcome, "not_run");
   } finally { await s.close() }
+  // A 429 with no Retry-After (or a shorter one) is the client's backoff running out, not the door's ask; a longer one is.
+  for (const [retryAfter, want] of [[undefined, /did not finish uploading on the snapshot's clock of 5s \(last: HTTP 429\)/], ["1", /did not finish uploading on the snapshot's clock of 5s \(last: HTTP 429\)/], ["3600", /the snapshot door asks to wait 3600s, more than the snapshot's clock leaves \(last: HTTP 429\)/]]) {
+    const t = await server({ faults: NEEDS_SNAPSHOT(), ticket: { snapshot: "required", repo: Array(50).fill(429), retryAfter } });
+    try {
+      const r = await cli(dir, [], { OHMYBUG_URL: t.url }, { snapshot: { waitS: 5, minTryMs: 1000 } });
+      assert.equal(r.code, 2, r.log);
+      assert.match(r.log, want, String(retryAfter));
+      assert.equal(/door asks to wait/.test(r.log), retryAfter === "3600", String(retryAfter));
+    } finally { await t.close() }
+  }
 });
 
 test("the hunt's clock is paused while the snapshot goes: a slow upload does not leave the hunt too little time", async () => {
