@@ -2073,10 +2073,10 @@ test("--deep --snapshot: a retire that hangs costs one short try and leaves the 
   } finally { await s.close() }
 });
 
-test("--deep --snapshot: a hunt that may have started is named, never retired; a 503 at capacity is sent again", { skip: !hasTar && "no tar" }, async () => {
+test("--deep --snapshot: a hunt that may have started is named, never retired, and the diff is never sent twice", { skip: !hasTar && "no tar" }, async () => {
   const { dir } = changed();
   // G7: a proxy's 502 or a reset at the payload: a hunt may run. Mutation: retire it, or call it "not started".
-  // A proxy's 503 (no JSON error) is not the service's "at capacity": not sent again. Mutation: any 503 is busy.
+  // A 502, a 503 or a reset at the diff upload: a hunt may have started, so the diff is not sent again.
   for (const payload of [[502], [503], ["reset"]]) {
     const s = await server({ ticket: { snapshot: "required", payload, del: "retired", body: payload[0] !== "reset" ? { payload: "<html>bad gateway</html>" } : undefined } });
     try {
@@ -2089,42 +2089,14 @@ test("--deep --snapshot: a hunt that may have started is named, never retired; a
       assert.equal(s.uploads.filter((u) => u.door === "payload").length, 1);
     } finally { await s.close() }
   }
-  // G6: the service's own 503 (a JSON error: at capacity, the ticket stays valid): waited out and sent again.
-  const s = await server({ findings: [high], ticket: { snapshot: "required", payload: [503], retryAfter: "1" } });
+  // Any 503, even the service's own JSON one, is sent once (one attempt at the door that starts the hunt).
+  const s = await server({ ticket: { snapshot: "required", payload: [503], retryAfter: "1", del: "retired" } });
   try {
     const r = await cli(dir, DEEP, { OHMYBUG_URL: s.url }, SNAP);
-    assert.equal(r.code, 1, r.log);
-    assert.equal(s.uploads.filter((u) => u.door === "payload").length, 2);
-    assert.equal(s.deletes.length, 0);
-    assert.equal(JSON.parse(r.out).upload_ticket, null);
-  } finally { await s.close() }
-});
-
-test("--deep --snapshot: capacity waits have their own clock; one that outlasts it retires the ticket", { skip: !hasTar && "no tar" }, async () => {
-  const { dir } = changed();
-  // The service asks for 15 s; the payload's clock of 30 s keeps 20 s for the start: stop before the wait, retire.
-  let s = await server({ ticket: { snapshot: "required", payload: [503, 503], retryAfter: "15", del: "retired" } });
-  try {
-    const r = await cli(dir, DEEP, { OHMYBUG_URL: s.url }, { snapshot: { ...SNAP.snapshot, busyS: 30 } });
     assert.equal(r.code, 2, r.log);
-    assert.match(r.log, /HTTP 503: the service asks to wait 15s, more than the deep payload's clock leaves; nothing was started\. The upload ticket \(review rev_test\) was retired/);
-    assert.deepEqual(JSON.parse(r.out).upload_ticket, { review_id: "rev_test", state: "retired" });
-  } finally { await s.close() }
-  // The payload's clock keeps minTryMs for the send, not the hunt's polling reserve: 22 s of it fit a 3 s wait.
-  // Mutation: the polling reserve (20 s) on this clock -> refused before the resend.
-  s = await server({ findings: [high], ticket: { snapshot: "required", payload: [503], retryAfter: "3" } });
-  try {
-    const r = await cli(dir, DEEP, { OHMYBUG_URL: s.url }, { snapshot: { ...SNAP.snapshot, busyS: 22 } });
-    assert.equal(r.code, 1, r.log);
-    assert.equal(s.uploads.filter((u) => u.door === "payload").length, 2);
-  } finally { await s.close() }
-  // A capacity wait does not come off the hunt's wait: with OHMYBUG_TIMEOUT_S at 30 s (POLL_ROOM 20 s) and a 12 s
-  // wait, the hunt still starts and is followed. Mutation: the payload on the hunt's clock -> refused before the resend.
-  s = await server({ findings: [high], ticket: { snapshot: "required", payload: [503], retryAfter: "12" } });
-  try {
-    const r = await cli(dir, DEEP, { OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: "30" }, { snapshot: { waitS: 60, minTryMs: 500 } });
-    assert.equal(r.code, 1, r.log);
-    assert.equal(s.uploads.filter((u) => u.door === "payload").length, 2);
+    assert.equal(s.uploads.filter((u) => u.door === "payload").length, 1);
+    assert.equal(s.deletes.length, 0);
+    assert.deepEqual(JSON.parse(r.out).upload_ticket, { review_id: "rev_test", state: "unknown" });
   } finally { await s.close() }
 });
 

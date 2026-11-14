@@ -46,7 +46,7 @@ Environment:
                       service may run a quick first step and continue it with the fast hunt: then the first step and
                       the fast hunt each get this wait, and the service's decision between them up to 27 minutes (or
                       this value, if longer). Give a CI job three times this value, or twice it plus 30 minutes if that
-                      is longer, plus 15 minutes when the run uploads a repository snapshot (50 with --deep --snapshot),
+                      is longer, plus 15 minutes when the run uploads a repository snapshot (35 with --deep --snapshot),
                       plus the time to clone and install. The service never continues --deep
   OHMYBUG_STORY       the --story value when the flag is not given
   OHMYBUG_FORMAT      the --format value when the flag is not given
@@ -81,9 +81,8 @@ const MAX_FILES = 30, MAX_EXTRA = 20, MAX_BYTES = 9 * 1024 * 1024, MAX_BODY = 11
 const MAX_TREE = 1024 * 1024;
 // A repository snapshot: 128 MiB compressed and 1 GiB unpacked at most (the service's caps), uploaded on its own clock
 // (the hunt's is paused meanwhile), no try started with under 30 s of it left. A deep run gives the pack, the ticket
-// (ticketS), the upload and the diff upload (busyS, the waits while deep hunts are at capacity) a clock each, and
-// retires a ticket it cannot use in one try of retireMs.
-const SNAPSHOT = { waitS: 900, maxBytes: 128 * 1024 * 1024, maxUnpacked: 1024 * 1024 * 1024, minTryMs: 30_000, ticketS: 120, busyS: 900, retireMs: 10_000 };
+// (ticketS) and the upload a clock each, and retires a ticket it cannot use in one try of retireMs.
+const SNAPSHOT = { waitS: 900, maxBytes: 128 * 1024 * 1024, maxUnpacked: 1024 * 1024 * 1024, minTryMs: 30_000, ticketS: 120, retireMs: 10_000 };
 // Failures before any byte reached a server: safe to send again, even a call that starts a hunt.
 const UNREACHABLE = new Set(["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH", "UND_ERR_CONNECT_TIMEOUT"]);
 // Text from the service on its way to a terminal and the result: control characters (C0, DEL, C1) dropped, capped.
@@ -713,30 +712,26 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
    * POST and return the body text, retrying network errors, 408, 429 and 5xx until the deadline; a host never reached
    * fails after four tries. With `once` (the call that starts a paid hunt) only failures that prove the server never
    * took the request are retried, and the request is not cut at 60 s (a multi-MB upload on a slow uplink takes longer)
-   * but at POLL_ROOM before the deadline, so a started hunt always gets polled (`ctx.room` sets that reserve for a call
-   * on a clock of its own). With `busy503` a 503 carrying the service's own JSON error (a deep payload refused at
-   * capacity, before anything started) is waited out and sent again. With `door` (the upload doors) a
+   * but at POLL_ROOM before the deadline, so a started hunt always gets polled. With `door` (the upload doors) a
    * refusal is read as {error, code}. A 401/403 is a refused key only on a call that sends one. Every refusal text is
    * cleaned. No redirect is followed: the body would go to wherever it points.
    */
   let reached = false;
   // `ctx` names the clock and the risk of a once call: a hunt's start by default; a deep upload ticket, or a deep payload, on its own clock.
-  async function http(url, init, { once = false, door = false, ctx = {}, busy503 = false } = {}) {
-    const { clock = "OHMYBUG_TIMEOUT_S", maybe = MAYBE_STARTED, act = "start a hunt and wait for it", second = "start a second hunt", room = POLL_ROOM } = ctx;
+  async function http(url, init, { once = false, door = false, ctx = {} } = {}) {
+    const { clock = "OHMYBUG_TIMEOUT_S", maybe = MAYBE_STARTED, act = "start a hunt and wait for it", second = "start a second hunt" } = ctx;
     for (let attempt = 0; ; attempt++) {
       const left = deadline - Date.now();
       if (left <= 0) throw new Deadline("timed out");
-      if (once && left <= room) throw new Refusal(`too little of ${clock} is left to ${act}; nothing was started`);
+      if (once && left <= POLL_ROOM) throw new Refusal(`too little of ${clock} is left to ${act}; nothing was started`);
       let why, retryAfter = 0;
       try {
-        const res = await fetch(url, { ...init, redirect: "error", signal: AbortSignal.timeout(once ? left - room : Math.min(60_000, left)) });
+        const res = await fetch(url, { ...init, redirect: "error", signal: AbortSignal.timeout(once ? left - POLL_ROOM : Math.min(60_000, left)) });
         reached = true;
         const text = await res.text();
         if (res.ok) return text;
         if ((res.status === 401 || res.status === 403) && init.headers?.authorization) throw new Refusal(`the API key was refused, or the request blocked (HTTP ${res.status} ${clean(text, 200)})`);
-        // busy503: a 503 with the service's own JSON error refused before starting anything (a proxy's 503 is not one).
-        const busy = busy503 && res.status === 503 && (() => { try { return typeof JSON.parse(text).error === "string"; } catch { return false; } })();
-        const retryable = res.status === 429 || busy || (!once && (res.status === 408 || res.status >= 500));
+        const retryable = res.status === 429 || (!once && (res.status === 408 || res.status >= 500));
         if (!retryable) {
           const said = door ? doorSaid(text) : { message: clean(text) };
           throw new Refusal(`HTTP ${res.status} ${said.message}${once && res.status >= 500 ? `. ${maybe}` : ""}`, said.code, res.status);
@@ -760,7 +755,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
       }
       const wait = Math.max(retryAfter, Math.min(30_000, 2000 * 2 ** attempt));
       // A wait the deadline cannot fit ends now, not after idling to the deadline.
-      if (wait >= deadline - Date.now() - (once ? room : 0)) {
+      if (wait >= deadline - Date.now() - (once ? POLL_ROOM : 0)) {
         if (once) throw new Refusal(`${why}: the service asks to wait ${Math.round(wait / 1000)}s, more than ${clock} leaves; nothing was started`);
         throw new Deadline("timed out");
       }
@@ -1009,8 +1004,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
       };
       const sendPayload = async () => {
         let text;
-        // A deep payload the service refuses as at capacity (a 503 with its own error) keeps its ticket: sent again.
-        try { text = await http(url.href, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ diff: a.diff, files }) }, { once: true, door: true, busy503: deep, ...(deep ? { ctx: { clock: "the deep payload's clock", act: "send the diff", room: snap.minTryMs } } : {}) }); }
+        try { text = await http(url.href, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ diff: a.diff, files }) }, { once: true, door: true }); }
         catch (err) {
           if (err instanceof Refusal && err.message.includes(MAYBE_STARTED)) throw new Refusal(`${err.message} (review ${t.review_id})`, err.code);
           throw err;
@@ -1031,10 +1025,12 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
         });
         return sendPayload();
       }
+      // The hunt's own wait is checked before the ticket: the steps below are paused, so it is decided here.
+      if (deadline - Date.now() <= POLL_ROOM) throw new Refusal("too little of OHMYBUG_TIMEOUT_S is left to start a hunt and wait for it; nothing was sent and nothing started");
       tree = await paused(snap.waitS * 1000, "packing the repository snapshot", () => packTree(root, change.rev, { ...snap, timeoutMs: deadline - Date.now() }));
       if (tree.cannot) throw new Refusal(`${tree.cannot}; nothing was sent and nothing started`);
       try {
-        t = await paused(snap.ticketS * 1000, "the deep upload ticket", () => askTicket(true, { clock: "the deep ticket's clock", maybe: TICKET_MAYBE, act: "ask for the deep upload ticket", second: "open a second deep ticket", room: snap.minTryMs }));
+        t = await paused(snap.ticketS * 1000, "the deep upload ticket", () => askTicket(true, { clock: "the deep ticket's clock", maybe: TICKET_MAYBE, act: "ask for the deep upload ticket", second: "open a second deep ticket" }));
       } catch (e) {
         if (e instanceof Refusal && e.message.includes(TICKET_MAYBE)) rec.ticket = { review_id: null, state: "unknown" };
         throw e;
@@ -1043,10 +1039,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
       try {
         readTicket();
         await paused(snap.waitS * 1000, "the repository snapshot", sendSnapshot);
-        // The hunt's own wait is checked before the call that starts it, as on every other path.
-        if (deadline - Date.now() <= POLL_ROOM) throw new Refusal("too little of OHMYBUG_TIMEOUT_S is left to start a hunt and wait for it; nothing was started");
-        // On its own clock too: waits while the service's deep hunts are at capacity never shorten the hunt's own wait.
-        return await paused(snap.busyS * 1000, "the deep payload", sendPayload);
+        return await sendPayload();
       } catch (e) {
         if (!(e instanceof Refusal)) throw e;
         const message = e.message;
