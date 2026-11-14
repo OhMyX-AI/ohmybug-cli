@@ -137,7 +137,7 @@ test("parseArgs refuses unknown flags and --base with --uncommitted", () => {
   assert.equal(typeof parseArgs(["--base"]), "string");
   assert.equal(typeof parseArgs(["--base", "x", "--uncommitted"]), "string");
   assert.deepEqual(parseArgs(["--base=dev"]), { base: "dev", uncommitted: false, deep: false, help: false, version: false });
-  assert.equal(typeof parseArgs(["--deep", "--uncommitted"]), "string");
+  assert.match(parseArgs(["--deep", "--uncommitted"]), /commit, then push and run ohmybug --deep on GitHub, or run ohmybug --deep --snapshot off github\.com/);
 });
 
 test("the base: --base, then the merge request target (remote-tracking when present), then origin/main", () => {
@@ -729,6 +729,14 @@ test("a Retry-After longer than the time left stops at once, before a hunt start
     assert.match(r.log, /asks to wait 3600s.*nothing was started/);
     assert.ok(Date.now() - t < 10_000);
   } finally { await s.close() }
+  // No Retry-After: the wait is this client's own backoff, and the text does not say the service asked for it.
+  const bare = await server({ submitStatus: 429 });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: bare.url, OHMYBUG_TIMEOUT_S: "30" });
+    assert.equal(r.code, 2, r.log);
+    assert.match(r.log, /HTTP 429: the next try would be in \d+s, more than OHMYBUG_TIMEOUT_S leaves; nothing was started/);
+    assert.doesNotMatch(r.log, /asks to wait/);
+  } finally { await bare.close() }
 });
 
 test("a file over 512 KiB is not sent, as context or on request", async () => {
@@ -788,9 +796,10 @@ test("--deep sends the pushed commit's coordinates and no payload; refuses what 
   } finally { await s.close() }
   // An https origin; Actions' base branch; --base wins over it; the origin wins over GITHUB_REPOSITORY, which is only
   // the fallback; in Actions GITHUB_SHA stands for the push.
-  git("remote", "set-url", "origin", "https://github.com/acme/web");
+  // GitHub's ssh-over-443 host in another letter case is github.com; --snapshot there is said to be unused.
   for (const [setup, env, argv, want] of [
-    [() => {}, { GITHUB_BASE_REF: "develop", GITHUB_SERVER_URL: "https://github.com" }, [], `acme/web ${head} develop`],
+    [() => git("remote", "set-url", "origin", "ssh://git@SSH.GitHub.com:443/acme/web.git"), {}, ["--snapshot"], `acme/web ${head} main`],
+    [() => git("remote", "set-url", "origin", "https://github.com/acme/web"), { GITHUB_BASE_REF: "develop", GITHUB_SERVER_URL: "https://github.com" }, [], `acme/web ${head} develop`],
     [() => {}, { GITHUB_BASE_REF: "develop" }, ["--base", "origin/release"], `acme/web ${head} release`],
     [() => git("update-ref", "-d", "refs/remotes/origin/feature"), { GITHUB_REPOSITORY: "acme/other", GITHUB_SHA: head }, [], `acme/web ${head} main`],
     [() => git("remote", "remove", "origin"), { GITHUB_REPOSITORY: "acme/other", GITHUB_SHA: head }, [], `acme/other ${head} main`],
@@ -801,6 +810,7 @@ test("--deep sends the pushed commit's coordinates and no payload; refuses what 
       const r = await cli(dir, ["--deep", ...argv], { OHMYBUG_URL: s.url, ...env });
       assert.equal(r.code, 0, r.log);
       assert.equal(target(s), want);
+      assert.equal(/--snapshot is not used: the service reads this repository from GitHub/.test(r.log), argv.includes("--snapshot"), r.log);
     } finally { await s.close() }
   }
   // The service turning the deep hunt down is a refusal: exit 2, its words, nothing polled.
@@ -1982,7 +1992,7 @@ test("--deep off github.com: a deep ticket that does not ask for the snapshot is
   try {
     const r = await cli(dir, ["--deep", "--snapshot"], { OHMYBUG_URL: s.url }, SNAP);
     assert.equal(r.code, 2, r.log);
-    assert.match(r.log, /the deep upload ticket did not ask for the repository snapshot; nothing was sent and nothing started\. The upload ticket \(review rev_test\) is still open/);
+    assert.match(r.log, /the deep upload ticket did not ask for the repository snapshot; nothing was uploaded and nothing started\. The upload ticket \(review rev_test\) is still open/);
     assert.deepEqual(s.uploads, []);
     assert.deepEqual(s.calls.map((c) => c.name), ["submit_review"]);
   } finally { await s.close() }

@@ -123,8 +123,9 @@ const readOf = (id, r, deep) => ({ id, status: r.status, route: !deep && typeof 
 // Modes that read the repository: the service refuses them on a diff alone (mode_needs_repo).
 const MODES = new Set(["lite", "snap", "fast"]), REPO_MODES = new Set(["lite", "snap"]);
 
-/** A run that cannot go on; `code` is the service's error code when the service refused. */
-export class Refusal extends Error { constructor(message, code, status) { super(message); this.code = code; this.status = status; } }
+/** A run that cannot go on; `code` is the service's error code when the service refused. `fate`: "hunt" when a hunt may
+ *  have started, "ticket" when a deep upload ticket may have been opened, null when nothing can have started. */
+export class Refusal extends Error { constructor(message, code, status, fate = null) { super(message); this.code = code; this.status = status; this.fate = fate; } }
 export class Deadline extends Error {}
 
 /** argv → options, or a string to print and exit 2 on. */
@@ -161,7 +162,7 @@ export function parseArgs(argv) {
   if (o.mode && o.deep) return "--mode picks a fast hunt's mode; --deep is its own hunt: use one of them";
   if (o.uncommitted && REPO_MODES.has(o.mode)) return `--mode ${o.mode} reads the repository, which --uncommitted cannot send: commit and push, or use --mode fast`;
   if (o.snapshot && !o.deep) return "--snapshot goes with --deep: it lets a deep hunt of a repository off github.com upload a snapshot of it";
-  if (o.uncommitted && o.deep) return "--deep reviews a commit, not the working tree: commit (and push, on GitHub) and run ohmybug --deep";
+  if (o.uncommitted && o.deep) return "--deep reviews a commit, not the working tree: commit, then push and run ohmybug --deep on GitHub, or run ohmybug --deep --snapshot off github.com";
   return o;
 }
 
@@ -617,7 +618,8 @@ export function repoTarget(env, git, base, local = false) {
   if (server && !/^https:\/\/github\.com\/?$/.test(server)) return { why: `the service reads repositories on github.com, not on ${server}`, offGithub: true };
   let url = "";
   try { url = git("remote", "get-url", "origin").trim(); } catch {}
-  let repo = url.match(/^(?:[\w.+-]+:\/\/)?(?:[^@/]+@)?github\.com[:/]([\w.-]+\/[\w.-]+?)(?:\.git)?\/?$/)?.[1] ?? "";
+  // Any case of the host, and GitHub's ssh-over-443 host (ssh://git@ssh.github.com:443/o/r). An ssh config alias is not read.
+  let repo = url.match(/^(?:[\w.+-]+:\/\/)?(?:[^@/]+@)?(?:ssh\.)?github\.com(?::443\/|[:/])([\w.-]+\/[\w.-]+?)(?:\.git)?\/?$/i)?.[1] ?? "";
   if (!repo && /^[\w.-]+\/[\w.-]+$/.test(env.GITHUB_REPOSITORY ?? "")) repo = env.GITHUB_REPOSITORY;
   if (!repo) return { why: "no GitHub repository: an origin remote on github.com, or GITHUB_REPOSITORY=owner/name", offGithub: true };
   const ref = git("rev-parse", "HEAD").trim();
@@ -724,7 +726,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
   let reached = false;
   // `ctx` names the clock and the risk of a once call: a hunt's start by default; a deep upload ticket, or a deep payload, on its own clock.
   async function http(url, init, { once = false, door = false, ctx = {} } = {}) {
-    const { clock = "OHMYBUG_TIMEOUT_S", maybe = MAYBE_STARTED, act = "start a hunt and wait for it", second = "start a second hunt" } = ctx;
+    const { clock = "OHMYBUG_TIMEOUT_S", maybe = MAYBE_STARTED, fate = "hunt", act = "start a hunt and wait for it", second = "start a second hunt" } = ctx;
     for (let attempt = 0; ; attempt++) {
       const left = deadline - Date.now();
       if (left <= 0) throw new Deadline("timed out");
@@ -739,7 +741,8 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
         const retryable = res.status === 429 || (!once && (res.status === 408 || res.status >= 500));
         if (!retryable) {
           const said = door ? doorSaid(text) : { message: clean(text) };
-          throw new Refusal(`HTTP ${res.status} ${said.message}${once && res.status >= 500 ? `. ${maybe}` : ""}`, said.code, res.status);
+          const may = once && res.status >= 500;
+          throw new Refusal(`HTTP ${res.status} ${said.message}${may ? `. ${maybe}` : ""}`, said.code, res.status, may ? fate : null);
         }
         why = `HTTP ${res.status}`;
         const after = res.headers.get("retry-after");
@@ -750,7 +753,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
         // Failures before any byte reached a server: safe to send again, even the paid call.
         const unreachable = UNREACHABLE.has(e.cause?.code);
         if (once && !unreachable) {
-          throw new Refusal(`no clear answer (${why}); not sent again, so as not to ${second}. ${maybe}`);
+          throw new Refusal(`no clear answer (${why}); not sent again, so as not to ${second}. ${maybe}`, undefined, undefined, fate);
         }
         // A host never reached is a wrong OHMYBUG_URL or a proxy-only runner, not a blip worth the whole timeout.
         if (unreachable && !reached && attempt >= 3) {
@@ -761,7 +764,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
       const wait = Math.max(retryAfter, Math.min(30_000, 2000 * 2 ** attempt));
       // A wait the deadline cannot fit ends now, not after idling to the deadline.
       if (wait >= deadline - Date.now() - (once ? POLL_ROOM : 0)) {
-        if (once) throw new Refusal(`${why}: the service asks to wait ${Math.round(wait / 1000)}s, more than ${clock} leaves; nothing was started`);
+        if (once) throw new Refusal(`${why}: ${retryAfter ? "the service asks to wait" : "the next try would be in"} ${Math.round(wait / 1000)}s, more than ${clock} leaves; nothing was started`);
         throw new Deadline("timed out");
       }
       log(`${why}; retrying in ${Math.round(wait / 1000)}s`);
@@ -852,7 +855,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
       // answer, and is not resent.
       if (!body) {
         const what = !msg ? "unreadable answer" : msg.error ? `protocol error: ${msg.error.message}` : raw.slice(0, 300) || "empty answer";
-        if (once) throw new Refusal(`${name}: ${what}; not sent again. ${ctx.maybe ?? MAYBE_STARTED}`);
+        if (once) throw new Refusal(`${name}: ${what}; not sent again. ${ctx.maybe ?? MAYBE_STARTED}`, undefined, undefined, ctx.fate ?? "hunt");
         log(`${name}: ${what}; retrying`);
         await sleep(Math.min(30_000, 2000 * 2 ** attempt));
         if (Date.now() >= deadline) throw new Deadline("timed out");
@@ -861,7 +864,8 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
       if (!msg.result?.isError) return body;
       // An internal error may come after the hunt was created: a paid call retries only a rate limit, and says so.
       if (!TRANSIENT_TOOL.has(body.error) || (once && body.error !== "rate_limited")) {
-        throw new Refusal(`${body.error ?? name}: ${body.message ?? raw.slice(0, 300)}${once && body.error === "internal" ? `. ${ctx.maybe ?? MAYBE_STARTED}` : ""}`, body.error);
+        const may = once && body.error === "internal";
+        throw new Refusal(`${body.error ?? name}: ${body.message ?? raw.slice(0, 300)}${may ? `. ${ctx.maybe ?? MAYBE_STARTED}` : ""}`, body.error, undefined, may ? ctx.fate ?? "hunt" : null);
       }
       const wait = Math.min(60_000, 5000 * 2 ** attempt);
       log(`${body.error}; retrying in ${wait / 1000}s`);
@@ -914,6 +918,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
       read = () => null;
       args = { deep: true, meta: { ...ciMeta(env, git), ...storyMeta, ...deepAt } };
       log(`deep hunt of ${args.meta.repo} at ${args.meta.ref.slice(0, 12)} against ${args.meta.base_branch}; waiting up to ${timeoutS}s`);
+      if (opts.snapshot) log("--snapshot is not used: the service reads this repository from GitHub, so nothing is uploaded");
     } else {
       change = selectChange(deepSnapshot ? { ...opts, base: deepSnapshotBase(opts, env, git) } : opts, env, git, () => snapshotTree(git, (extra, ...a) => execGit(root, a, extra).toString(), root));
       if (!change.diff.trim()) { out(`Nothing to review: no changes against ${change.base}.`); rec.noChanges = true; return 0; }
@@ -983,13 +988,13 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
         let u = null;
         try { if (typeof t.upload_url === "string") u = new URL(t.upload_url, api); } catch {}
         // The address is a capability: only its host is ever printed.
-        if (!u || u.origin !== apiUrl.origin) throw new Refusal(`the upload ticket named no usable address${u ? ` (it named another host, ${u.host})` : ""}; nothing was sent and nothing started`);
+        if (!u || u.origin !== apiUrl.origin) throw new Refusal(`the upload ticket named no usable address${u ? ` (it named another host, ${u.host})` : ""}; nothing was uploaded and nothing started`);
         url = u;
-        if (!ticketId) throw new Refusal("the upload ticket carried no review id; nothing was sent and nothing started");
+        if (!ticketId) throw new Refusal("the upload ticket carried no review id; nothing was uploaded and nothing started");
         // Only on a positive ask: a ticket that does not say "required" never gets the repository. A deep hunt reads the
         // repository, so a deep ticket without that ask is refused here rather than run on the diff alone.
         if (t.snapshot !== "required") {
-          if (deep) throw new Refusal("the deep upload ticket did not ask for the repository snapshot; nothing was sent and nothing started");
+          if (deep) throw new Refusal("the deep upload ticket did not ask for the repository snapshot; nothing was uploaded and nothing started");
           log("the upload ticket takes the diff only: the repository is not uploaded"); return false;
         }
         return true;
@@ -1011,12 +1016,12 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
         let text;
         try { text = await http(url.href, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ diff: a.diff, files }) }, { once: true, door: true }); }
         catch (err) {
-          if (err instanceof Refusal && err.message.includes(MAYBE_STARTED)) throw new Refusal(`${err.message} (review ${t.review_id})`, err.code);
+          if (err instanceof Refusal && err.fate === "hunt") throw new Refusal(`${err.message} (review ${t.review_id})`, err.code, err.status, "hunt");
           throw err;
         }
         let j = null;
         try { j = JSON.parse(text); } catch {}
-        if (j?.ok !== true) throw new Refusal(`the diff upload answered unclearly (${clean(text, 120)}). ${MAYBE_STARTED} (review ${t.review_id})`);
+        if (j?.ok !== true) throw new Refusal(`the diff upload answered unclearly (${clean(text, 120)}). ${MAYBE_STARTED} (review ${t.review_id})`, undefined, undefined, "hunt");
         const id = typeof j.review_id === "string" && REVIEW_ID.test(j.review_id) ? j.review_id : t.review_id;
         if (id !== t.review_id) log(`the same change is already being hunted as review ${id}: following it`);
         const keep = (o) => Object.fromEntries([["live_url", "string"], ["hunt_mode", "string"], ["recent_median_minutes", "number"]].filter(([k, type]) => typeof o[k] === type).map(([k]) => [k, o[k]]));
@@ -1035,9 +1040,9 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
       tree = await paused(snap.waitS * 1000, "packing the repository snapshot", () => packTree(root, change.rev, { ...snap, timeoutMs: deadline - Date.now() }));
       if (tree.cannot) throw new Refusal(`${tree.cannot}; nothing was sent and nothing started`);
       try {
-        t = await paused(snap.ticketS * 1000, "the deep upload ticket", () => askTicket(true, { clock: "the deep ticket's clock", maybe: TICKET_MAYBE, act: "ask for the deep upload ticket", second: "open a second deep ticket" }));
+        t = await paused(snap.ticketS * 1000, "the deep upload ticket", () => askTicket(true, { clock: "the deep ticket's clock", maybe: TICKET_MAYBE, fate: "ticket", act: "ask for the deep upload ticket", second: "open a second deep ticket" }));
       } catch (e) {
-        if (e instanceof Refusal && e.message.includes(TICKET_MAYBE)) rec.ticket = { review_id: null, state: "unknown" };
+        if (e instanceof Refusal && e.fate === "ticket") rec.ticket = { review_id: null, state: "unknown" };
         throw e;
       }
       // One catch for every refusal after the ticket's answer (the #3676 table): none leaves the ticket unnamed.
@@ -1049,7 +1054,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
         if (!(e instanceof Refusal)) throw e;
         const message = e.message;
         // A hunt may run: the ticket is not retired (that would not stop it), and the message already names it.
-        if (message.includes(MAYBE_STARTED)) { rec.ticket = { review_id: ticketId, state: "unknown" }; throw e; }
+        if (e.fate === "hunt") { rec.ticket = { review_id: ticketId, state: "unknown" }; throw e; }
         const state = e.status === 404 || e.status === 410 ? "gone" : url && await retire(url) ? "retired" : "open";
         rec.ticket = { review_id: ticketId, state };
         throw new Refusal(`${message}${/[.!?]$/.test(message) ? "" : "."} ${ticketSentence(state, ticketId)}`, e.code);
@@ -1070,7 +1075,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
       if (REPO_MODES.has(mode)) throw new Refusal(`${e.message}; --mode ${mode} needs the repository, so the diff was not sent alone: use --mode fast to review the diff without it`, e.code);
       sub = await submit(fallback(e.code));
     }
-    if (!sub.review_id) throw new Refusal(`submit_review answered without a review id: ${JSON.stringify(sub).slice(0, 300)}. ${MAYBE_STARTED}`);
+    if (!sub.review_id) throw new Refusal(`submit_review answered without a review id: ${JSON.stringify(sub).slice(0, 300)}. ${MAYBE_STARTED}`, undefined, undefined, "hunt");
     started = sub;
     rec.reviewId = sub.review_id;
     rec.live = liveLink(sub.live_url) ?? undefined;
@@ -1177,7 +1182,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
     log(message);
     rec.error = { code: e instanceof Refusal && typeof e.code === "string" ? e.code : null, message };
     rec.timedOut = e instanceof Deadline;
-    rec.maybeStarted = e instanceof Refusal && e.message.includes(MAYBE_STARTED);
+    rec.maybeStarted = e instanceof Refusal && e.fate === "hunt";
     if (started) log(`review ${started.review_id} may still be running${rec.live ? `: ${rec.live}` : ""}`);
     return 2;
   }
