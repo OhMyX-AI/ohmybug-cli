@@ -101,9 +101,11 @@ function doorSaid(text) {
 // Pinned diff format, whatever the user's git config says (noprefix, mnemonicPrefix, textconv drivers).
 const DIFF_FLAGS = ["--no-color", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/"];
 const TRANSIENT_TOOL = new Set(["internal", "rate_limited"]);
-// The deep payload door's own "every slot busy" 503 (#3688): sent before the ticket is taken, so nothing started. Only
-// this code says so; a 503 without it (a proxy, an older service) may have started a hunt. Never resent (#3662).
+// The deep payload door's own "every slot busy" 503 (#3688): sent before the payload uses the ticket, so nothing
+// started. Only this code on a 503 says so; a 503 without it (a proxy, an older service), or the code on any other
+// status, may have started a hunt. Never resent (#3662): the ticket is retired instead.
 const DEEP_AT_CAPACITY = "deep_at_capacity";
+const atCapacity = (status, code) => status === 503 && code === DEEP_AT_CAPACITY;
 const STORY = new Set(["auto", "private", "never"]);
 const FORMATS = new Set(["text", "markdown", "json"]);
 export const RESULT_SCHEMA = "ohmybug-cli/result/1";
@@ -720,8 +722,8 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
    * POST and return the body text, retrying network errors, 408, 429 and 5xx until the deadline; a host never reached
    * fails after four tries. With `once` (the call that starts a paid hunt) only failures that prove the server never
    * took the request are retried, and the request is not cut at 60 s (a multi-MB upload on a slow uplink takes longer)
-   * but at POLL_ROOM before the deadline, so a started hunt always gets polled. With `door` (the upload doors) a
-   * refusal is read as {error, code}. A 401/403 is a refused key only on a call that sends one. Every refusal text is
+   * but at POLL_ROOM before the deadline, so a started hunt always gets polled. With `door` (the upload doors: true,
+   * or "deep" for the deep payload door, whose capacity 503 is not a start, atCapacity) a refusal is read as {error, code}. A 401/403 is a refused key only on a call that sends one. Every refusal text is
    * cleaned. No redirect is followed: the body would go to wherever it points.
    */
   let reached = false;
@@ -742,7 +744,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
         const retryable = res.status === 429 || (!once && (res.status === 408 || res.status >= 500));
         if (!retryable) {
           const said = door ? doorSaid(text) : { message: clean(text) };
-          const started = once && res.status >= 500 && !(door === "deep" && res.status === 503 && said.code === DEEP_AT_CAPACITY);
+          const started = once && res.status >= 500 && !(door === "deep" && atCapacity(res.status, said.code));
           throw new Refusal(`HTTP ${res.status} ${said.message}${started ? `. ${maybe}` : ""}`, said.code, res.status);
         }
         why = `HTTP ${res.status}`;
@@ -1017,8 +1019,9 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
         catch (err) {
           if (err instanceof Refusal && err.message.includes(MAYBE_STARTED)) throw new Refusal(`${err.message} (review ${t.review_id})`, err.code);
           // The service's words are for a client that resends; this one does not (one attempt per door, #3662).
-          if (deep && err instanceof Refusal && err.status === 503 && err.code === DEEP_AT_CAPACITY) {
-            throw new Refusal("every deep-hunt slot is busy right now; nothing started and nothing was charged: run it again in a few minutes", err.code, err.status);
+          if (deep && err instanceof Refusal && atCapacity(err.status, err.code)) {
+            // The ticket sentence the outer catch adds says what is charged; this one says what to do.
+            throw new Refusal("every deep-hunt slot is busy right now and nothing started: run it again in a few minutes", err.code, err.status);
           }
           throw err;
         }

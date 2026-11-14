@@ -2079,6 +2079,9 @@ test("--deep --snapshot: every stop after the ticket's answer retires or names t
     // #3688: the service's own capacity 503 (its code) started nothing: retired, not "may have started", sent once.
     ["payload 503 deep_at_capacity", { snapshot: "required", payload: [503], retryAfter: "120", del: "retired",
       body: { payload: JSON.stringify({ error: "the deep hunt is at capacity right now", code: "deep_at_capacity" }) } }, RETIRED, { review_id: "rev_test", state: "retired" }, 1],
+    // #3722: the same answer whose retire fails leaves the ticket open, and still says nothing started.
+    ["payload 503 deep_at_capacity, DELETE 404", { snapshot: "required", payload: [503], retryAfter: "120",
+      body: { payload: JSON.stringify({ error: "the deep hunt is at capacity right now", code: "deep_at_capacity" }) } }, OPEN, { review_id: "rev_test", state: "open" }, 1],
     // D2: an address on another host is never called, not even to retire it.
     ["address on another host", { snapshot: "required", url: "https://elsewhere.example/u/tok" }, OPEN, { review_id: "rev_test", state: "open" }, 0],
   ];
@@ -2093,8 +2096,12 @@ test("--deep --snapshot: every stop after the ticket's answer retires or names t
       assert.doesNotMatch(r.log, /deep slot/, name);
       assert.doesNotMatch(r.log, /may have started/, name)
       if (name.includes("deep_at_capacity")) {
-        assert.match(r.log, /every deep-hunt slot is busy right now; nothing started and nothing was charged: run it again in a few minutes/)
+        assert.match(r.log, /every deep-hunt slot is busy right now and nothing started: run it again in a few minutes/)
+        assert.equal(r.log.match(/charged/g).length, 1, `${name}: one word on charging, the ticket sentence's`)
         assert.equal(s.uploads.filter((u) => u.door === "payload").length, 1, name)
+        // #3722: the code reaches the JSON; the service's words (for a client that resends) do not.
+        assert.equal(JSON.parse(r.out).error.code, "deep_at_capacity", name)
+        assert.doesNotMatch(r.log + r.out, /at capacity right now/, name)
       }
       const j = JSON.parse(r.out);
       assert.deepEqual([j.outcome, j.upload_ticket], ["not_run", state], name);
@@ -2557,4 +2564,18 @@ test("a review that uploads a snapshot leaves out of its files whatever the snap
 test("the README budget names the snapshot's 15 minutes", () => {
   const readme = readFileSync(fileURLToPath(new URL("../README.md", import.meta.url)), "utf8");
   assert.match(readme, /plus 15 minutes when the run uploads a repository snapshot/);
+});
+
+test("--deep --snapshot: the capacity code on a status other than 503 may have started a hunt (#3722)", { skip: !hasTar && "no tar" }, async () => {
+  const { dir } = changed();
+  const s = await server({ findings: [high], ticket: { snapshot: "required", payload: [502], del: "retired",
+    body: { payload: JSON.stringify({ error: "bad gateway", code: "deep_at_capacity" }) } } });
+  try {
+    const r = await cli(dir, DEEP, { OHMYBUG_URL: s.url }, SNAP);
+    assert.equal(r.code, 2, r.log);
+    assert.equal(JSON.parse(r.out).outcome, "maybe_started");
+    assert.match(r.log, /may have started/);
+    assert.equal(s.deletes.length, 0, "a hunt may run: the ticket is not retired");
+    assert.equal(s.uploads.filter((u) => u.door === "payload").length, 1);
+  } finally { await s.close() }
 });
