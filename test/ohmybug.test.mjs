@@ -93,7 +93,7 @@ async function server({ huntMs = 0, findings = [], status = "done", review_of_re
       const ask = name === "wait_review" && requested ? [requested, requestedAgain][asks] : undefined;
       if (ask) asks++;
       const result = toolError ? toolError
-        : name === "submit_review" && args.upload ? { ...(ticket?.noId ? {} : { review_id: "rev_test" }), status: "awaiting_upload", ...(ticket?.live ? { live_url: ticket.live } : {}), ...(ticket?.received ? { snapshot_received: true } : {}), ...(ticket?.url === null ? {} : { upload_url: ticket?.url ?? `${url}/u/tok-secret${ticket?.slash ? "/" : ""}` }), ...(ticket?.snapshot ? { snapshot: ticket.snapshot } : {}) }
+        : name === "submit_review" && args.upload ? { ...(ticket?.noId ? {} : { review_id: "rev_test" }), status: "awaiting_upload", ...(ticket?.live ? { live_url: ticket.live } : {}), ...(ticket?.url === null ? {} : { upload_url: ticket?.url ?? `${url}/u/tok-secret${ticket?.slash ? "/" : ""}` }), ...(ticket?.snapshot ? { snapshot: ticket.snapshot } : {}) }
         : name === "submit_review" ? { review_id: "rev_test", status: "running", ...submitExtra }
         : ask ? { review_id: "rev_test", status: "needs_files", requested_files: ask, files_url: filesUrl ?? `${url}/files` }
         : name === "wait_review" ? { review_id: "rev_test", status: Date.now() - (huntFrom ??= Date.now()) < huntMs ? "running" : status }
@@ -1802,7 +1802,10 @@ test("packTree: the stored blobs, raw: no filter, export rule or eol rule runs; 
   const secret = [".env", ".env.example", "web/.env.local", "up/.ENV.Prod", "src/secrets.ts", "a/Credentials.json", "certs/server.pem", "certs2/Server.PEM",
     "c.p12", "d.PFX", "tls.key", "k.ppk", "a.jks", "b.keystore", "deploy/id_ed25519", "id_rsa", "id_rsa.pub", "k/ID_DSA", "k2/id_ecdsa", "k3/id_ed25519_sk",
     "infra/prod.tfstate", "infra/prod.tfstate.backup", "vars.tfvars.json", ".npmrc", "sub/.netrc", ".pgpass", ".pypirc", ".git-credentials", "kubeconfig",
-    ".kube/config", ".docker/config.json", ".ssh/known_hosts", ".aws/config", ".gnupg/pubring.kbx"];
+    ".kube/config", ".docker/config.json", ".ssh/known_hosts", ".aws/config", ".gnupg/pubring.kbx",
+    // Every alternative as a folder too: whatever is inside it stays out.
+    "secrets/db.yml", "prod-credentials/x.js", ".env.d/x", "id_rsa.d/x", "certs.pem/x", "keys.key/x", "store.jks/x", "x.tfstate.d/y", "y.tfvars.d/z",
+    "n/.npmrc/x", "kc/kubeconfig/x", "deep/.SSH/x"];
   const kept = ["web/envelope.js", "keys.md", "key.js", "docs/kube.md", "tfstate.md", "menv/x.js", "ssh.md"];
   for (const p of [...secret, ...kept]) { mkdirSync(join(dir, p, ".."), { recursive: true }); writeFileSync(join(dir, p), "x\n"); }
   writeFileSync(join(dir, "crypted.bin"), "ciphertext\n");
@@ -1874,17 +1877,6 @@ test("snapshot_required: a ticket, the stored tree as gzip, then the same diff a
   } finally { await s.close() }
 });
 
-test("a ticket that already holds the snapshot (snapshot_received) is not sent it again; the diff still goes", async () => {
-  const { dir } = changed();
-  const s = await server({ faults: NEEDS_SNAPSHOT(), ticket: { snapshot: "required", received: true } });
-  try {
-    const r = await cli(dir, [], { OHMYBUG_URL: s.url }, SNAP);
-    assert.equal(r.code, 0, r.log);
-    assert.deepEqual(s.uploads.map((u) => u.door), ["payload"]);
-    assert.match(r.log, /already holds this run's snapshot: not sent again/);
-  } finally { await s.close() }
-});
-
 test("an upload address ending in / still takes the snapshot at <address>/repo and the diff at the address", async () => {
   const { dir } = changed();
   const s = await server({ faults: NEEDS_SNAPSHOT(), ticket: { snapshot: "required", slash: true } });
@@ -1916,13 +1908,14 @@ test("packTree: a git call that stalls (a blobless clone fetching blobs) ends wi
 
 test("fileReader never reads a secret-named file of the tree, in any case", () => {
   const { dir, git } = repo();
-  for (const p of [".env", "Prod.PEM", "conf.js"]) writeFileSync(join(dir, p), "x\n");
+  const out = [".env", ".env.example", "Prod.PEM", "src/Secrets.ts", "a/credentials.json", ".npmrc", "infra/x.tfstate", "id_rsa.pub", ".aws/config", "secrets/db.yml"];
+  const kept = ["conf.js", "docs/kube.md"];
+  for (const p of [...out, ...kept]) { mkdirSync(join(dir, p, ".."), { recursive: true }); writeFileSync(join(dir, p), "x\n"); }
   git("add", ".");
   git("commit", "-qm", "secrets");
-  const read = fileReader({ all: [".env", "Prod.PEM", "conf.js"], rev: git("rev-parse", "HEAD").trim() }, (...a) => execFileSync("git", ["-C", dir, ...a]));
-  assert.equal(read(".env"), null);
-  assert.equal(read("Prod.PEM"), null);
-  assert.equal(read("conf.js"), "x\n");
+  const read = fileReader({ all: [...out, ...kept], rev: git("rev-parse", "HEAD").trim() }, (...a) => execFileSync("git", ["-C", dir, ...a]));
+  for (const p of out) assert.equal(read(p), null, p);
+  for (const p of kept) assert.equal(read(p), "x\n", p);
 });
 
 test("--uncommitted: the snapshot is the working tree with untracked files, never ignored ones, and the index is untouched", { skip: !hasTar && "no tar" }, async () => {

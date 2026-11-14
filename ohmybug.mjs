@@ -282,7 +282,7 @@ const SECRET_FILE = /(^|\/)(\.env[^/]*|[^/]*(secret|credential)[^/]*|id_(rsa|dsa
 /**
  * The reviewed tree as a tar.gz of the blobs git stores: read raw with `cat-file --batch`, so no checkout filter runs
  * (an encrypted file stays encrypted, an LFS pointer stays a pointer) and no export-ignore, export-subst or eol rule
- * applies. A symlink goes as a regular file holding its target's name; a submodule and a secret-named file are left out. Returns { tgz, files,
+ * applies. A symlink goes as a regular file holding its target's name; a submodule, and a file named like a secret or inside a folder named like one, are left out. Returns { tgz, files,
  * gitlinks, secrets } or { cannot } (a reason, not thrown: it matters only when the service asks for the snapshot).
  * shortcut: a symlink is not a link entry, so an import through a symlinked directory does not resolve on the
  * service; send typeflag 2 if the service asks for it.
@@ -344,7 +344,7 @@ export async function packTree(root, rev, { maxBytes, maxUnpacked, timeoutMs }) 
 
 /**
  * path → text or null, from the reviewed tree. Only a path in it is read, so a request cannot reach an ignored file,
- * .git, or anything outside the repository, and a secret-named file is never read; a symlink reads as its target's name. Missing, binary, LFS pointers and
+ * .git, or anything outside the repository, and a file named like a secret or inside a folder named like one is never read; a symlink reads as its target's name. Missing, binary, LFS pointers and
  * files over MAX_FILE read as null.
  */
 export function fileReader(change, gitBuf) {
@@ -893,13 +893,11 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
         if (typeof t.review_id !== "string" || !REVIEW_ID.test(t.review_id)) throw new Refusal("the upload ticket carried no review id; nothing was sent and nothing started");
         // Only on a positive ask: a ticket that does not say "required" never gets the repository.
         if (t.snapshot !== "required") { log("the upload ticket takes the diff only: the repository is not uploaded"); return; }
-        // The ticket handed back with its snapshot already stored: never packed and sent twice.
-        if (t.snapshot_received === true) { log("the upload ticket already holds this run's snapshot: not sent again"); return; }
         if (env.OHMYBUG_SNAPSHOT === "off") throw new Refusal("the service asks for a snapshot of the repository, and OHMYBUG_SNAPSHOT=off keeps it on this machine; no snapshot was sent, nothing started, and the upload ticket expires unused (diff-only reviews are chosen in the hunting policy: https://app.ohmybug.ai/me/policy)");
         // Packed on the snapshot's clock, and only when the ticket wants it.
         const tree = await packTree(root, change.rev, { ...snap, timeoutMs: deadline - Date.now() });
         if (tree.cannot) throw new Refusal(`${tree.cannot}; no snapshot was sent, nothing started, and the upload ticket expires unused`);
-        log(`uploading the repository snapshot (${tree.files} file(s), ${Math.ceil(tree.tgz.length / 1024)} KiB${tree.gitlinks ? `; ${tree.gitlinks} submodule(s) left out` : ""}${tree.secrets ? `; ${tree.secrets} secret-named file(s) such as .env or *.pem left out` : ""})`);
+        log(`uploading the repository snapshot (${tree.files} file(s), ${Math.ceil(tree.tgz.length / 1024)} KiB${tree.gitlinks ? `; ${tree.gitlinks} submodule(s) left out` : ""}${tree.secrets ? `; ${tree.secrets} file(s) named like secrets, or in folders named like them, left out` : ""})`);
         const door = new URL(url);
         door.pathname = `${door.pathname.replace(/\/$/, "")}/repo`;
         await uploadSnapshot(door.href, tree.tgz);
