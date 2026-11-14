@@ -705,14 +705,16 @@ test("--deep sends the pushed commit's coordinates and no payload; refuses what 
   git("commit", "-qam", "c");
   const head = git("rev-parse", "HEAD").trim();
   const target = (s) => { const m = s.calls.find((c) => c.name === "submit_review")?.args.meta; return m && [m.repo, m.ref, m.base_branch].join(" ") };
-  // Refused before any call: no GitHub repository, a remote that only mentions github.com, an unpushed HEAD,
-  // GitHub Enterprise, a base that is not a branch name.
+  // Refused before any call: off github.com (no GitHub repository, a remote that only mentions github.com) with the
+  // snapshot kept here (the snapshot path itself is tested below), an unpushed HEAD, GitHub Enterprise kept here too,
+  // a base that is not a branch name.
+  const kept = { OHMYBUG_SNAPSHOT: "off" }, keptWhy = /not on github\.com uploads a snapshot of it, and OHMYBUG_SNAPSHOT=off keeps the repository on this machine; nothing was sent/;
   for (const [setup, env, argv, why] of [
-    [() => {}, {}, [], /--deep cannot run: no GitHub repository/],
-    [() => git("remote", "add", "origin", "https://git.example.com/github.com/acme/app.git"), {}, [], /--deep cannot run: no GitHub repository/],
+    [() => {}, kept, [], keptWhy],
+    [() => git("remote", "add", "origin", "https://git.example.com/github.com/acme/app.git"), kept, [], keptWhy],
     [() => git("remote", "set-url", "origin", "git@github.com:acme/app.git"), {}, [], /push it first/],
     [() => git("update-ref", "refs/remotes/fork/feature", "HEAD"), { GITHUB_SHA: "0".repeat(40) }, [], /push it first/],
-    [() => git("update-ref", "refs/remotes/origin/feature", "HEAD"), { GITHUB_SERVER_URL: "https://ghe.example.com" }, [], /not on https:\/\/ghe/],
+    [() => git("update-ref", "refs/remotes/origin/feature", "HEAD"), { GITHUB_SERVER_URL: "https://ghe.example.com", ...kept }, [], keptWhy],
     [() => {}, {}, ["--base", head.slice(0, 12)], /is not a branch name/],
     [() => {}, {}, ["--base", "HEAD~1"], /is not a branch name/],
   ]) {
@@ -1897,6 +1899,44 @@ test("snapshot_required: a ticket, the stored tree as gzip, then the same diff a
     assert.equal(j.review.id, "rev_test");
     assert.match(r.log, /started in fast mode/);
     assert.match(r.log, /live progress: https:\/\/example\.test\/live\/up/);
+  } finally { await s.close() }
+});
+
+test("--deep off github.com: a deep upload ticket with no repo or ref, the stored HEAD tree as gzip, then the diff and files; nothing else first", { skip: !hasTar && "no tar" }, async () => {
+  const { dir } = changed();
+  const s = await server({ findings: [high], ticket: { snapshot: "required" } });
+  try {
+    const r = await cli(dir, ["--deep", "--format", "json"], { OHMYBUG_URL: s.url }, SNAP);
+    assert.equal(r.code, 1, r.log);
+    const subs = s.calls.filter((c) => c.name === "submit_review");
+    // One submit, the ticket: deep and upload, no payload, no mode, and meta without the commit key the GitHub path takes.
+    assert.equal(subs.length, 1);
+    assert.equal(subs[0].args.deep, true);
+    assert.equal(subs[0].args.upload, true);
+    assert.equal(subs[0].args.diff, undefined);
+    assert.equal(subs[0].args.mode, undefined);
+    assert.equal(subs[0].args.meta.repo, undefined);
+    assert.equal(subs[0].args.meta.ref, undefined);
+    assert.equal(subs[0].args.meta.branch, "feature");
+    assert.deepEqual(s.uploads.map((u) => [u.door, u.type]), [["repo", "application/gzip"], ["payload", "application/json"]]);
+    assert.equal(readFileSync(join(untar(s.uploads[0].body), "app.js"), "utf8"), "export const a = 2\n");
+    const body = JSON.parse(s.uploads[1].body);
+    assert.deepEqual(Object.keys(body).sort(), ["diff", "files"]);
+    assert.match(body.diff, /export const a = 2/);
+    assert.ok(body.files.some((f) => f.path === ".review-client/tree.txt"));
+    assert.equal(JSON.parse(r.out).review.deep, true);
+    assert.match(r.log, /deep hunt over a snapshot of this repository \(it is not on github\.com\)/);
+  } finally { await s.close() }
+});
+
+test("--deep off github.com: a deep ticket that does not ask for the snapshot is refused; the diff is never sent alone", async () => {
+  const { dir } = changed();
+  const s = await server({ findings: [high], ticket: {} });
+  try {
+    const r = await cli(dir, ["--deep"], { OHMYBUG_URL: s.url }, SNAP);
+    assert.equal(r.code, 2, r.log);
+    assert.match(r.log, /the deep upload ticket did not ask for the repository snapshot; nothing was sent and nothing started/);
+    assert.deepEqual(s.uploads, []);
   } finally { await s.close() }
 });
 

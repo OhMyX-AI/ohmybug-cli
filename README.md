@@ -31,7 +31,7 @@ ohmybug                  # review <base>...HEAD: the commits of this branch
 ohmybug --base develop   # the same against another base
 ohmybug --uncommitted    # review the working tree against HEAD, untracked files included (not ignored ones)
 ohmybug --mode lite      # a lite hunt of the pushed HEAD (see Hunt modes)
-ohmybug --deep           # the deep hunt of the pushed HEAD (GitHub, public or with the OhMyBug App): the service reads the whole repository; up to 2 hours
+ohmybug --deep           # the deep hunt of HEAD: on GitHub (public or with the OhMyBug App) the service reads the pushed commit; elsewhere a snapshot is uploaded; up to 2 hours
 ```
 
 The base is `--base`, else `$CI_MERGE_REQUEST_TARGET_BRANCH_NAME` (GitLab merge request pipelines), else `origin/main`. The CI clone must contain the base: fetch it, or clone with enough depth.
@@ -144,7 +144,7 @@ pipelines:
 
 ## What is sent
 
-With `--deep`, no code is sent: only the GitHub repository name (from the origin remote, else `$GITHUB_REPOSITORY`), the HEAD commit, the base branch and the branch name; the service reads the repository from GitHub (public, or with the OhMyBug App installed).
+With `--deep` on a GitHub repository, no code is sent: only the GitHub repository name (from the origin remote, else `$GITHUB_REPOSITORY`), the HEAD commit, the base branch and the branch name; the service reads the repository from GitHub (public, or with the OhMyBug App installed); a HEAD that is not pushed there is refused. With `--deep` on a repository that is not on github.com (no github.com origin and no `$GITHUB_REPOSITORY`, or `$GITHUB_SERVER_URL` names another host: GitLab, Bitbucket, a local repository), the deep hunt runs over a snapshot: the run asks for a deep upload ticket, uploads a snapshot of the HEAD commit exactly as described below for the fast hunt's snapshot (files named like secrets left out), then sends the diff against the base and up to 29 related files, less those the snapshot leaves out. The repository name and the commit are not sent. `OHMYBUG_SNAPSHOT=off` stops such a run before anything is sent.
 
 Without `--deep` and `--uncommitted`, when HEAD is pushed to a github.com repository (the origin remote, else `$GITHUB_REPOSITORY`) and the base is an origin branch at the same commit as here, the diff is left out: the repository name, the HEAD commit and the base branch go instead, and the service reads the change from GitHub and runs its full fast hunt. If the service does not take the change from GitHub (it cannot read the repository: a private one without the OhMyBug App installed, or one off the key's repository list; or the compare fails, is empty or is too large), the run says so and sends the same review again with the diff, without the rest of the repository unless the service then asks for it (below); with `--mode lite` or `snap` it stops there instead, since those modes need the repository. Otherwise the diff is sent, and the run says why.
 
