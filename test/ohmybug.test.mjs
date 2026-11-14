@@ -1937,6 +1937,54 @@ test("--deep off github.com: a deep ticket that does not ask for the snapshot is
     assert.equal(r.code, 2, r.log);
     assert.match(r.log, /the deep upload ticket did not ask for the repository snapshot; nothing was sent and nothing started/);
     assert.deepEqual(s.uploads, []);
+    assert.deepEqual(s.calls.map((c) => c.name), ["submit_review"]);
+  } finally { await s.close() }
+});
+
+test("--deep off github.com: the base is --base, else $GITHUB_BASE_REF (origin/<it>), else the fast rule", async () => {
+  const { dir, git } = changed();
+  git("update-ref", "refs/remotes/origin/develop", "HEAD");
+  git("branch", "-q", "local-base", "HEAD");
+  for (const [argv, env, base] of [[[], { GITHUB_BASE_REF: "develop" }, "origin/develop"], [["--base", "local-base"], { GITHUB_BASE_REF: "nope" }, "local-base"]]) {
+    const s = await server({ ticket: { snapshot: "required" } });
+    try {
+      // Both bases are HEAD: nothing to review, and nothing is asked of the service.
+      const r = await cli(dir, ["--deep", ...argv], { OHMYBUG_URL: s.url, ...env }, SNAP);
+      assert.equal(r.code, 0, r.log);
+      assert.match(r.out, new RegExp(`Nothing to review: no changes against ${base}\\.`));
+      assert.equal(s.calls.length, 0);
+    } finally { await s.close() }
+  }
+});
+
+test("--deep on GitHub Enterprise (GITHUB_SERVER_URL another host) takes the snapshot path", { skip: !hasTar && "no tar" }, async () => {
+  const { dir } = changed();
+  const s = await server({ findings: [high], ticket: { snapshot: "required" } });
+  try {
+    const r = await cli(dir, ["--deep"], { OHMYBUG_URL: s.url, GITHUB_SERVER_URL: "https://ghe.example.com" }, SNAP);
+    assert.equal(r.code, 1, r.log);
+    const sub = s.calls.find((c) => c.name === "submit_review");
+    assert.deepEqual([sub.args.deep, sub.args.upload, sub.args.meta.repo], [true, true, undefined]);
+    assert.deepEqual(s.uploads.map((u) => u.door), ["repo", "payload"]);
+  } finally { await s.close() }
+});
+
+test("--deep off github.com: the tree is packed before the ticket (a failed pack asks nothing), and the ticket is asked once", async () => {
+  const { dir } = changed();
+  let s = await server({ ticket: { snapshot: "required" } });
+  try {
+    const r = await cli(dir, ["--deep"], { OHMYBUG_URL: s.url }, { snapshot: { waitS: 60, minTryMs: 500, maxBytes: 10 } });
+    assert.equal(r.code, 2, r.log);
+    assert.match(r.log, /compressed.*nothing was sent and nothing started/);
+    assert.equal(s.calls.length, 0);
+  } finally { await s.close() }
+  // A deep ticket holds a slot from its mint: an unclear answer is not resent. Mutation: ask it with retries -> 2 calls.
+  s = await server({ faults: { submit_review: 503 }, ticket: { snapshot: "required" } });
+  try {
+    const r = await cli(dir, ["--deep"], { OHMYBUG_URL: s.url }, SNAP);
+    assert.notEqual(r.code, 0, r.log);
+    assert.equal(s.calls.filter((c) => c.name === "submit_review").length, 1);
+    assert.deepEqual(s.uploads, []);
   } finally { await s.close() }
 });
 

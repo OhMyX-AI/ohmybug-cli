@@ -36,7 +36,8 @@ hunt; otherwise, or when the service does not take it from GitHub, the diff is s
 service then asks for the repository (snapshot_required), the reviewed tree goes too, as git stores it (see the README).
 
 The base is --base, else $CI_MERGE_REQUEST_TARGET_BRANCH_NAME (GitLab merge request pipelines),
-else origin/main. With --deep it is a branch name: --base, else $GITHUB_BASE_REF, else main.
+else origin/main. With --deep on GitHub it is a branch name: --base, else $GITHUB_BASE_REF, else main; off
+github.com it is --base, else $GITHUB_BASE_REF (origin/<it> when present), else the rule above.
 
 Environment:
   OHMYBUG_API_KEY     required: a key from https://app.ohmybug.ai/me
@@ -142,7 +143,7 @@ export function parseArgs(argv) {
   if (o.uncommitted && o.base) return "--uncommitted and --base do not go together";
   if (o.mode && o.deep) return "--mode picks a fast hunt's mode; --deep is its own hunt: use one of them";
   if (o.uncommitted && REPO_MODES.has(o.mode)) return `--mode ${o.mode} reads the repository, which --uncommitted cannot send: commit and push, or use --mode fast`;
-  if (o.uncommitted && o.deep) return "--deep reviews a pushed commit, not the working tree: commit, push and run ohmybug --deep";
+  if (o.uncommitted && o.deep) return "--deep reviews a commit, not the working tree: commit (and push, on GitHub) and run ohmybug --deep";
   return o;
 }
 
@@ -615,6 +616,16 @@ export function repoTarget(env, git, base, local = false) {
   return { repo, ref, base_branch: branch };
 }
 
+/** The base of a deep hunt off github.com, as a ref of this clone: --base, else $GITHUB_BASE_REF (the remote-tracking
+ *  ref when the clone has it), else undefined, which leaves resolveBase's rule (the merge request's target, else
+ *  origin/main). */
+export function deepSnapshotBase(opts, env, git) {
+  if (opts.base) return opts.base;
+  const b = env.GITHUB_BASE_REF;
+  if (!b) return undefined;
+  try { git("rev-parse", "--verify", "--quiet", `origin/${b}^{commit}`); return `origin/${b}`; } catch { return b; }
+}
+
 /** The deep hunt's target: repoTarget with the base --base, else $GITHUB_BASE_REF, else main. A repository off
  *  github.com is `{ offGithub: true }`: its deep hunt runs over a snapshot this machine uploads. Any other gap (a GitHub
  *  repository whose HEAD is not pushed, a base that is not a branch) is a refusal. */
@@ -868,7 +879,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
       log(`deep hunt of ${args.meta.repo} at ${args.meta.ref.slice(0, 12)} against ${args.meta.base_branch}; waiting up to ${timeoutS}s`);
       if (timeoutS < 7200) log("a deep hunt takes up to 2 hours: OHMYBUG_TIMEOUT_S under 7200 may end the wait before the result");
     } else {
-      change = selectChange(opts, env, git, () => snapshotTree(git, (extra, ...a) => execGit(root, a, extra).toString(), root));
+      change = selectChange(deepSnapshot ? { ...opts, base: deepSnapshotBase(opts, env, git) } : opts, env, git, () => snapshotTree(git, (extra, ...a) => execGit(root, a, extra).toString(), root));
       if (!change.diff.trim()) { out(`Nothing to review: no changes against ${change.base}.`); rec.noChanges = true; return 0; }
       read = fileReader(change, gitBuf);
       // The reviewers can ask for any file by path; without the list they cannot name a caller to ask for.
@@ -895,7 +906,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
       // With the repository the service runs the full fast hunt; with the diff alone, a review without it.
       const target = opts.uncommitted ? { why: "--uncommitted reviews the working tree, which only this machine has" } : repoTarget(env, git, change.base, true);
       if (deepSnapshot) {
-        log(`deep hunt over a snapshot of this repository (it is not on github.com): the reviewed commit and the diff are uploaded; waiting up to ${timeoutS}s`);
+        log(`deep hunt over a snapshot of this repository (it is not on github.com): the reviewed commit and the diff against ${change.base} are uploaded; waiting up to ${timeoutS}s`);
         if (timeoutS < 7200) log("a deep hunt takes up to 2 hours: OHMYBUG_TIMEOUT_S under 7200 may end the wait before the result");
         args = payload();
       } else if (target.why) {
@@ -917,13 +928,20 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
      * of the stored blobs, then the same diff and files (less those the snapshot leaves out). The refusal started nothing; the ticket and the snapshot run on
      * their own clock while the hunt's is paused. The diff upload starts the hunt and is sent once; its answer names
      * the review (another one when the same payload is already being hunted).
+     * With `deep` (a deep hunt off github.com) there is no refusal first: the tree is packed BEFORE the ticket, since a
+     * deep ticket holds a deep slot from its mint, and the ticket is asked once (a resend could mint a second); a deep
+     * ticket that does not ask for the snapshot is refused, never run on the diff alone.
      */
     const submitByUpload = async (a, deep = false) => {
       if (!deep) log("the service asks for the repository with this diff (snapshot_required): sending the review again by upload");
-      let t, url = null, files = a.files ?? [];
+      let t, url = null, files = a.files ?? [], tree = null;
       await paused(snap.waitS * 1000, "the upload ticket and the repository snapshot", async () => {
+        if (deep) {
+          tree = await packTree(root, change.rev, { ...snap, timeoutMs: deadline - Date.now() });
+          if (tree.cannot) throw new Refusal(`${tree.cannot}; nothing was sent and nothing started`);
+        }
         // A deep ticket carries no repo or ref: with them the service takes the GitHub path (#2010's contract).
-        t = await tool("submit_review", { upload: true, ...(a.meta ? { meta: a.meta } : {}), ...(deep ? { deep: true } : modeArg) });
+        t = await tool("submit_review", { upload: true, ...(a.meta ? { meta: a.meta } : {}), ...(deep ? { deep: true } : modeArg) }, deep);
         try { if (typeof t.upload_url === "string") url = new URL(t.upload_url, api); } catch {}
         // The address is a capability: only its host is ever printed.
         if (!url || url.origin !== apiUrl.origin) throw new Refusal(`the upload ticket named no usable address${url ? ` (it named another host, ${url.host})` : ""}; nothing was sent and nothing started`);
@@ -935,8 +953,8 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
           log("the upload ticket takes the diff only: the repository is not uploaded"); return;
         }
         if (env.OHMYBUG_SNAPSHOT === "off") throw new Refusal("the service asks for a snapshot of the repository, and OHMYBUG_SNAPSHOT=off keeps it on this machine; no snapshot was sent, nothing started, and the upload ticket expires unused (diff-only reviews are chosen in the hunting policy: https://app.ohmybug.ai/me/policy)");
-        // Packed on the snapshot's clock, and only when the ticket wants it.
-        const tree = await packTree(root, change.rev, { ...snap, timeoutMs: deadline - Date.now() });
+        // Packed on the snapshot's clock, and only when the ticket wants it (a deep run packed it before the ticket).
+        if (!tree) tree = await packTree(root, change.rev, { ...snap, timeoutMs: deadline - Date.now() });
         if (tree.cannot) throw new Refusal(`${tree.cannot}; no snapshot was sent, nothing started, and the upload ticket expires unused`);
         log(`uploading the repository snapshot (${tree.files} file(s), ${Math.ceil(tree.tgz.length / 1024)} KiB${tree.gitlinks ? `; ${tree.gitlinks} submodule(s) left out` : ""}${tree.secrets ? `; ${tree.secrets} file(s) named like secrets, or in folders named like them, left out` : ""})`);
         // From here the review holds a snapshot: the files beside it, sent now or on request, leave out what it leaves out.
