@@ -278,9 +278,9 @@ function byteReader(stream) {
 // .git-credentials, kubeconfig, .kube, .docker, .ssh, .aws, .gnupg): a file or folder of that name at any depth, in any
 // case, stays out of a snapshot, whatever its content. With a snapshot, the files sent beside it follow it too.
 const SNAPSHOT_SECRET = /(^|\/)(\.env[^/]*|[^/]*(secret|credential)[^/]*|id_(rsa|dsa|ecdsa|ed25519)[^/]*|[^/]*\.(pem|key|p12|pfx|ppk|jks|keystore)|[^/]*\.(tfstate|tfvars)[^/]*|\.(npmrc|netrc|pgpass|pypirc|git-credentials|kube|docker|ssh|aws|gnupg)|kubeconfig)(\/|$)/i;
-// Files named like secrets, never sent as files on a diff-only review (narrower, so a review keeps .env.example, public
-// keys and code named like secrets.ts as context).
-const SECRET_FILE = /(^|\/)(id_(rsa|dsa|ecdsa|ed25519)|[^/]+\.(pem|p12|pfx|key)|\.env(\.(?!example$|sample$|template$|dist$)[^/]+)?)$/i;
+// Files never sent as files on a review without a snapshot: the list above minus what a review needs as context, code
+// named like secrets.ts or credentials.json, .env.example (.sample, .template, .dist) and public keys (*.pub).
+const SECRET_FILE = /(^|\/)(\.env(?!\.(example|sample|template|dist)(\/|$))[^/]*|id_(rsa|dsa|ecdsa|ed25519)(?![^/]*\.pub(\/|$))[^/]*|[^/]*\.(pem|key|p12|pfx|ppk|jks|keystore)|[^/]*\.(tfstate|tfvars)[^/]*|\.(npmrc|netrc|pgpass|pypirc|git-credentials|kube|docker|ssh|aws|gnupg)|kubeconfig)(\/|$)/i;
 
 /**
  * The reviewed tree as a tar.gz of the blobs git stores: read raw with `cat-file --batch`, so no checkout filter runs
@@ -347,14 +347,14 @@ export async function packTree(root, rev, { maxBytes, maxUnpacked, timeoutMs }) 
 
 /**
  * path → text or null, from the reviewed tree. Only a path in it is read, so a request cannot reach an ignored file,
- * .git, or anything outside the repository, and a file named like a secret or inside a folder named like one is never read; a symlink reads as its target's name. Missing, binary, LFS pointers and
+ * .git, or anything outside the repository, and a path `deny` names (SECRET_FILE, or SNAPSHOT_SECRET beside a snapshot) is never read; a symlink reads as its target's name. Missing, binary, LFS pointers and
  * files over MAX_FILE read as null.
  */
-export function fileReader(change, gitBuf) {
+export function fileReader(change, gitBuf, deny = SECRET_FILE) {
   const known = new Set(change.all);
   return (requested) => {
     const path = String(requested).replace(/^\/+/, "");
-    if (!known.has(path) || SECRET_FILE.test(path)) return null;
+    if (!known.has(path) || deny.test(path)) return null;
     try {
       if (Number(gitBuf("cat-file", "-s", `${change.rev}:${path}`).toString()) > MAX_FILE) return null;
       const buf = gitBuf("cat-file", "blob", `${change.rev}:${path}`);
@@ -881,7 +881,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
     /**
      * A diff sent alone that the service refuses with snapshot_required (an account not set to diff-only reviews) goes
      * again by upload: a ticket, then, only when the ticket says `snapshot: "required"`, the reviewed tree as a tar.gz
-     * of the stored blobs, then the same diff and files. The refusal started nothing; the ticket and the snapshot run on
+     * of the stored blobs, then the same diff and files (less those the snapshot leaves out). The refusal started nothing; the ticket and the snapshot run on
      * their own clock while the hunt's is paused. The diff upload starts the hunt and is sent once; its answer names
      * the review (another one when the same payload is already being hunted).
      */
@@ -902,8 +902,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
         if (tree.cannot) throw new Refusal(`${tree.cannot}; no snapshot was sent, nothing started, and the upload ticket expires unused`);
         log(`uploading the repository snapshot (${tree.files} file(s), ${Math.ceil(tree.tgz.length / 1024)} KiB${tree.gitlinks ? `; ${tree.gitlinks} submodule(s) left out` : ""}${tree.secrets ? `; ${tree.secrets} file(s) named like secrets, or in folders named like them, left out` : ""})`);
         // From here the review holds a snapshot: the files beside it, sent now or on request, leave out what it leaves out.
-        const narrow = read;
-        read = (p) => (SNAPSHOT_SECRET.test(String(p).replace(/^\/+/, "")) ? null : narrow(p));
+        read = fileReader(change, gitBuf, SNAPSHOT_SECRET);
         files = files.filter((f) => !SNAPSHOT_SECRET.test(f.path));
         const door = new URL(url);
         door.pathname = `${door.pathname.replace(/\/$/, "")}/repo`;

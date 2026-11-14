@@ -250,17 +250,19 @@ test("--uncommitted answers a file request from the working tree, untracked incl
   } finally { await s.close() }
 });
 
-test("a diff-only review: a file named like a secret is in the diff but never sent as a file; code named like secrets.ts is", async () => {
+test("a diff-only review: a secret or credential store is in the diff but never sent as a file; code named like secrets.ts is", async () => {
   const { dir, git } = repo();
-  for (const p of ["src/secrets.ts", ".env.example", ".env", "lib.js"]) { mkdirSync(join(dir, p, ".."), { recursive: true }); writeFileSync(join(dir, p), `// ${p}\n`); }
+  for (const p of ["src/secrets.ts", ".env.example", ".env", ".npmrc", "lib.js"]) { mkdirSync(join(dir, p, ".."), { recursive: true }); writeFileSync(join(dir, p), `// ${p}\n`); }
   git("add", ".");
   git("commit", "-qm", "secret-named");
-  const s = await server({ requested: ["src/secrets.ts", ".env.example", ".env", "lib.js"] });
+  const s = await server({ requested: ["src/secrets.ts", ".env.example", ".env", ".npmrc", "lib.js"] });
   try {
     assert.equal((await cli(dir, [], { OHMYBUG_URL: s.url })).code, 0);
     const sub = s.calls.find((c) => c.name === "submit_review").args;
     assert.match(sub.diff, /b\/\.env\n/);
-    assert.ok(!sub.files.some((f) => f.path === ".env"), ".env is not sent as context");
+    const context = sub.files.map((f) => f.path);
+    assert.ok(!context.includes(".env") && !context.includes(".npmrc"), context.join(","));
+    assert.ok(context.includes("src/secrets.ts") && context.includes(".env.example"), context.join(","));
     assert.deepEqual(s.posted[0].files.map((f) => f.path), ["src/secrets.ts", ".env.example", "lib.js"]);
   } finally { await s.close() }
 });
@@ -1923,10 +1925,13 @@ test("packTree: a git call that stalls (a blobless clone fetching blobs) ends wi
   } finally { process.env.PATH = path; delete process.env.OMB_SLOW; }
 });
 
-test("fileReader never reads a file named like a secret, in any case; the snapshot's broader names stay readable", () => {
+test("fileReader: secrets and credential stores are never read, in any case; code named like secrets, examples and public keys are", () => {
   const { dir, git } = repo();
-  const out = [".env", "web/.env.local", "Prod.PEM", "id_rsa", "k/ID_ED25519", "c.p12", "tls.key"];
-  const kept = [".env.example", ".env.sample", "src/Secrets.ts", "a/credentials.json", ".npmrc", "infra/x.tfstate", "id_rsa.pub", ".aws/config", "secrets/db.yml", "conf.js"];
+  const out = [".env", "web/.env.local", ".envrc", ".env.example.bak", "Prod.PEM", "c.p12", "cert.pfx", "tls.key", "k.ppk", "a.jks", "b.keystore",
+    "id_rsa", "id_dsa", "id_ecdsa", "k/ID_ED25519", "k2/id_ed25519_sk", "id_rsa.bak", ".npmrc", ".git-credentials", ".netrc", ".pgpass", ".pypirc",
+    "kubeconfig", ".aws/config", ".kube/config", ".docker/config.json", ".ssh/known_hosts", ".gnupg/x", "infra/x.tfstate", "v.tfvars.json"];
+  const kept = [".env.example", ".env.sample", "w/.env.template", "w2/.env.DIST", "src/Secrets.ts", "a/credentials.json", "secrets/db.yml",
+    "id_rsa.pub", "k3/ID_ED25519.PUB", "conf.js", "my.npmrc", ".dockerignore", "app.env"];
   for (const p of [...out, ...kept]) { mkdirSync(join(dir, p, ".."), { recursive: true }); writeFileSync(join(dir, p), "x\n"); }
   git("add", ".");
   git("commit", "-qm", "secrets");
@@ -2214,6 +2219,14 @@ test("a review that uploads a snapshot leaves out of its files whatever the snap
     assert.ok(!tarNames(s.uploads.find((u) => u.door === "repo").body).includes("src/secrets.ts"));
     assert.deepEqual(s.posted[0].files.map((f) => f.path), ["lib.js"]);
   } finally { await s.close() }
+  // A ticket that takes the diff alone keeps those files beside it.
+  const off = await server({ faults: NEEDS_SNAPSHOT(), ticket: { snapshot: "off" }, requested: ["src/secrets.ts", "lib.js"] });
+  try {
+    assert.equal((await cli(dir, [], { OHMYBUG_URL: off.url }, SNAP)).code, 0);
+    const sent = JSON.parse(off.uploads.find((u) => u.door === "payload").body).files.map((f) => f.path);
+    assert.ok(sent.includes("src/secrets.ts"), sent.join(","));
+    assert.deepEqual(off.posted[0].files.map((f) => f.path), ["src/secrets.ts", "lib.js"]);
+  } finally { await off.close() }
 });
 
 test("the README budget names the snapshot's 15 minutes", () => {
