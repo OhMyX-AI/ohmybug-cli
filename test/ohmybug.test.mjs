@@ -93,7 +93,7 @@ async function server({ huntMs = 0, findings = [], status = "done", review_of_re
       const ask = name === "wait_review" && requested ? [requested, requestedAgain][asks] : undefined;
       if (ask) asks++;
       const result = toolError ? toolError
-        : name === "submit_review" && args.upload ? { ...(ticket?.noId ? {} : { review_id: "rev_test" }), status: "awaiting_upload", ...(ticket?.live ? { live_url: ticket.live } : {}), ...(ticket?.url === null ? {} : { upload_url: ticket?.url ?? `${url}/u/tok-secret${ticket?.slash ? "/" : ""}` }), ...(ticket?.snapshot ? { snapshot: ticket.snapshot } : {}) }
+        : name === "submit_review" && args.upload ? { ...(ticket?.noId ? {} : { review_id: "rev_test" }), status: "awaiting_upload", ...(ticket?.live ? { live_url: ticket.live } : {}), ...(ticket?.received ? { snapshot_received: true } : {}), ...(ticket?.url === null ? {} : { upload_url: ticket?.url ?? `${url}/u/tok-secret${ticket?.slash ? "/" : ""}` }), ...(ticket?.snapshot ? { snapshot: ticket.snapshot } : {}) }
         : name === "submit_review" ? { review_id: "rev_test", status: "running", ...submitExtra }
         : ask ? { review_id: "rev_test", status: "needs_files", requested_files: ask, files_url: filesUrl ?? `${url}/files` }
         : name === "wait_review" ? { review_id: "rev_test", status: Date.now() - (huntFrom ??= Date.now()) < huntMs ? "running" : status }
@@ -1798,16 +1798,20 @@ test("packTree: the stored blobs, raw: no filter, export rule or eol rule runs; 
   symlinkSync("app.js", join(dir, "link.js"));
   const p100 = `${"a".repeat(96)}.txt`, p101 = `${"b".repeat(97)}.txt`, p300 = `${"c".repeat(150)}/${"d".repeat(145)}.txt`;
   for (const p of [p100, p101, p300]) { mkdirSync(join(dir, p, ".."), { recursive: true }); writeFileSync(join(dir, p), `${p.length}\n`); }
-  const secret = [".env", "web/.env.local", "up/.ENV.Prod", "certs/server.pem", "certs2/Server.PEM", "c.p12", "d.PFX", "tls.key", "deploy/id_ed25519", "id_rsa", "k/ID_DSA", "k2/id_ecdsa"];
-  const kept = [".env.example", ".env.sample", "w/.env.template", "w2/.env.DIST", "web/envelope.js", "keys.md", "id_rsa.pub", "key.js"];
+  // The service's snapshot list, every entry, files and folders, any depth and case.
+  const secret = [".env", ".env.example", "web/.env.local", "up/.ENV.Prod", "src/secrets.ts", "a/Credentials.json", "certs/server.pem", "certs2/Server.PEM",
+    "c.p12", "d.PFX", "tls.key", "k.ppk", "a.jks", "b.keystore", "deploy/id_ed25519", "id_rsa", "id_rsa.pub", "k/ID_DSA", "k2/id_ecdsa", "k3/id_ed25519_sk",
+    "infra/prod.tfstate", "infra/prod.tfstate.backup", "vars.tfvars.json", ".npmrc", "sub/.netrc", ".pgpass", ".pypirc", ".git-credentials", "kubeconfig",
+    ".kube/config", ".docker/config.json", ".ssh/known_hosts", ".aws/config", ".gnupg/pubring.kbx"];
+  const kept = ["web/envelope.js", "keys.md", "key.js", "docs/kube.md", "tfstate.md", "menv/x.js", "ssh.md"];
   for (const p of [...secret, ...kept]) { mkdirSync(join(dir, p, ".."), { recursive: true }); writeFileSync(join(dir, p), "x\n"); }
-  writeFileSync(join(dir, "secret.bin"), "ciphertext\n");
+  writeFileSync(join(dir, "crypted.bin"), "ciphertext\n");
   writeFileSync(join(dir, "crlf.txt"), "one\ntwo\n");
   writeFileSync(join(dir, "ver.txt"), "$Format:%H$\n");
   mkdirSync(join(dir, "tests"));
   writeFileSync(join(dir, "tests", "t.js"), "test\n");
   writeFileSync(join(dir, "big.bin"), "version https://git-lfs.github.com/spec/v1\noid sha256:00\nsize 9\n");
-  writeFileSync(join(dir, ".gitattributes"), "secret.bin filter=boom\ncrlf.txt eol=crlf\nver.txt export-subst\ntests/ export-ignore\n");
+  writeFileSync(join(dir, ".gitattributes"), "crypted.bin filter=boom\ncrlf.txt eol=crlf\nver.txt export-subst\ntests/ export-ignore\n");
   git("config", "filter.boom.smudge", `touch ${join(dir, "SMUDGED")}; tr a-z A-Z`);
   git("config", "core.autocrlf", "true");
   git("add", ".");
@@ -1826,7 +1830,7 @@ test("packTree: the stored blobs, raw: no filter, export rule or eol rule runs; 
   assert.ok(a.tgz.equals(b.tgz), "a tree packs to the same bytes");
   const out = untar(a.tgz);
   const stored = (p) => execFileSync("git", ["-C", dir, "cat-file", "blob", `${rev}:${p}`]);
-  for (const p of ["app.js", "bin/run.sh", "secret.bin", "crlf.txt", "ver.txt", "tests/t.js", "big.bin", p100, p101, p300, ".gitattributes"]) {
+  for (const p of ["app.js", "bin/run.sh", "crypted.bin", "crlf.txt", "ver.txt", "tests/t.js", "big.bin", p100, p101, p300, ".gitattributes"]) {
     assert.ok(readFileSync(join(out, p)).equals(stored(p)), p);
   }
   assert.equal(readFileSync(join(out, "link.js"), "utf8"), "app.js");
@@ -1867,6 +1871,17 @@ test("snapshot_required: a ticket, the stored tree as gzip, then the same diff a
     assert.equal(j.review.id, "rev_test");
     assert.match(r.log, /started in fast mode/);
     assert.match(r.log, /live progress: https:\/\/example\.test\/live\/up/);
+  } finally { await s.close() }
+});
+
+test("a ticket that already holds the snapshot (snapshot_received) is not sent it again; the diff still goes", async () => {
+  const { dir } = changed();
+  const s = await server({ faults: NEEDS_SNAPSHOT(), ticket: { snapshot: "required", received: true } });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: s.url }, SNAP);
+    assert.equal(r.code, 0, r.log);
+    assert.deepEqual(s.uploads.map((u) => u.door), ["payload"]);
+    assert.match(r.log, /already holds this run's snapshot: not sent again/);
   } finally { await s.close() }
 });
 

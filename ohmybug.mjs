@@ -11,7 +11,7 @@ import { Readable, Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createGzip } from "node:zlib";
 
-export const VERSION = "0.10.0";
+export const VERSION = "0.10.1";
 const USAGE = `ohmybug ${VERSION}: review this repository's changes with OhMyBug.
 
 Usage:
@@ -273,8 +273,11 @@ function byteReader(stream) {
   };
 }
 
-// File names that hold secrets, as the plugin's secret scan names them, in any case: never sent, whatever their content.
-const SECRET_FILE = /(^|\/)(id_(rsa|dsa|ecdsa|ed25519)|[^/]+\.(pem|p12|pfx|key)|\.env(\.(?!example$|sample$|template$|dist$)[^/]+)?)$/i;
+// Names that hold secrets, the service's own snapshot list (.env*, *secret*, *credential*, id_rsa* and the other SSH key
+// names, *.pem, *.key, *.p12, *.pfx, *.ppk, *.jks, *.keystore, *.tfstate*, *.tfvars*, .npmrc, .netrc, .pgpass, .pypirc,
+// .git-credentials, kubeconfig, .kube, .docker, .ssh, .aws, .gnupg): a file or folder of that name at any depth, in any
+// case, is never sent, whatever its content.
+const SECRET_FILE = /(^|\/)(\.env[^/]*|[^/]*(secret|credential)[^/]*|id_(rsa|dsa|ecdsa|ed25519)[^/]*|[^/]*\.(pem|key|p12|pfx|ppk|jks|keystore)|[^/]*\.(tfstate|tfvars)[^/]*|\.(npmrc|netrc|pgpass|pypirc|git-credentials|kube|docker|ssh|aws|gnupg)|kubeconfig)(\/|$)/i;
 
 /**
  * The reviewed tree as a tar.gz of the blobs git stores: read raw with `cat-file --batch`, so no checkout filter runs
@@ -890,6 +893,8 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
         if (typeof t.review_id !== "string" || !REVIEW_ID.test(t.review_id)) throw new Refusal("the upload ticket carried no review id; nothing was sent and nothing started");
         // Only on a positive ask: a ticket that does not say "required" never gets the repository.
         if (t.snapshot !== "required") { log("the upload ticket takes the diff only: the repository is not uploaded"); return; }
+        // The ticket handed back with its snapshot already stored: never packed and sent twice.
+        if (t.snapshot_received === true) { log("the upload ticket already holds this run's snapshot: not sent again"); return; }
         if (env.OHMYBUG_SNAPSHOT === "off") throw new Refusal("the service asks for a snapshot of the repository, and OHMYBUG_SNAPSHOT=off keeps it on this machine; no snapshot was sent, nothing started, and the upload ticket expires unused (diff-only reviews are chosen in the hunting policy: https://app.ohmybug.ai/me/policy)");
         // Packed on the snapshot's clock, and only when the ticket wants it.
         const tree = await packTree(root, change.rev, { ...snap, timeoutMs: deadline - Date.now() });
