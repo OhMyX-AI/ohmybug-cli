@@ -11,7 +11,7 @@ import { Readable, Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createGzip } from "node:zlib";
 
-export const VERSION = "0.10.3";
+export const VERSION = "0.10.4";
 const USAGE = `ohmybug ${VERSION}: review this repository's changes with OhMyBug.
 
 Usage:
@@ -56,14 +56,19 @@ Environment:
 
 Behind a proxy: Node's fetch reads HTTPS_PROXY only with NODE_USE_ENV_PROXY=1 (Node 22.21+, 24+).
 
-Exit codes: 0 no medium or worse bug, 1 at least one, 2 the review could not run, or was cut short with no
-medium or worse bug.`;
+Exit codes: 0 no medium or worse bug (a medium judged real and marked tracked in your own ticket does not
+count), 1 at least one, 2 the review could not run, or was cut short with no medium or worse bug.`;
 
 /** Severity order, in lower case; P0-P3 is the same scale. Medium or worse blocks: what OhMyBug bills as a real bug. */
 const RANK = { critical: 0, p0: 0, high: 1, p1: 1, medium: 2, p2: 2, low: 3, p3: 3 };
 const rankOf = (f) => RANK[String(f?.severity).toLowerCase()] ?? 4;
-// A gate fails closed: a severity it does not know blocks.
-const isBlocking = (f) => rankOf(f) !== 3;
+/** A medium finding judged real and marked tracked in the client's own ticket (#3382, #3403): `deferred` or `accepted`
+ *  with a ref. Anything else, `still_open` (#3384) and any mark on another severity included, is not this. */
+const isKnown = (f) => rankOf(f) === 2 && f?.verdict === "REAL" && !!f.known && typeof f.known === "object"
+  && (f.known.kind === "deferred" || f.known.kind === "accepted") && typeof f.known.ref === "string" && f.known.ref.trim() !== "";
+// A gate fails closed: a severity it does not know blocks; a known medium does not.
+const isBlocking = (f) => rankOf(f) !== 3 && !isKnown(f);
+const KNOWN_TAG = "known: tracked in your ticket";
 const MAYBE_STARTED = "A hunt may have started: see https://app.ohmybug.ai/me";
 // A deep upload ticket starts no hunt and is never charged, but until it is used, retired or expired it counts as one
 // running review of the account (#3676).
@@ -466,7 +471,7 @@ export function formatFindings(findings) {
   return [...findings].sort((a, b) => rankOf(a) - rankOf(b)).map((f) => {
     const where = f.file ? (f.line ? `${f.file}:${f.line}` : String(f.file)) : "";
     const scenario = String(f.failure_scenario ?? "").trim().replace(/\n/g, "\n    ");
-    return `${String(f.severity ?? "unrated").toUpperCase()}  ${where}  ${f.title ?? ""}`.trimEnd() + (scenario ? `\n    ${scenario}` : "");
+    return `${String(f.severity ?? "unrated").toUpperCase()}  ${where}  ${f.title ?? ""}${isKnown(f) ? `  (${KNOWN_TAG})` : ""}`.trimEnd() + (scenario ? `\n    ${scenario}` : "");
   }).join("\n\n");
 }
 
@@ -487,7 +492,7 @@ const usd = (v) => (v === null || v === undefined || v === "" || !Number.isFinit
 export function resultOf(rec, code) {
   const r = rec.answer;
   const findings = [...(r?.findings ?? []).filter((f) => f && typeof f === "object")].sort((a, b) => rankOf(a) - rankOf(b)).map((f) => ({
-    id: scalar(f.finding_id ?? f.id), severity: severityOf(f), blocking: isBlocking(f), file: scalar(f.file),
+    id: scalar(f.finding_id ?? f.id), severity: severityOf(f), blocking: isBlocking(f), known: isKnown(f), file: scalar(f.file),
     line: /^[1-9]\d*$/.test(String(f.line ?? "")) ? Number(f.line) : null, title: String(f.title ?? ""),
     body: String(f.failure_scenario ?? ""), suggested_fix: strOrNull(f.suggested_fix),
   }));
@@ -556,7 +561,7 @@ export function resultMarkdown(res, folds = true) {
   const where = (f) => (f.file ? (f.line ? `${f.file}:${f.line}` : f.file) : "");
   if (res.findings.length) {
     out.push("| Severity | Location | Finding |", "|---|---|---|");
-    for (const f of res.findings) out.push(`| ${f.severity.toUpperCase()} | ${cell(where(f))} | ${cell(f.title)} |`);
+    for (const f of res.findings) out.push(`| ${f.severity.toUpperCase()}${f.known ? ` (${KNOWN_TAG})` : ""} | ${cell(where(f))} | ${cell(f.title)} |`);
     out.push("");
     for (const f of folds ? res.findings : []) {
       out.push(`<details><summary>${escHtml(`${f.severity.toUpperCase()} ${where(f)}: ${f.title}`.replace(/[\r\n]+/g, " "))}</summary>`, "");

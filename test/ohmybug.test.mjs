@@ -7,7 +7,7 @@ import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync, readFileSync, utime
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ciMeta, contextDenied, DECISION_WAIT_S, exitCodeFor, fileReader, fitBody, packTree, snapshotDenied, parseArgs, resolveBase, resultMarkdown, resultOf, rpcMessage, run, silentBillLine, trimDiff, VERSION } from "../ohmybug.mjs";
+import { ciMeta, contextDenied, DECISION_WAIT_S, exitCodeFor, fileReader, formatFindings, fitBody, packTree, snapshotDenied, parseArgs, resolveBase, resultMarkdown, resultOf, rpcMessage, run, silentBillLine, trimDiff, VERSION } from "../ohmybug.mjs";
 
 // The tests own their git config: a developer's or a runner's own (a git-lfs filter, say) would change what they see.
 process.env.GIT_CONFIG_GLOBAL = "/dev/null";
@@ -146,6 +146,43 @@ test("the base: --base, then the merge request target (remote-tracking when pres
   assert.equal(resolveBase({}, { CI_MERGE_REQUEST_TARGET_BRANCH_NAME: "develop" }, has(["origin/develop"])), "origin/develop");
   assert.equal(resolveBase({}, { CI_MERGE_REQUEST_TARGET_BRANCH_NAME: "develop" }, has([])), "develop");
   assert.equal(resolveBase({}, {}, has([])), "origin/main");
+});
+
+// #3403: a medium judged real and marked tracked in the client's own ticket (#3382) does not block; nothing else changes.
+test("exit codes: a known medium does not block; still_open, a high, a bad mark or no REAL verdict still do", () => {
+  const med = { severity: "medium", title: "m", file: "a.js", line: 1 };
+  const known = { ...med, verdict: "REAL", known: { kind: "deferred", ref: "#12" } };
+  assert.equal(exitCodeFor({ status: "done", findings: [known] }), 0);
+  assert.equal(exitCodeFor({ status: "done", findings: [{ ...known, known: { kind: "accepted", ref: "https://t.example/1" } }] }), 0);
+  assert.equal(exitCodeFor({ status: "done", findings: [{ ...known, severity: "P2" }] }), 0, "P2 is medium");
+  assert.equal(exitCodeFor({ status: "done", findings: [known, low] }), 0);
+  assert.equal(exitCodeFor({ status: "done", findings: [known, high] }), 1, "another major still blocks");
+  const blocks = {
+    "still_open keeps blocking (#3384)": { ...known, known: { kind: "still_open", of: { id: "f-1", round: 1 } } },
+    "a high is never known": { ...known, severity: "high" },
+    "a critical is never known": { ...known, severity: "critical" },
+    "an unrated finding fails closed": { ...known, severity: "blocker" },
+    "no verdict": { ...known, verdict: undefined },
+    "NOT_REAL is not read here": { ...known, verdict: "NOT_REAL" },
+    "UNCLEAR": { ...known, verdict: "UNCLEAR" },
+    "an unknown kind": { ...known, known: { kind: "later", ref: "#1" } },
+    "no ref": { ...known, known: { kind: "deferred" } },
+    "a blank ref": { ...known, known: { kind: "deferred", ref: "  " } },
+    "a string mark": { ...known, known: "deferred" },
+  };
+  for (const [why, f] of Object.entries(blocks)) assert.equal(exitCodeFor({ status: "done", findings: [f] }), 1, why);
+  // A cut-short run is still not clean when its only medium is known.
+  assert.equal(exitCodeFor({ status: "done", findings: [known], review_of_record: false }), 2);
+  // The outputs: a known finding is tagged, never blocking, left out of the count; the ref (server text) is not echoed.
+  const res = resultOf({ reviewId: "rev_x", answer: { status: "done", findings: [known, { ...med, finding_id: "f2" }] } }, 1);
+  assert.deepEqual(res.findings.map((f) => [f.blocking, f.known]), [[false, true], [true, false]]);
+  assert.equal(res.counts.blocking, 1);
+  assert.equal(res.counts.medium, 2);
+  const md = resultMarkdown(res);
+  assert.match(md, /\| MEDIUM \(known: tracked in your ticket\) \| ` a\.js:1 ` \|/);
+  assert.doesNotMatch(md, /#12/);
+  assert.match(formatFindings([known]), /^MEDIUM  a\.js:1  m  \(known: tracked in your ticket\)$/m);
+  assert.doesNotMatch(formatFindings([{ ...med }]), /known/);
 });
 
 test("exit codes: 1 on a medium or worse bug, 0 on lows or none, 2 on a failed or cut-short clean run", () => {
@@ -993,7 +1030,7 @@ test("--format json: one object on stdout, the same exit code, every field prese
     assert.equal(j.billing.charged_usd, null);
     assert.equal(j.silent_bill, null);
     assert.deepEqual(j.findings.map((f) => [f.severity, f.blocking]), [["high", true], ["medium", true], ["low", false], ["unrated", true]]);
-    assert.deepEqual(j.findings[1], { id: "rev_test:f2", severity: "medium", blocking: true, file: "b.js", line: 2, title: "t2", body: "s2", suggested_fix: "fix it" });
+    assert.deepEqual(j.findings[1], { id: "rev_test:f2", severity: "medium", blocking: true, known: false, file: "b.js", line: 2, title: "t2", body: "s2", suggested_fix: "fix it" });
     assert.deepEqual([j.findings[3].file, j.findings[3].line, j.findings[3].id], [null, null, null]);
     assert.deepEqual(j.counts, { total: 4, blocking: 3, critical: 0, high: 1, medium: 1, low: 1, unrated: 1 });
     assert.equal(j.error, null);

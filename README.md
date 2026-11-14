@@ -41,8 +41,8 @@ The CLI prints each finding (severity, file:line, title, failure scenario) and a
 
 | Exit code | Meaning |
 |---|---|
-| 0 | no medium or worse bug (lows are printed, and do not fail the job) |
-| 1 | at least one medium or worse bug, or a finding whose severity the CLI does not know (the gate fails closed) |
+| 0 | no medium or worse bug (lows are printed, and do not fail the job); a medium finding judged real and marked tracked in your own ticket (by your agent or on the hunt page, before the run reads the hunt) does not count. CI keys have no confirm step, so on them nothing is ever marked |
+| 1 | at least one medium or worse bug not marked tracked, or a finding whose severity the CLI does not know (the gate fails closed) |
 | 2 | the review could not run: no key, a refused key, network, a failed review, a continuation the service named that this client does not follow, or a run cut short with no medium or worse bug (lows found by a cut-short run do not make it clean) |
 
 | Variable | Default | |
@@ -82,7 +82,7 @@ exit $code
 | `live_url_missing` | why `live_url` is null (for example, the key's live link setting is off), else null |
 | `billing` | `{tariff, charged_usd, paid_by, note}`: on CI billing `tariff` is `ci` and `charged_usd` what was charged; otherwise `tariff` is `confirm` and `charged_usd` null, since the charge comes when someone confirms a medium or worse finding as real, or at the billing deadline; null `tariff` when nothing started or no result was read |
 | `silent_bill` | null, or `{at, billed, note}` for a review with a billing deadline |
-| `findings` | most severe first, each `{id, severity, blocking, file, line, title, body, suggested_fix}`; `severity` one of `critical`, `high`, `medium`, `low` (P0-P3 map to them) or `unrated` for none or one this CLI does not know; `blocking` is medium or worse or unrated; `body` is the failure scenario |
+| `findings` | most severe first, each `{id, severity, blocking, known, file, line, title, body, suggested_fix}`; `severity` one of `critical`, `high`, `medium`, `low` (P0-P3 map to them) or `unrated` for none or one this CLI does not know; `blocking` is medium or worse or unrated, except a `known` one; `known` (0.10.4 or later) is true for a medium finding judged real and marked tracked in your own ticket; `body` is the failure scenario |
 | `counts` | `{total, blocking, critical, high, medium, low, unrated}` |
 | `error` | null, or `{code, message}` when the run stopped without a result or the review failed: `code` is the service's error code when it refused, else null |
 | `upload_ticket` | null, or `{review_id, state}` when a `--deep --snapshot` run stopped after asking for its upload ticket: `state` is `retired` (the run retired it), `open` (it could not; the ticket counts as a running review on the account until it expires, and nothing runs on it), `gone` (used or expired) or `unknown` (the ticket's answer, or the start of the hunt, was not clear); `review_id` is null when the ticket named none |
