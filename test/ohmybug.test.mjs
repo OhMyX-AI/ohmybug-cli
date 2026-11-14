@@ -7,7 +7,7 @@ import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync, readFileSync, utime
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ciMeta, contextDenied, DECISION_WAIT_S, exitCodeFor, fileReader, fitBody, packTree, SNAPSHOT_SECRET, parseArgs, resolveBase, resultMarkdown, resultOf, rpcMessage, run, silentBillLine, trimDiff, VERSION } from "../ohmybug.mjs";
+import { ciMeta, contextDenied, DECISION_WAIT_S, exitCodeFor, fileReader, fitBody, packTree, snapshotDenied, parseArgs, resolveBase, resultMarkdown, resultOf, rpcMessage, run, silentBillLine, trimDiff, VERSION } from "../ohmybug.mjs";
 
 // The tests own their git config: a developer's or a runner's own (a git-lfs filter, say) would change what they see.
 process.env.GIT_CONFIG_GLOBAL = "/dev/null";
@@ -1822,10 +1822,14 @@ test("packTree: the stored blobs, raw: no filter, export rule or eol rule runs; 
     ".kube/config", ".docker/config.json", ".ssh/known_hosts", ".aws/config", ".gnupg/pubring.kbx",
     // Folder cases: whatever is inside a folder so named stays out.
     "secrets/db.yml", "prod-credentials/x.js", ".env.d/x", "id_rsa.d/x", "certs.pem/x", "keys.key/x", "store.jks/x", "x.tfstate.d/y", "y.tfvars.d/z",
-    "n/.npmrc/x", "kc/kubeconfig/x", "deep/.SSH/x"];
+    "n/.npmrc/x", "kc/kubeconfig/x", "deep/.SSH/x",
+    // Judged per file name: kubeconfig under any name, env files by suffix; source-code names stay (below).
+    "kubeconfig.yaml", "app.env", "notkubeconfig", "deploy/k8s/prod-kubeconfig.yaml", "admin.kubeconfig", "kubeconfig_prod", "kubeconfig.bak",
+    "kube_config_x.yml", "Kube-Config.json", "Kubeconfig.GO", "prod.env.local", "prod.env-local", "up2/App.ENV"];
   // Near misses, as the service's globs keep them: a listed name with more characters before or after it.
-  const kept = ["web/envelope.js", "keys.md", "key.js", "docs/kube.md", "tfstate.md", "menv/x.js", "ssh.md", "my.npmrc", "kubeconfig.yaml", ".dockerignore",
-    ".sshrc", "server.pem.bak", "x.keys", "myid_rsa", ".github/x.yml", "app.env", "a.keymap.ts", "notkubeconfig", ".awsrc"];
+  const kept = ["web/envelope.js", "keys.md", "key.js", "docs/kube.md", "tfstate.md", "menv/x.js", "ssh.md", "my.npmrc", ".dockerignore",
+    ".sshrc", "server.pem.bak", "x.keys", "myid_rsa", ".github/x.yml", "a.keymap.ts", ".awsrc", "src/kubeconfig.go", "src/kubeconfig-loader.ts",
+    "src/config.env.ts", "src/app.env.d.ts", "pkg/kubeconfig-loader/README.md", "deploy/app.envoy.yaml", "deploy/prod.environment.yaml"];
   for (const p of [...secret, ...kept]) { mkdirSync(join(dir, p, ".."), { recursive: true }); writeFileSync(join(dir, p), "x\n"); }
   writeFileSync(join(dir, "crypted.bin"), "ciphertext\n");
   writeFileSync(join(dir, "crlf.txt"), "one\ntwo\n");
@@ -1932,12 +1936,13 @@ test("contextDenied: the snapshot list per path part; only the file's own name m
     "secrets.js/prod.yml", "credentials.go/x.go", "id_rsa.pub/id_rsa", "id_rsa.pub/readme.md", ".env.example/x", "src/.env.example/readme.md",
     ".env.secret/app.ts", ".git-credentials/helper.go", "a/.ssh/keys.go", ".kube/secrets.go", "kubeconfig/a.go", ".Docker/config.json", ".aws/config",
     ".env", ".envrc", ".env.example.bak", ".env.examples", ".env.local.example", ".env.js", ".env.example.js", ".env.example.ts", "id_rsa",
-    "id_rsa.pub.bak", "id_rsa.ts", "id_rsa.pub.ts", "id_ed25519_sk", "id_ed25519_sk.pub", ".npmrc", ".git-credentials", "kubeconfig", "server.pem", "tls.key"];
+    "id_rsa.pub.bak", "id_rsa.ts", "id_rsa.pub.ts", "id_ed25519_sk", "id_ed25519_sk.pub", ".npmrc", ".git-credentials", "kubeconfig", "server.pem", "tls.key",
+    "kubeconfig.yaml", "app.env", "example.env", "prod-kubeconfig.yaml", "kube_config_x.yml", "Kubeconfig.GO", "prod.env-local", "app.env_backup"];
   const allowed = ["secrets.ts", "src/Secrets.ts", "lib/credentials.go", "SECRETS.TS", "secrets.d.ts", "secrets.json.js", "src/auth/secretManager.test.ts",
     "src/credential_store.py", "secretsecret.go", "secsecretret.go", "id_secretrsa.ts", "secret.key.go", "secrets.pem.js", "x.keystore.secret.java",
     "kubeconfig.secret.go", ".git-credentials.js", ".npmrc.secret.js", ".env.example", ".ENV.Sample", ".env.template", ".env.dist", "id_rsa.pub",
-    "ID_ED25519.PUB", "k/id_dsa.pub", "k/id_ecdsa.pub", "my.npmrc", "kubeconfig.yaml", ".dockerignore", "app.env", "example.env", "server.pem.ts",
-    "tls.key.ts", "app.js"];
+    "ID_ED25519.PUB", "k/id_dsa.pub", "k/id_ecdsa.pub", "my.npmrc", ".dockerignore", "server.pem.ts",
+    "tls.key.ts", "app.js", "kubeconfig-loader.ts", "config.env.ts", "pkg/kubeconfig-loader/README.md", "app.envoy.yaml", "prod.environment.yaml"];
   for (const p of denied) assert.equal(contextDenied(p), true, p);
   for (const p of allowed) assert.equal(contextDenied(p), false, p);
 });
@@ -1948,9 +1953,9 @@ test("fileReader: secrets and credential stores are never read, in any case; cod
     "id_rsa", "id_dsa", "id_ecdsa", "k/ID_ED25519", "k2/id_ed25519_sk", "id_rsa.bak", ".npmrc", ".git-credentials", ".netrc", ".pgpass", ".pypirc",
     "kubeconfig", ".aws/config", ".kube/config", ".docker/config.json", ".ssh/known_hosts", ".gnupg/x", "infra/x.tfstate", "v.tfvars.json",
     // Secret-named data files and folders stay out; only source code named like secrets is context.
-    "a/credentials.json", "secrets.yml", "client_secret.json", "secrets/db.yml", "secrets/manager.ts", "prod-credentials/x.js", "id_rsa.pub.bak"];
+    "a/credentials.json", "secrets.yml", "client_secret.json", "secrets/db.yml", "secrets/manager.ts", "prod-credentials/x.js", "id_rsa.pub.bak", "app.env", "k8s/prod-kubeconfig.yaml"];
   const kept = [".env.example", ".env.sample", "w/.env.template", "w2/.env.DIST", "src/Secrets.ts", "lib/credentials.go", "id_rsa.pub",
-    "k3/ID_ED25519.PUB", "conf.js", "my.npmrc", ".dockerignore", "app.env"];
+    "k3/ID_ED25519.PUB", "conf.js", "my.npmrc", ".dockerignore", "src/kubeconfig-loader.ts"];
   for (const p of [...out, ...kept]) { mkdirSync(join(dir, p, ".."), { recursive: true }); writeFileSync(join(dir, p), "x\n"); }
   git("add", ".");
   git("commit", "-qm", "secrets");
@@ -1958,9 +1963,10 @@ test("fileReader: secrets and credential stores are never read, in any case; cod
   for (const p of out) assert.equal(read(p), null, p);
   for (const p of kept) assert.equal(read(p), "x\n", p);
   // Beside a snapshot the reader takes the snapshot's list: the context-only names are not read either.
-  const beside = fileReader({ all: [...out, ...kept], rev: git("rev-parse", "HEAD").trim() }, (...a) => execFileSync("git", ["-C", dir, ...a]), (p) => SNAPSHOT_SECRET.test(p));
-  for (const p of [".env.example", "src/Secrets.ts", "lib/credentials.go", "id_rsa.pub"]) assert.equal(beside(p), null, p);
+  const beside = fileReader({ all: [...out, ...kept], rev: git("rev-parse", "HEAD").trim() }, (...a) => execFileSync("git", ["-C", dir, ...a]), snapshotDenied);
+  for (const p of [".env.example", "src/Secrets.ts", "lib/credentials.go", "id_rsa.pub", "app.env"]) assert.equal(beside(p), null, p);
   assert.equal(beside("conf.js"), "x\n");
+  assert.equal(beside("src/kubeconfig-loader.ts"), "x\n");
 });
 
 test("--uncommitted: the snapshot is the working tree with untracked files, never ignored ones, and the index is untouched", { skip: !hasTar && "no tar" }, async () => {

@@ -11,7 +11,7 @@ import { Readable, Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createGzip } from "node:zlib";
 
-export const VERSION = "0.10.2";
+export const VERSION = "0.10.3";
 const USAGE = `ohmybug ${VERSION}: review this repository's changes with OhMyBug.
 
 Usage:
@@ -278,6 +278,14 @@ function byteReader(stream) {
 // .git-credentials, kubeconfig, .kube, .docker, .ssh, .aws, .gnupg): a file or folder of that name at any depth, in any
 // case, stays out of a snapshot, whatever its content. With a snapshot, the files sent beside it follow it too.
 export const SNAPSHOT_SECRET = /(^|\/)(\.env[^/]*|[^/]*(secret|credential)[^/]*|id_(rsa|dsa|ecdsa|ed25519)[^/]*|[^/]*\.(pem|key|p12|pfx|ppk|jks|keystore)|[^/]*\.(tfstate|tfvars)[^/]*|\.(npmrc|netrc|pgpass|pypirc|git-credentials|kube|docker|ssh|aws|gnupg)|kubeconfig)(\/|$)/i;
+// File names (never folders) the service's snapshot also leaves out, unless they end in a lower-case source-code
+// extension: kubeconfig under any name that contains it, and env files by suffix (app.env, prod.env.local). A glob
+// alone cannot tell prod-kubeconfig.yaml from kubeconfig-loader.ts or config.env.ts, so these are judged per file.
+const SECRET_FILE = /kubeconfig|kube[-_]config|\.env$|\.env[^a-z0-9]/i;
+const SOURCE_EXT = /\.(ts|tsx|js|jsx|mjs|cjs|py|go|java|kt|kts|rb|rs|cs|php|swift|scala|c|cc|cpp|h|hpp|m|ex|exs|dart|lua)$/;
+const secretFile = (name) => SECRET_FILE.test(name) && !SOURCE_EXT.test(name);
+/** Left out of a snapshot, and out of the files sent beside one: the list per path part, or the file's own name. */
+export const snapshotDenied = (path) => SNAPSHOT_SECRET.test(path) || secretFile(path.slice(path.lastIndexOf("/") + 1));
 // Files never sent as files on a review without a snapshot: the snapshot list, per path part. Only the file's own
 // name may trip it, and only two ways: an exact env example or public key name, or source code whose name trips
 // nothing but the secret/credential words (secrets.ts, credentials.go). A folder that trips keeps its contents out.
@@ -287,7 +295,9 @@ export function contextDenied(path) {
   const dirs = path.split("/");
   const name = dirs.pop();
   if (dirs.some((dir) => SNAPSHOT_SECRET.test(dir))) return true;
-  if (!SNAPSHOT_SECRET.test(name) || CONTEXT_EXACT.test(name)) return false;
+  if (CONTEXT_EXACT.test(name)) return false;
+  if (secretFile(name)) return true;
+  if (!SNAPSHOT_SECRET.test(name)) return false;
   // The words blanked: what still trips the list is another rule (.env*, id_rsa*, *.tfvars*), and that one has no exemption.
   return !(CODE_NAME.test(name) && !SNAPSHOT_SECRET.test(name.replace(/secret|credential/gi, "x")));
 }
@@ -319,7 +329,7 @@ export async function packTree(root, rev, { maxBytes, maxUnpacked, timeoutMs }) 
     const [mode, type, oid, size] = rec.subarray(0, tab).toString().trim().split(/\s+/);
     const path = rec.subarray(tab + 1);
     if (type !== "blob") { gitlinks++; continue; }
-    if (SNAPSHOT_SECRET.test(path.toString())) { secrets++; continue; }
+    if (snapshotDenied(path.toString())) { secrets++; continue; }
     files.push({ mode, oid, size: Number(size), path });
     unpacked += (path.length > 100 ? tarEntry(path, 0o644, 0).length : 512) + Math.ceil(Number(size) / 512) * 512;
   }
@@ -912,8 +922,8 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
         if (tree.cannot) throw new Refusal(`${tree.cannot}; no snapshot was sent, nothing started, and the upload ticket expires unused`);
         log(`uploading the repository snapshot (${tree.files} file(s), ${Math.ceil(tree.tgz.length / 1024)} KiB${tree.gitlinks ? `; ${tree.gitlinks} submodule(s) left out` : ""}${tree.secrets ? `; ${tree.secrets} file(s) named like secrets, or in folders named like them, left out` : ""})`);
         // From here the review holds a snapshot: the files beside it, sent now or on request, leave out what it leaves out.
-        read = fileReader(change, gitBuf, (p) => SNAPSHOT_SECRET.test(p));
-        files = files.filter((f) => !SNAPSHOT_SECRET.test(f.path));
+        read = fileReader(change, gitBuf, snapshotDenied);
+        files = files.filter((f) => !snapshotDenied(f.path));
         const door = new URL(url);
         door.pathname = `${door.pathname.replace(/\/$/, "")}/repo`;
         await uploadSnapshot(door.href, tree.tgz);
