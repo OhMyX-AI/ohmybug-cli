@@ -101,6 +101,9 @@ function doorSaid(text) {
 // Pinned diff format, whatever the user's git config says (noprefix, mnemonicPrefix, textconv drivers).
 const DIFF_FLAGS = ["--no-color", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/"];
 const TRANSIENT_TOOL = new Set(["internal", "rate_limited"]);
+// The deep payload door's own "every slot busy" 503 (#3688): sent before the ticket is taken, so nothing started. Only
+// this code says so; a 503 without it (a proxy, an older service) may have started a hunt. Never resent (#3662).
+const DEEP_AT_CAPACITY = "deep_at_capacity";
 const STORY = new Set(["auto", "private", "never"]);
 const FORMATS = new Set(["text", "markdown", "json"]);
 export const RESULT_SCHEMA = "ohmybug-cli/result/1";
@@ -740,7 +743,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
         const retryable = res.status === 429 || (!once && (res.status === 408 || res.status >= 500));
         if (!retryable) {
           const said = door ? doorSaid(text) : { message: clean(text) };
-          const may = once && res.status >= 500;
+          const may = once && res.status >= 500 && !(door === "deep" && res.status === 503 && said.code === DEEP_AT_CAPACITY);
           throw new Refusal(`HTTP ${res.status} ${said.message}${may ? `. ${maybe}` : ""}`, said.code, res.status, may ? fate : null);
         }
         why = `HTTP ${res.status}`;
@@ -1015,9 +1018,13 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
       };
       const sendPayload = async () => {
         let text;
-        try { text = await http(url.href, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ diff: a.diff, files }) }, { once: true, door: true }); }
+        try { text = await http(url.href, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ diff: a.diff, files }) }, { once: true, door: deep ? "deep" : true }); }
         catch (err) {
           if (err instanceof Refusal && err.fate === "hunt") throw new Refusal(`${err.message} (review ${t.review_id})`, err.code, err.status, "hunt");
+          // The service's words are for a client that resends; this one does not (one attempt per door, #3662).
+          if (deep && err instanceof Refusal && err.status === 503 && err.code === DEEP_AT_CAPACITY) {
+            throw new Refusal("every deep-hunt slot is busy right now; nothing started and nothing was charged: run it again in a few minutes", err.code, err.status);
+          }
           throw err;
         }
         let j = null;
