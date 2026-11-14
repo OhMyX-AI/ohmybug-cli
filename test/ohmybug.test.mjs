@@ -250,6 +250,22 @@ test("--uncommitted answers a file request from the working tree, untracked incl
   } finally { await s.close() }
 });
 
+test("a tracked, changed file named like a secret is in the diff but never sent as a file, nor in answer to a request", async () => {
+  const { dir, git } = repo();
+  for (const p of ["src/secrets.ts", ".env.example", "lib.js"]) { mkdirSync(join(dir, p, ".."), { recursive: true }); writeFileSync(join(dir, p), `// ${p}\n`); }
+  git("add", ".");
+  git("commit", "-qm", "secret-named");
+  const s = await server({ requested: ["src/secrets.ts", ".env.example", "lib.js"] });
+  try {
+    assert.equal((await cli(dir, [], { OHMYBUG_URL: s.url })).code, 0);
+    const sub = s.calls.find((c) => c.name === "submit_review").args;
+    assert.match(sub.diff, /src\/secrets\.ts/);
+    assert.match(sub.diff, /\.env\.example/);
+    assert.ok(!sub.files.some((f) => ["src/secrets.ts", ".env.example"].includes(f.path)), "not sent as context");
+    assert.deepEqual(s.posted[0].files.map((f) => f.path), ["lib.js"]);
+  } finally { await s.close() }
+});
+
 test("a changed file named like a git option is a search term, and its referrers are sent", async () => {
   const { dir, git } = repo();
   writeFileSync(join(dir, "user.js"), 'import x from "./-Oecho.js"\n');
@@ -1803,10 +1819,12 @@ test("packTree: the stored blobs, raw: no filter, export rule or eol rule runs; 
     "c.p12", "d.PFX", "tls.key", "k.ppk", "a.jks", "b.keystore", "deploy/id_ed25519", "id_rsa", "id_rsa.pub", "k/ID_DSA", "k2/id_ecdsa", "k3/id_ed25519_sk",
     "infra/prod.tfstate", "infra/prod.tfstate.backup", "vars.tfvars.json", ".npmrc", "sub/.netrc", ".pgpass", ".pypirc", ".git-credentials", "kubeconfig",
     ".kube/config", ".docker/config.json", ".ssh/known_hosts", ".aws/config", ".gnupg/pubring.kbx",
-    // Every alternative as a folder too: whatever is inside it stays out.
+    // Folder cases: whatever is inside a folder so named stays out.
     "secrets/db.yml", "prod-credentials/x.js", ".env.d/x", "id_rsa.d/x", "certs.pem/x", "keys.key/x", "store.jks/x", "x.tfstate.d/y", "y.tfvars.d/z",
     "n/.npmrc/x", "kc/kubeconfig/x", "deep/.SSH/x"];
-  const kept = ["web/envelope.js", "keys.md", "key.js", "docs/kube.md", "tfstate.md", "menv/x.js", "ssh.md"];
+  // Near misses, as the service's globs keep them: a listed name with more characters before or after it.
+  const kept = ["web/envelope.js", "keys.md", "key.js", "docs/kube.md", "tfstate.md", "menv/x.js", "ssh.md", "my.npmrc", "kubeconfig.yaml", ".dockerignore",
+    ".sshrc", "server.pem.bak", "x.keys", "myid_rsa", ".github/x.yml", "app.env", "a.keymap.ts", "notkubeconfig", ".awsrc"];
   for (const p of [...secret, ...kept]) { mkdirSync(join(dir, p, ".."), { recursive: true }); writeFileSync(join(dir, p), "x\n"); }
   writeFileSync(join(dir, "crypted.bin"), "ciphertext\n");
   writeFileSync(join(dir, "crlf.txt"), "one\ntwo\n");
