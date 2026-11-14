@@ -2076,6 +2076,9 @@ test("--deep --snapshot: every stop after the ticket's answer retires or names t
     ["snapshot 413", { snapshot: "required", repo: [413], del: "retired" }, RETIRED, { review_id: "rev_test", state: "retired" }, 1],
     ["snapshot 404", { snapshot: "required", repo: [404] }, GONE, { review_id: "rev_test", state: "gone" }, 0],
     ["payload 410", { snapshot: "required", payload: [410] }, GONE, { review_id: "rev_test", state: "gone" }, 0],
+    // #3688: the service's own capacity 503 (its code) started nothing: retired, not "may have started", sent once.
+    ["payload 503 deep_at_capacity", { snapshot: "required", payload: [503], retryAfter: "120", del: "retired",
+      body: { payload: JSON.stringify({ error: "the deep hunt is at capacity right now", code: "deep_at_capacity" }) } }, RETIRED, { review_id: "rev_test", state: "retired" }, 1],
     // D2: an address on another host is never called, not even to retire it.
     ["address on another host", { snapshot: "required", url: "https://elsewhere.example/u/tok" }, OPEN, { review_id: "rev_test", state: "open" }, 0],
   ];
@@ -2088,6 +2091,11 @@ test("--deep --snapshot: every stop after the ticket's answer retires or names t
       assert.match(r.log, sentence, name);
       assert.equal(r.log.match(/The upload ticket/g).length, 1, `${name}: exactly one ticket sentence`);
       assert.doesNotMatch(r.log, /deep slot/, name);
+      assert.doesNotMatch(r.log, /may have started/, name)
+      if (name.includes("deep_at_capacity")) {
+        assert.match(r.log, /every deep-hunt slot is busy right now; nothing started and nothing was charged: run it again in a few minutes/)
+        assert.equal(s.uploads.filter((u) => u.door === "payload").length, 1, name)
+      }
       const j = JSON.parse(r.out);
       assert.deepEqual([j.outcome, j.upload_ticket], ["not_run", state], name);
       assert.equal(s.deletes.length, deletes, name);
@@ -2163,8 +2171,10 @@ test("--deep --snapshot: an unclear ticket answer from the tool says a ticket, n
       assert.equal(s.calls.filter((c) => c.name === "submit_review").length, 1, fault);
     } finally { await s.close() }
   }
-  // busy503 is the deep payload's only: a fast payload's 503 (even with a JSON error) may have started a hunt.
-  const s = await server({ faults: NEEDS_SNAPSHOT(), ticket: { snapshot: "required", payload: [503], retryAfter: "1" } });
+  // busy503 is the deep payload's only: a fast payload's 503 (even with a JSON error, even with the deep door's capacity
+  // code, #3688) may have started a hunt.
+  const s = await server({ faults: NEEDS_SNAPSHOT(), ticket: { snapshot: "required", payload: [503], retryAfter: "1",
+    body: { payload: JSON.stringify({ error: "at capacity", code: "deep_at_capacity" }) } } });
   try {
     const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url }, SNAP);
     assert.equal(r.code, 2, r.log);
