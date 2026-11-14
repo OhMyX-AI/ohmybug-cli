@@ -7,7 +7,7 @@ import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync, readFileSync, utime
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ciMeta, DECISION_WAIT_S, exitCodeFor, fitBody, packTree, parseArgs, resolveBase, resultMarkdown, resultOf, rpcMessage, run, silentBillLine, trimDiff, VERSION } from "../ohmybug.mjs";
+import { ciMeta, DECISION_WAIT_S, exitCodeFor, fileReader, fitBody, packTree, parseArgs, resolveBase, resultMarkdown, resultOf, rpcMessage, run, silentBillLine, trimDiff, VERSION } from "../ohmybug.mjs";
 
 // The tests own their git config: a developer's or a runner's own (a git-lfs filter, say) would change what they see.
 process.env.GIT_CONFIG_GLOBAL = "/dev/null";
@@ -1798,7 +1798,8 @@ test("packTree: the stored blobs, raw: no filter, export rule or eol rule runs; 
   symlinkSync("app.js", join(dir, "link.js"));
   const p100 = `${"a".repeat(96)}.txt`, p101 = `${"b".repeat(97)}.txt`, p300 = `${"c".repeat(150)}/${"d".repeat(145)}.txt`;
   for (const p of [p100, p101, p300]) { mkdirSync(join(dir, p, ".."), { recursive: true }); writeFileSync(join(dir, p), `${p.length}\n`); }
-  const secret = [".env", "web/.env.local", "certs/server.pem", "deploy/id_ed25519", "tls.key"], kept = [".env.example", "web/envelope.js", "keys.md"];
+  const secret = [".env", "web/.env.local", "up/.ENV.Prod", "certs/server.pem", "certs2/Server.PEM", "c.p12", "d.PFX", "tls.key", "deploy/id_ed25519", "id_rsa", "k/ID_DSA", "k2/id_ecdsa"];
+  const kept = [".env.example", ".env.sample", "w/.env.template", "w2/.env.DIST", "web/envelope.js", "keys.md", "id_rsa.pub", "key.js"];
   for (const p of [...secret, ...kept]) { mkdirSync(join(dir, p, ".."), { recursive: true }); writeFileSync(join(dir, p), "x\n"); }
   writeFileSync(join(dir, "secret.bin"), "ciphertext\n");
   writeFileSync(join(dir, "crlf.txt"), "one\ntwo\n");
@@ -1841,7 +1842,8 @@ test("packTree: over the compressed or the unpacked cap, or an empty tree, is a 
   const { dir, git } = repo();
   const rev = git("rev-parse", "HEAD^{tree}").trim();
   assert.match((await packTree(dir, rev, { maxBytes: 10, maxUnpacked: 1 << 30, timeoutMs: 60_000 })).cannot, /over 1 MiB compressed/);
-  assert.match((await packTree(dir, rev, { maxBytes: 1 << 30, maxUnpacked: 100, timeoutMs: 60_000 })).cannot, /MiB unpacked, over the 1 MiB/);
+  // Just over the tar trailer: only the files' own headers and blocks can go over it.
+  assert.match((await packTree(dir, rev, { maxBytes: 1 << 30, maxUnpacked: 1025, timeoutMs: 60_000 })).cannot, /MiB unpacked, over the 1 MiB/);
   const empty = git("hash-object", "-t", "tree", "/dev/null").trim();
   assert.match((await packTree(dir, empty, { maxBytes: 1 << 30, maxUnpacked: 1 << 30, timeoutMs: 60_000 })).cannot, /no files/);
 });
@@ -1878,10 +1880,34 @@ test("an upload address ending in / still takes the snapshot at <address>/repo a
   } finally { await s.close() }
 });
 
-test("packTree: the git calls end with the snapshot's clock", async () => {
+test("packTree: a git call that stalls (a blobless clone fetching blobs) ends with the snapshot's clock", async () => {
   const { dir, git } = repo();
   const rev = git("rev-parse", "HEAD^{tree}").trim();
-  assert.match((await packTree(dir, rev, { maxBytes: 1 << 30, maxUnpacked: 1 << 30, timeoutMs: 1 })).cannot, /could not (list|pack)/);
+  const bin = mkdtempSync(join(tmpdir(), "omb-git-"));
+  const real = execFileSync("sh", ["-c", "command -v git"]).toString().trim();
+  writeFileSync(join(bin, "git"), `#!/bin/sh\nfor a in "$@"; do [ "$a" = "$OMB_SLOW" ] && exec sleep 20; done\nexec "${real}" "$@"\n`, { mode: 0o755 });
+  const path = process.env.PATH;
+  process.env.PATH = `${bin}:${path}`;
+  try {
+    for (const [slow, said] of [["ls-tree", /could not list the reviewed tree within 2s/], ["cat-file", /could not pack the repository snapshot within 2s \(git was still reading the blobs\)/]]) {
+      process.env.OMB_SLOW = slow;
+      const t0 = Date.now();
+      const r = await packTree(dir, rev, { maxBytes: 1 << 30, maxUnpacked: 1 << 30, timeoutMs: 2000 });
+      assert.match(r.cannot ?? "", said, slow);
+      assert.ok(Date.now() - t0 < 10_000, `${slow} took ${Date.now() - t0} ms`);
+    }
+  } finally { process.env.PATH = path; delete process.env.OMB_SLOW; }
+});
+
+test("fileReader never reads a secret-named file of the tree, in any case", () => {
+  const { dir, git } = repo();
+  for (const p of [".env", "Prod.PEM", "conf.js"]) writeFileSync(join(dir, p), "x\n");
+  git("add", ".");
+  git("commit", "-qm", "secrets");
+  const read = fileReader({ all: [".env", "Prod.PEM", "conf.js"], rev: git("rev-parse", "HEAD").trim() }, (...a) => execFileSync("git", ["-C", dir, ...a]));
+  assert.equal(read(".env"), null);
+  assert.equal(read("Prod.PEM"), null);
+  assert.equal(read("conf.js"), "x\n");
 });
 
 test("--uncommitted: the snapshot is the working tree with untracked files, never ignored ones, and the index is untouched", { skip: !hasTar && "no tar" }, async () => {
@@ -1920,7 +1946,7 @@ test("a ticket that does not say required (off, absent, unknown) gets the diff a
   try {
     const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url }, { snapshot: { ...SNAP.snapshot, maxBytes: 10 } });
     assert.equal(r.code, 2);
-    assert.match(r.log, /over 1 MiB compressed, the most the service takes; nothing was sent, and the upload ticket expires unused/);
+    assert.match(r.log, /over 1 MiB compressed, the most the service takes; no snapshot was sent, nothing started, and the upload ticket expires unused/);
     assert.equal(s.uploads.length, 0);
     const j = JSON.parse(r.out);
     assert.deepEqual([j.outcome, j.error.code], ["not_run", null]);
@@ -2015,7 +2041,7 @@ test("a snapshot that never lands stops on its own clock with a snapshot refusal
   try {
     const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url }, { snapshot: { waitS: 5, minTryMs: 1000 } });
     assert.equal(r.code, 2);
-    assert.match(r.log, /the repository snapshot did not finish uploading within 5s \(last: HTTP 503\); nothing was started/);
+    assert.match(r.log, /the repository snapshot did not finish uploading on the snapshot's clock of 5s \(last: HTTP 503\); nothing was started/);
     assert.doesNotMatch(r.log, /no result within/);
     assert.ok(s.uploads.length <= 3, String(s.uploads.length));
     assert.equal(JSON.parse(r.out).outcome, "not_run");
@@ -2131,7 +2157,7 @@ test("OHMYBUG_SNAPSHOT=off: a ticket that asks for the snapshot stops with nothi
   try {
     const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url, OHMYBUG_SNAPSHOT: "off" }, SNAP);
     assert.equal(r.code, 2);
-    assert.match(r.log, /OHMYBUG_SNAPSHOT=off keeps it on this machine; nothing was sent/);
+    assert.match(r.log, /OHMYBUG_SNAPSHOT=off keeps it on this machine; no snapshot was sent, nothing started/);
     assert.equal(s.uploads.length, 0);
     assert.equal(JSON.parse(r.out).outcome, "not_run");
   } finally { await s.close() }
