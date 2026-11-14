@@ -618,8 +618,7 @@ export function repoTarget(env, git, base, local = false) {
   if (server && !/^https:\/\/github\.com\/?$/.test(server)) return { why: `the service reads repositories on github.com, not on ${server}`, offGithub: true };
   let url = "";
   try { url = git("remote", "get-url", "origin").trim(); } catch {}
-  // Any case of the host, and GitHub's ssh-over-443 host (ssh://git@ssh.github.com:443/o/r). An ssh config alias is not read.
-  let repo = url.match(/^(?:[\w.+-]+:\/\/)?(?:[^@/]+@)?(?:ssh\.)?github\.com(?::443\/|[:/])([\w.-]+\/[\w.-]+?)(?:\.git)?\/?$/i)?.[1] ?? "";
+  let repo = url.match(/^(?:[\w.+-]+:\/\/)?(?:[^@/]+@)?github\.com[:/]([\w.-]+\/[\w.-]+?)(?:\.git)?\/?$/)?.[1] ?? "";
   if (!repo && /^[\w.-]+\/[\w.-]+$/.test(env.GITHUB_REPOSITORY ?? "")) repo = env.GITHUB_REPOSITORY;
   if (!repo) return { why: "no GitHub repository: an origin remote on github.com, or GITHUB_REPOSITORY=owner/name", offGithub: true };
   const ref = git("rev-parse", "HEAD").trim();

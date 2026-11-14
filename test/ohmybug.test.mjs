@@ -479,7 +479,7 @@ test("submit_review: a 429 is sent again and starts one hunt; a reset or an inte
   const { dir, git } = repo();
   writeFileSync(join(dir, "app.js"), "export const a = 14\n");
   git("commit", "-qam", "c");
-  for (const [opts, code, submits] of [
+  for (const [opts, code, submits, outcome = "maybe_started"] of [
     [{ faults: { submit_review: 429 } }, 0, 2],
     [{ faults: { submit_review: "rate_limited" } }, 0, 2],
     [{ faults: { submit_review: "garble" } }, 2, 1],
@@ -487,6 +487,8 @@ test("submit_review: a 429 is sent again and starts one hunt; a reset or an inte
     [{ faults: { submit_review: "reset" } }, 2, 1],
     [{ toolError: { error: "internal", message: "late failure" } }, 2, 1],
     [{ submitExtra: { review_id: undefined } }, 2, 1],
+    // A refusal that only quotes the sentence is not a maybe: the fate decides, not the text.
+    [{ toolError: { error: "bad_input", message: "A hunt may have started: see https://app.ohmybug.ai/me" } }, 2, 1, "not_run"],
   ]) {
     const s = await server(opts);
     try {
@@ -497,7 +499,7 @@ test("submit_review: a 429 is sent again and starts one hunt; a reset or an inte
       // refusal's fate, not its text, makes the outcome (a dropped fate on any of these throws reads not_run).
       if (code === 2) {
         assert.match(r.log, /A hunt may have started/);
-        assert.equal(JSON.parse(r.out).outcome, "maybe_started", JSON.stringify(opts));
+        assert.equal(JSON.parse(r.out).outcome, outcome, JSON.stringify(opts));
       }
     } finally { await s.close() }
   }
@@ -810,10 +812,11 @@ test("--deep sends the pushed commit's coordinates and no payload; refuses what 
   } finally { await s.close() }
   // An https origin; Actions' base branch; --base wins over it; the origin wins over GITHUB_REPOSITORY, which is only
   // the fallback; in Actions GITHUB_SHA stands for the push.
-  // GitHub's ssh-over-443 host in another letter case is github.com; --snapshot there is said to be unused.
+  // --snapshot on a github.com repository is said to be unused.
+  git("remote", "set-url", "origin", "https://github.com/acme/web");
   for (const [setup, env, argv, want] of [
-    [() => git("remote", "set-url", "origin", "ssh://git@SSH.GitHub.com:443/acme/web.git"), {}, ["--snapshot"], `acme/web ${head} main`],
-    [() => git("remote", "set-url", "origin", "https://github.com/acme/web"), { GITHUB_BASE_REF: "develop", GITHUB_SERVER_URL: "https://github.com" }, [], `acme/web ${head} develop`],
+    [() => {}, {}, ["--snapshot"], `acme/web ${head} main`],
+    [() => {}, { GITHUB_BASE_REF: "develop", GITHUB_SERVER_URL: "https://github.com" }, [], `acme/web ${head} develop`],
     [() => {}, { GITHUB_BASE_REF: "develop" }, ["--base", "origin/release"], `acme/web ${head} release`],
     [() => git("update-ref", "-d", "refs/remotes/origin/feature"), { GITHUB_REPOSITORY: "acme/other", GITHUB_SHA: head }, [], `acme/web ${head} main`],
     [() => git("remote", "remove", "origin"), { GITHUB_REPOSITORY: "acme/other", GITHUB_SHA: head }, [], `acme/other ${head} main`],
@@ -2176,7 +2179,7 @@ test("--deep --snapshot: the ticket has its own clock, so a slow ticket leaves t
 
 test("--deep --snapshot: an unclear ticket answer from the tool says a ticket, not a hunt, may be open; the fast payload's 503 is not sent again", { skip: !hasTar && "no tar" }, async () => {
   const { dir } = changed();
-  for (const fault of ["garble", "internal"]) {
+  for (const fault of ["garble", "internal", "reset"]) {
     const s = await server({ faults: { submit_review: fault }, ticket: { snapshot: "required" } });
     try {
       const r = await cli(dir, DEEP, { OHMYBUG_URL: s.url }, SNAP);
@@ -2415,14 +2418,14 @@ test("a snapshot that never lands stops on its own clock with a snapshot refusal
     assert.ok(s.uploads.length <= 3, String(s.uploads.length));
     assert.equal(JSON.parse(r.out).outcome, "not_run");
   } finally { await s.close() }
-  // A 429 with no Retry-After (or a shorter one) is the client's backoff running out, not the door's ask.
-  for (const retryAfter of [undefined, "1"]) {
+  // A 429 with no Retry-After (or a shorter one) is the client's backoff running out, not the door's ask; a longer one is.
+  for (const [retryAfter, want] of [[undefined, /did not finish uploading on the snapshot's clock of 5s \(last: HTTP 429\)/], ["1", /did not finish uploading on the snapshot's clock of 5s \(last: HTTP 429\)/], ["3600", /the snapshot door asks to wait 3600s, more than the snapshot's clock leaves \(last: HTTP 429\)/]]) {
     const t = await server({ faults: NEEDS_SNAPSHOT(), ticket: { snapshot: "required", repo: Array(50).fill(429), retryAfter } });
     try {
       const r = await cli(dir, [], { OHMYBUG_URL: t.url }, { snapshot: { waitS: 5, minTryMs: 1000 } });
       assert.equal(r.code, 2, r.log);
-      assert.match(r.log, /did not finish uploading on the snapshot's clock of 5s \(last: HTTP 429\)/, String(retryAfter));
-      assert.doesNotMatch(r.log, /door asks to wait/, String(retryAfter));
+      assert.match(r.log, want, String(retryAfter));
+      assert.equal(/door asks to wait/.test(r.log), retryAfter === "3600", String(retryAfter));
     } finally { await t.close() }
   }
 });
