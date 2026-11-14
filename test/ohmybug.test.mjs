@@ -40,7 +40,7 @@ function repo() {
  * file request's address; `huntMs` keeps wait_review running that long after its first call, each answer after up to 1 s; `submitExtra` adds fields to the submit answer; `requestedAgain` makes the second wait_review a second request at the same address.
  */
 async function server({ huntMs = 0, findings = [], status = "done", review_of_record = true, httpStatus = 200, requested, requestedAgain, sse = false, submitStatus, submitBody, toolError, faults = {}, filesStatus = 200, filesUrl, filesLocation, extra = {}, submitExtra = {}, ticket } = {}, port = 0) {
-  const calls = [], posted = [], uploads = [];
+  const calls = [], posted = [], uploads = [], deletes = [];
   let url, asks = 0, huntFrom;
   const srv = createServer((req, res) => {
     let body = "";
@@ -50,6 +50,16 @@ async function server({ huntMs = 0, findings = [], status = "done", review_of_re
       if (httpStatus !== 200) { res.writeHead(httpStatus); return res.end("no"); }
       // The upload doors: ticket.repo / ticket.payload answer with those statuses in turn ("reset" drops the socket),
       // 200 once the list is out; ticket.body overrides a door's answer text, ticket.delayMs delays the snapshot door's answer.
+      // DELETE <upload_url> (#3676): ticket.del answers with "retired" (200 {retired: true}), "hang" (never), "reset", or a
+      // status; 404 by default, as a server without the door.
+      if (req.url.startsWith("/u/") && req.method === "DELETE") {
+        deletes.push(req.url);
+        const d = ticket?.del ?? 404;
+        if (d === "hang") return;
+        if (d === "reset") return req.socket.destroy();
+        res.writeHead(d === "retired" ? 200 : d, { "content-type": "application/json" });
+        return res.end(JSON.stringify(d === "retired" ? { ok: true, retired: true, review_id: "rev_test" } : { error: "not found" }));
+      }
       if (req.url.startsWith("/u/")) {
         const door = /\/repo$/.test(req.url) ? "repo" : "payload";
         uploads.push({ door, path: req.url, type: req.headers["content-type"], body: Buffer.concat(chunks) });
@@ -59,7 +69,7 @@ async function server({ huntMs = 0, findings = [], status = "done", review_of_re
         const answer = ticket?.body?.[door] ?? JSON.stringify(st === 200
           ? (door === "payload" ? { ok: true, review_id: ticket?.payloadId ?? "rev_test", status: "running", live_url: "https://example.test/live/up", hunt_mode: "fast" } : { ok: true })
           : { error: `${door} refused: see https://app.ohmybug.ai/me/policy`, ...(st === 409 && door === "payload" ? { code: "snapshot_required" } : {}) });
-        const send = () => { res.writeHead(st, { "content-type": "application/json" }); res.end(answer); };
+        const send = () => { res.writeHead(st, { "content-type": "application/json", ...(st !== 200 && ticket?.retryAfter ? { "retry-after": ticket.retryAfter } : {}) }); res.end(answer); };
         return ticket?.delayMs && door === "repo" ? setTimeout(send, ticket.delayMs) : send();
       }
       if (req.url === "/files") {
@@ -110,7 +120,7 @@ async function server({ huntMs = 0, findings = [], status = "done", review_of_re
   srv.keepAliveTimeout = 60_000;
   await new Promise((r) => srv.listen(port, "127.0.0.1", r));
   url = `http://127.0.0.1:${srv.address().port}`;
-  return { url, calls, posted, uploads, close: () => new Promise((r) => { srv.close(r); srv.closeIdleConnections?.(); }) };
+  return { url, calls, posted, uploads, deletes, close: () => new Promise((r) => { srv.close(r); srv.closeIdleConnections?.(); }) };
 }
 
 async function cli(dir, argv, env, extra = {}) {
@@ -973,7 +983,7 @@ test("--format json: one object on stdout, the same exit code, every field prese
     assert.equal(r.code, 1);
     assert.equal(r.out.split("\n").length, 1, "one line");
     const j = JSON.parse(r.out);
-    assert.deepEqual(Object.keys(j), ["schema", "cli_version", "exit_code", "outcome", "review", "live_url", "live_url_missing", "billing", "silent_bill", "findings", "counts", "error"]);
+    assert.deepEqual(Object.keys(j), ["schema", "cli_version", "exit_code", "outcome", "review", "live_url", "live_url_missing", "billing", "silent_bill", "findings", "counts", "error", "upload_ticket"]);
     assert.equal(j.schema, "ohmybug-cli/result/1");
     assert.equal(j.cli_version, VERSION);
     assert.deepEqual([j.exit_code, j.outcome], [1, "blocking"]);
@@ -1935,7 +1945,7 @@ test("--deep off github.com: a deep ticket that does not ask for the snapshot is
   try {
     const r = await cli(dir, ["--deep", "--snapshot"], { OHMYBUG_URL: s.url }, SNAP);
     assert.equal(r.code, 2, r.log);
-    assert.match(r.log, /the deep upload ticket did not ask for the repository snapshot; nothing was sent and nothing started\. The deep upload ticket \(review rev_\w+\) was minted and holds a deep slot until it expires unused/);
+    assert.match(r.log, /the deep upload ticket did not ask for the repository snapshot; nothing was sent and nothing started\. The upload ticket \(review rev_test\) is still open/);
     assert.deepEqual(s.uploads, []);
     assert.deepEqual(s.calls.map((c) => c.name), ["submit_review"]);
   } finally { await s.close() }
@@ -1978,12 +1988,14 @@ test("--deep off github.com: the tree is packed before the ticket (a failed pack
     assert.match(r.log, /compressed.*nothing was sent and nothing started/);
     assert.equal(s.calls.length, 0);
   } finally { await s.close() }
-  // A deep ticket holds a slot from its mint: an unclear answer is not resent. Mutation: ask it with retries -> 2 calls.
+  // An open deep ticket counts against the account: an unclear answer is not resent. Mutation: ask it with retries -> 2 calls.
   s = await server({ faults: { submit_review: 503 }, ticket: { snapshot: "required" } });
   try {
-    const r = await cli(dir, ["--deep", "--snapshot"], { OHMYBUG_URL: s.url }, SNAP);
+    const r = await cli(dir, ["--deep", "--snapshot", "--format", "json"], { OHMYBUG_URL: s.url }, SNAP);
     assert.notEqual(r.code, 0, r.log);
-    assert.match(r.log, /A deep upload ticket may have been minted: it holds a deep slot/);
+    assert.deepEqual(JSON.parse(r.out).upload_ticket, { review_id: null, state: "unknown" });
+    assert.equal(s.deletes.length, 0);
+    assert.match(r.log, /A deep upload ticket may have been opened: if so, it counts as one running review/);
     assert.doesNotMatch(r.log, /A hunt may have started/);
     assert.equal(s.calls.filter((c) => c.name === "submit_review").length, 1);
     assert.deepEqual(s.uploads, []);
@@ -2007,16 +2019,107 @@ test("--deep off github.com is opt-in: without --snapshot or OHMYBUG_SNAPSHOT=on
   } finally { await s.close() }
 });
 
-test("--deep off github.com: a pack that leaves too little of the snapshot's clock stops before the ticket", { skip: !hasTar && "no tar" }, async () => {
+// The #3676 table: every stop after a deep ticket's answer names the ticket, retires it when no hunt can have started,
+// and says one of retired / open / gone. Each row: the server, the expected sentence and JSON, and how many DELETEs.
+const DEEP = ["--deep", "--snapshot", "--format", "json"];
+const RETIRED = /The upload ticket \(review rev_test\) was retired: nothing runs, nothing is charged/;
+const OPEN = /The upload ticket( \(review rev_test\))? is still open and could not be retired from here: it counts as one running review/;
+const GONE = /The upload ticket \(review rev_test\) is used or expired; this run started nothing on it/;
+test("--deep --snapshot: every stop after the ticket's answer retires or names the ticket (#3676 table)", { skip: !hasTar && "no tar" }, async () => {
+  const rows = [
+    // G3 (M1): the payload door refuses after the snapshot landed. Mutation: the catch ends before the payload.
+    ["payload 400, DELETE retires", { snapshot: "required", payload: [400], del: "retired" }, RETIRED, { review_id: "rev_test", state: "retired" }, 1],
+    // G3 on a server without DELETE (prod before #3670): any answer but 200 + retired is open.
+    ["payload 400, DELETE 404", { snapshot: "required", payload: [400] }, OPEN, { review_id: "rev_test", state: "open" }, 1],
+    ["payload 400, DELETE 200 without retired", { snapshot: "required", payload: [400], del: 200 }, OPEN, { review_id: "rev_test", state: "open" }, 1],
+    // D4: no snapshot ask. D3: no review id (retired, but named without an id).
+    ["no snapshot ask", { del: "retired" }, RETIRED, { review_id: "rev_test", state: "retired" }, 1],
+    ["no review id", { snapshot: "required", noId: true }, /The upload ticket is still open/, { review_id: null, state: "open" }, 1],
+    // E4: the snapshot door refuses. E5 and G4: a door says the ticket is gone, so no DELETE.
+    ["snapshot 413", { snapshot: "required", repo: [413], del: "retired" }, RETIRED, { review_id: "rev_test", state: "retired" }, 1],
+    ["snapshot 404", { snapshot: "required", repo: [404] }, GONE, { review_id: "rev_test", state: "gone" }, 0],
+    ["payload 410", { snapshot: "required", payload: [410] }, GONE, { review_id: "rev_test", state: "gone" }, 0],
+    // D2: an address on another host is never called, not even to retire it.
+    ["address on another host", { snapshot: "required", url: "https://elsewhere.example/u/tok" }, OPEN, { review_id: "rev_test", state: "open" }, 0],
+  ];
   const { dir } = changed();
-  const s = await server({ ticket: { snapshot: "required" } });
+  for (const [name, ticket, sentence, state, deletes] of rows) {
+    const s = await server({ findings: [high], ticket });
+    try {
+      const r = await cli(dir, DEEP, { OHMYBUG_URL: s.url }, SNAP);
+      assert.equal(r.code, 2, `${name}: ${r.log}`);
+      assert.match(r.log, sentence, name);
+      assert.equal(r.log.match(/The upload ticket/g).length, 1, `${name}: exactly one ticket sentence`);
+      assert.doesNotMatch(r.log, /deep slot/, name);
+      const j = JSON.parse(r.out);
+      assert.deepEqual([j.outcome, j.upload_ticket], ["not_run", state], name);
+      assert.equal(s.deletes.length, deletes, name);
+      if (deletes) assert.equal(s.deletes[0], "/u/tok-secret", name);
+    } finally { await s.close() }
+  }
+});
+
+test("--deep --snapshot: a retire that hangs costs one short try and leaves the ticket open", { skip: !hasTar && "no tar" }, async () => {
+  const { dir } = changed();
+  const s = await server({ ticket: { snapshot: "required", payload: [400], del: "hang" } });
   try {
-    // 5 s of clock against 20 s of ticket room plus two upload tries: refused after packing. Mutation: no check -> a ticket.
-    const r = await cli(dir, ["--deep", "--snapshot"], { OHMYBUG_URL: s.url }, { snapshot: { waitS: 5, minTryMs: 500, maxBytes: 1 << 20, maxUnpacked: 1 << 24 } });
+    const t0 = Date.now();
+    const r = await cli(dir, DEEP, { OHMYBUG_URL: s.url }, { snapshot: { ...SNAP.snapshot, retireMs: 300 } });
     assert.equal(r.code, 2, r.log);
-    assert.match(r.log, /packing the repository snapshot left too little of the snapshot's clock of 5s.*nothing was sent and nothing started/);
-    assert.doesNotMatch(r.log.trim().split("\n").at(-1), /OHMYBUG_TIMEOUT_S/);
-    assert.equal(s.calls.length, 0);
+    assert.match(r.log, OPEN);
+    assert.ok(Date.now() - t0 < 10_000);
+  } finally { await s.close() }
+});
+
+test("--deep --snapshot: a hunt that may have started is named, never retired; a 503 at capacity is sent again", { skip: !hasTar && "no tar" }, async () => {
+  const { dir } = changed();
+  // G7: a proxy's 502 or a reset at the payload: a hunt may run. Mutation: retire it, or call it "not started".
+  for (const payload of [[502], ["reset"]]) {
+    const s = await server({ ticket: { snapshot: "required", payload, del: "retired", body: payload[0] === 502 ? { payload: "<html>bad gateway</html>" } : undefined } });
+    try {
+      const r = await cli(dir, DEEP, { OHMYBUG_URL: s.url }, SNAP);
+      assert.equal(r.code, 2, r.log);
+      assert.match(r.log, /A hunt may have started: see https:\/\/app\.ohmybug\.ai\/me \(review rev_test\)/);
+      const j = JSON.parse(r.out);
+      assert.deepEqual([j.outcome, j.upload_ticket], ["maybe_started", { review_id: "rev_test", state: "unknown" }]);
+      assert.equal(s.deletes.length, 0);
+      assert.equal(s.uploads.filter((u) => u.door === "payload").length, 1);
+    } finally { await s.close() }
+  }
+  // G6: the service's own 503 (a JSON error: at capacity, the ticket stays valid): waited out and sent again.
+  const s = await server({ findings: [high], ticket: { snapshot: "required", payload: [503], retryAfter: "1" } });
+  try {
+    const r = await cli(dir, DEEP, { OHMYBUG_URL: s.url }, SNAP);
+    assert.equal(r.code, 1, r.log);
+    assert.equal(s.uploads.filter((u) => u.door === "payload").length, 2);
+    assert.equal(s.deletes.length, 0);
+    assert.equal(JSON.parse(r.out).upload_ticket, null);
+  } finally { await s.close() }
+});
+
+test("--deep --snapshot: the ticket has its own clock, so a slow ticket leaves the upload its whole time (M2)", { skip: !hasTar && "no tar" }, async () => {
+  const { dir } = changed();
+  // The ticket answers 429 first (a 2 s backoff). The snapshot door's clock of 2 s starts at its first try, so the
+  // upload still runs. Mutation: one clock over the ticket and the upload -> under minTryMs left, no upload.
+  const s = await server({ findings: [high], faults: { submit_review: 429 }, ticket: { snapshot: "required" } });
+  try {
+    const r = await cli(dir, DEEP, { OHMYBUG_URL: s.url }, { snapshot: { waitS: 2, minTryMs: 500, ticketS: 30 } });
+    assert.equal(r.code, 1, r.log);
+    assert.equal(s.calls.filter((c) => c.name === "submit_review").length, 2);
+    assert.deepEqual(s.uploads.map((u) => u.door), ["repo", "payload"]);
+  } finally { await s.close() }
+});
+
+test("the fast upload path never retires its ticket and keeps its texts", { skip: !hasTar && "no tar" }, async () => {
+  const { dir } = changed();
+  const s = await server({ faults: NEEDS_SNAPSHOT(), ticket: { snapshot: "required", payload: [400], del: "retired" } });
+  try {
+    const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url }, SNAP);
+    assert.equal(r.code, 2, r.log);
+    assert.match(r.log, /could not review: HTTP 400 payload refused: see https:\/\/app\.ohmybug\.ai\/me\/policy$/m);
+    assert.doesNotMatch(r.log, /upload ticket \(review/);
+    assert.equal(s.deletes.length, 0);
+    assert.equal(JSON.parse(r.out).upload_ticket, null);
   } finally { await s.close() }
 });
 
