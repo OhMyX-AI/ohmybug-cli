@@ -28,7 +28,8 @@ Usage:
 
 Without --uncommitted, a pushed HEAD of a github.com repository whose base is an origin branch (at the same commit as
 here) is read by the service from GitHub (public, or with the OhMyBug GitHub App installed), which runs the full fast
-hunt; otherwise, or when the service does not take it from GitHub, the diff is sent and reviewed without the repository.
+hunt; otherwise, or when the service does not take it from GitHub, the diff is sent without the repository. If the
+service then asks for the repository (snapshot_required), the reviewed tree goes too, as a tar.gz (see the README).
 
 The base is --base, else $CI_MERGE_REQUEST_TARGET_BRANCH_NAME (GitLab merge request pipelines),
 else origin/main. With --deep it is a branch name: --base, else $GITHUB_BASE_REF, else main.
@@ -464,7 +465,7 @@ export function deepTarget(opts, env, git) {
 const REPO_REFUSED = new Set(["diff_required", "repo_not_listed", "diff_fetch_failed", "empty_compare", "diff_too_large"]);
 
 /** One review, start to end. Returns the exit code; never calls process.exit itself (the tests drive it). */
-export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s + "\n"), log = (s) => process.stderr.write(`ohmybug: ${s}\n`), decisionWaitS = DECISION_WAIT_S, maxSnapshot = MAX_SNAPSHOT }) {
+export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s + "\n"), log = (s) => process.stderr.write(`ohmybug: ${s}\n`), decisionWaitS = DECISION_WAIT_S, maxSnapshot = MAX_SNAPSHOT, cutMs = 60_000 }) {
   const opts = parseArgs(argv);
   if (typeof opts === "string") { log(opts); log("see ohmybug --help"); return 2; }
   if (opts.help) { out(USAGE); return 0; }
@@ -473,7 +474,7 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
   if (!FORMATS.has(format)) { log(`OHMYBUG_FORMAT must be text, markdown or json, not ${env.OHMYBUG_FORMAT}`); return 2; }
   const rec = { deep: opts.deep };
   // The text lines go to stdout only in text; the other formats print the one result below.
-  const code = await review({ opts, env, cwd, out: format === "text" ? out : () => {}, log, rec, decisionWaitS, maxSnapshot });
+  const code = await review({ opts, env, cwd, out: format === "text" ? out : () => {}, log, rec, decisionWaitS, maxSnapshot, cutMs });
   const res = format === "text" && !opts.stepSummary ? null : resultOf(rec, code);
   if (format === "json") out(JSON.stringify(res));
   if (format === "markdown") out(resultMarkdown(res));
@@ -485,7 +486,7 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
   return code;
 }
 
-async function review({ opts, env, cwd, out, log, rec, decisionWaitS, maxSnapshot }) {
+async function review({ opts, env, cwd, out, log, rec, decisionWaitS, maxSnapshot, cutMs }) {
   if (!Number.isSafeInteger(decisionWaitS) || decisionWaitS < 1) throw new TypeError(`decisionWaitS must be a whole number of seconds, got ${decisionWaitS}`);
   // A run that stops before a hunt says why in the result too.
   const fail = (message) => { log(message); rec.error = { code: null, message }; return 2; };
@@ -519,30 +520,33 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, maxSnapsho
    * POST and return the body text, retrying network errors, 408, 429 and 5xx until the deadline; a host never reached
    * fails after four tries. With `once` (the call that starts a paid hunt) only failures that prove the server never
    * took the request are retried, and the request is not cut at 60 s (a multi-MB upload on a slow uplink takes longer)
-   * but at POLL_ROOM before the deadline, so a started hunt always gets polled. No redirect is followed: the body
-   * would go to wherever it points.
+   * but at POLL_ROOM before the deadline, so a started hunt always gets polled. `long` (a bulk upload that starts
+   * nothing) is not cut at 60 s either and is retried; it stops POLL_ROOM before the deadline. With `upload` (the
+   * upload doors) a refusal's JSON {error, code} is read: the error printed, capped and stripped, the code kept; and
+   * the statuses in `okRetry` count as success on a retry only (a 409 there is our own earlier try arriving). A 401/403
+   * is a refused key only on a call that sends one. No redirect is followed: the body would go to wherever it points.
    */
   let reached = false;
-  async function http(url, init, { once = false, long = false, okStatus = [] } = {}) {
+  async function http(url, init, { once = false, long = false, upload = false, okRetry = [] } = {}) {
     for (let attempt = 0; ; attempt++) {
       const left = deadline - Date.now();
       if (left <= 0) throw new Deadline("timed out");
       if (once && left <= POLL_ROOM) throw new Refusal("too little of OHMYBUG_TIMEOUT_S is left to start a hunt and wait for it; nothing was started");
+      if (long && left <= POLL_ROOM) throw new Refusal("the repository snapshot did not finish uploading within OHMYBUG_TIMEOUT_S; nothing was started");
       let why, retryAfter = 0;
       try {
         // A paid call or a bulk upload is not cut at 60 s: a multi-MB body on a slow uplink takes longer.
-        const res = await fetch(url, { ...init, redirect: "error", signal: AbortSignal.timeout(once || long ? Math.max(1000, left - POLL_ROOM) : Math.min(60_000, left)) });
+        const res = await fetch(url, { ...init, redirect: "error", signal: AbortSignal.timeout(once || long ? left - POLL_ROOM : Math.min(cutMs, left)) });
         reached = true;
         const text = await res.text();
-        if (res.ok || okStatus.includes(res.status)) return text;
+        if (res.ok || (attempt > 0 && okRetry.includes(res.status))) return text;
         if ((res.status === 401 || res.status === 403) && init.headers?.authorization) throw new Refusal(`the API key was refused, or the request blocked (HTTP ${res.status} ${text.slice(0, 200)})`);
         const retryable = res.status === 429 || (!once && (res.status === 408 || res.status >= 500));
         if (!retryable) {
-          // The upload doors answer {error, code}: the error is printed whole (it can carry a link), the code kept.
           let j = null;
-          try { j = JSON.parse(text); } catch {}
-          // Capped, and control characters dropped: it goes to a terminal and into the result as it is.
-          const said = typeof j?.error === "string" ? j.error.replace(/[\x00-\x1f\x7f]/g, " ").slice(0, 2000) : text.slice(0, 300);
+          if (upload) { try { j = JSON.parse(text); } catch {} }
+          // Capped, and control characters (C0, DEL, C1) dropped: it goes to a terminal and into the result as it is.
+          const said = typeof j?.error === "string" ? j.error.replace(/[\x00-\x1f\x7f-\x9f]/g, " ").slice(0, 2000) : text.slice(0, 300);
           throw new Refusal(`HTTP ${res.status} ${said}${once && res.status >= 500 ? `. ${MAYBE_STARTED}` : ""}`, typeof j?.code === "string" ? j.code : undefined);
         }
         why = `HTTP ${res.status}`;
@@ -676,13 +680,13 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, maxSnapsho
       // With the repository the service runs the full fast hunt; with the diff alone, a review without it.
       const target = opts.uncommitted ? { why: "--uncommitted reviews the working tree, which only this machine has" } : repoTarget(env, git, change.base, true);
       if (target.why) {
-        log(`reviewing the diff only, without the repository: ${target.why}`);
+        log(`sending the diff without the repository: ${target.why}`);
         args = payload();
       } else {
         log(`the service reads ${target.repo} at ${target.ref.slice(0, 12)} against ${target.base_branch} from GitHub`);
         args = fitBody({ diff: "", files: files(MAX_BYTES), meta: { ...meta, ...target } });
         fallback = (code) => {
-          log(`the service did not take the change from GitHub (${code}): reviewing the diff only, without the repository${code === "diff_required" ? "; the OhMyBug GitHub App installed on the repository (read-only) gives the full fast hunt" : ""}`);
+          log(`the service did not take the change from GitHub (${code}): sending the diff without the repository${code === "diff_required" ? "; the OhMyBug GitHub App installed on the repository (read-only) gives the full fast hunt" : ""}`);
           return payload();
         };
       }
@@ -691,21 +695,23 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, maxSnapsho
     /**
      * A diff sent alone that the service refuses with snapshot_required (an account not set to diff-only reviews) goes
      * again by upload: a ticket, the repository at the reviewed tree as a tar.gz, then the same diff and files. Nothing
-     * was started by the refusal. The snapshot is sent only on that refusal and never when the ticket says
-     * `snapshot: "off"`, so a diff-only account never uploads its repository.
+     * was started by the refusal. The snapshot is sent only on that refusal and only when the ticket says
+     * `snapshot: "required"`, so a diff-only account never uploads its repository.
      */
     const submit = async (a) => {
       try { return await tool("submit_review", { ...a, ...modeArg }, true); }
       catch (e) {
         if (!(e instanceof Refusal) || e.code !== "snapshot_required" || !a.diff) throw e;
         log("the service asks for the repository with this diff (snapshot_required): sending the review again by upload");
-        // Packed before a ticket is asked for: a snapshot that cannot go stops here, with nothing on the server. Attributes
-        // come from the empty tree, so export-ignore does not leave reviewed files out (GIT_ATTR_SOURCE; a git too old to read it applies them).
-        let tgz;
-        try { tgz = execGit(root, ["archive", "--format=tar.gz", change.rev], { GIT_ATTR_SOURCE: git("hash-object", "-t", "tree", "/dev/null").trim() }); }
-        catch (err) { throw new Refusal(`could not pack the repository snapshot (${err.code === "ENOBUFS" ? "over 256 MiB" : err.message}); nothing was started. ${e.message}`, e.code); }
-        if (tgz.length > maxSnapshot) throw new Refusal(`the repository snapshot is ${Math.ceil(tgz.length / 1048576)} MiB compressed, over the ${Math.floor(maxSnapshot / 1048576)} MiB the service takes; nothing was started. ${e.message}`, e.code);
-        const t = await tool("submit_review", { upload: true, ...(a.meta ? { meta: a.meta } : {}), ...modeArg }, true);
+        // Packed first: a snapshot that cannot go is known before anything is sent. It stops the run only if the ticket
+        // asks for one; a diff-only ticket takes the diff alone. `git archive` applies the tree's export-ignore.
+        let tgz = null, cannot = null;
+        try { tgz = execGit(root, ["-c", "core.autocrlf=false", "archive", "--format=tar.gz", change.rev]); }
+        catch (err) { cannot = `could not pack the repository snapshot (${err.code === "ENOBUFS" ? "over 256 MiB" : err.message})`; }
+        if (tgz && tgz.length > maxSnapshot) cannot = `the repository snapshot is ${Math.ceil(tgz.length / 1048576)} MiB compressed, over the ${Math.floor(maxSnapshot / 1048576)} MiB the service takes`;
+        // A ticket starts nothing: asked for with retries, on a fresh clock.
+        deadline = Date.now() + timeoutS * 1000;
+        const t = await tool("submit_review", { upload: true, ...(a.meta ? { meta: a.meta } : {}), ...modeArg });
         let url = null;
         if (typeof t.upload_url === "string") { try { url = new URL(t.upload_url, api); } catch {} }
         if (typeof t.review_id !== "string" || !url || url.origin !== apiUrl.origin) {
@@ -713,16 +719,18 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, maxSnapsho
         }
         // Only on a positive ask: a ticket that does not say "required" never gets the repository.
         if (t.snapshot === "required") {
+          if (cannot) throw new Refusal(`${cannot}; nothing was sent, and the upload ticket expires unused. The service said: ${e.message}`);
           log(`uploading the repository snapshot (${Math.ceil(tgz.length / 1024)} KiB)`);
           const door = new URL(url);
           door.pathname = `${door.pathname.replace(/\/$/, "")}/repo`;
-          // 409: this ticket already has its snapshot (an earlier try of this upload arrived).
-          await http(door.href, { method: "POST", headers: { "content-type": "application/gzip" }, body: tgz }, { okStatus: [409], long: true });
+          await http(door.href, { method: "POST", headers: { "content-type": "application/gzip" }, body: tgz }, { long: true, upload: true, okRetry: [409] });
         } else log("the upload ticket takes the diff only: the repository is not uploaded");
-        // The review starts on this body: sent once. No clear answer means it may have started, under this id.
-        try { await http(url.href, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ diff: a.diff, files: a.files ?? [] }) }, { once: true }); }
+        // The hunt starts on this body, so it gets its own clock, and the body is sent once.
+        deadline = Date.now() + timeoutS * 1000;
+        try { await http(url.href, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ diff: a.diff, files: a.files ?? [] }) }, { once: true, upload: true }); }
         catch (err) {
-          if (err instanceof Refusal && err.message.includes(MAYBE_STARTED)) { started = t; rec.reviewId = t.review_id; }
+          // No clear answer: name the review that may have started; the outcome stays an unconfirmed start.
+          if (err instanceof Refusal && err.message.includes(MAYBE_STARTED)) throw new Refusal(`${err.message} (review ${t.review_id})`, err.code);
           throw err;
         }
         return t;
