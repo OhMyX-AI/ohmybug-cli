@@ -11,7 +11,7 @@ import { Readable, Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createGzip } from "node:zlib";
 
-export const VERSION = "0.10.1";
+export const VERSION = "0.10.2";
 const USAGE = `ohmybug ${VERSION}: review this repository's changes with OhMyBug.
 
 Usage:
@@ -276,8 +276,11 @@ function byteReader(stream) {
 // Names that hold secrets, the service's own snapshot list (.env*, *secret*, *credential*, id_rsa* and the other SSH key
 // names, *.pem, *.key, *.p12, *.pfx, *.ppk, *.jks, *.keystore, *.tfstate*, *.tfvars*, .npmrc, .netrc, .pgpass, .pypirc,
 // .git-credentials, kubeconfig, .kube, .docker, .ssh, .aws, .gnupg): a file or folder of that name at any depth, in any
-// case, is never sent, whatever its content.
-const SECRET_FILE = /(^|\/)(\.env[^/]*|[^/]*(secret|credential)[^/]*|id_(rsa|dsa|ecdsa|ed25519)[^/]*|[^/]*\.(pem|key|p12|pfx|ppk|jks|keystore)|[^/]*\.(tfstate|tfvars)[^/]*|\.(npmrc|netrc|pgpass|pypirc|git-credentials|kube|docker|ssh|aws|gnupg)|kubeconfig)(\/|$)/i;
+// case, stays out of a snapshot, whatever its content. With a snapshot, the files sent beside it follow it too.
+const SNAPSHOT_SECRET = /(^|\/)(\.env[^/]*|[^/]*(secret|credential)[^/]*|id_(rsa|dsa|ecdsa|ed25519)[^/]*|[^/]*\.(pem|key|p12|pfx|ppk|jks|keystore)|[^/]*\.(tfstate|tfvars)[^/]*|\.(npmrc|netrc|pgpass|pypirc|git-credentials|kube|docker|ssh|aws|gnupg)|kubeconfig)(\/|$)/i;
+// Files named like secrets, never sent as files on a diff-only review (narrower, so a review keeps .env.example, public
+// keys and code named like secrets.ts as context).
+const SECRET_FILE = /(^|\/)(id_(rsa|dsa|ecdsa|ed25519)|[^/]+\.(pem|p12|pfx|key)|\.env(\.(?!example$|sample$|template$|dist$)[^/]+)?)$/i;
 
 /**
  * The reviewed tree as a tar.gz of the blobs git stores: read raw with `cat-file --batch`, so no checkout filter runs
@@ -306,7 +309,7 @@ export async function packTree(root, rev, { maxBytes, maxUnpacked, timeoutMs }) 
     const [mode, type, oid, size] = rec.subarray(0, tab).toString().trim().split(/\s+/);
     const path = rec.subarray(tab + 1);
     if (type !== "blob") { gitlinks++; continue; }
-    if (SECRET_FILE.test(path.toString())) { secrets++; continue; }
+    if (SNAPSHOT_SECRET.test(path.toString())) { secrets++; continue; }
     files.push({ mode, oid, size: Number(size), path });
     unpacked += (path.length > 100 ? tarEntry(path, 0o644, 0).length : 512) + Math.ceil(Number(size) / 512) * 512;
   }
@@ -884,7 +887,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
      */
     const submitByUpload = async (a) => {
       log("the service asks for the repository with this diff (snapshot_required): sending the review again by upload");
-      let t, url = null;
+      let t, url = null, files = a.files ?? [];
       await paused(snap.waitS * 1000, "the upload ticket and the repository snapshot", async () => {
         t = await tool("submit_review", { upload: true, ...(a.meta ? { meta: a.meta } : {}), ...modeArg });
         try { if (typeof t.upload_url === "string") url = new URL(t.upload_url, api); } catch {}
@@ -898,12 +901,16 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
         const tree = await packTree(root, change.rev, { ...snap, timeoutMs: deadline - Date.now() });
         if (tree.cannot) throw new Refusal(`${tree.cannot}; no snapshot was sent, nothing started, and the upload ticket expires unused`);
         log(`uploading the repository snapshot (${tree.files} file(s), ${Math.ceil(tree.tgz.length / 1024)} KiB${tree.gitlinks ? `; ${tree.gitlinks} submodule(s) left out` : ""}${tree.secrets ? `; ${tree.secrets} file(s) named like secrets, or in folders named like them, left out` : ""})`);
+        // From here the review holds a snapshot: the files beside it, sent now or on request, leave out what it leaves out.
+        const narrow = read;
+        read = (p) => (SNAPSHOT_SECRET.test(String(p).replace(/^\/+/, "")) ? null : narrow(p));
+        files = files.filter((f) => !SNAPSHOT_SECRET.test(f.path));
         const door = new URL(url);
         door.pathname = `${door.pathname.replace(/\/$/, "")}/repo`;
         await uploadSnapshot(door.href, tree.tgz);
       });
       let text;
-      try { text = await http(url.href, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ diff: a.diff, files: a.files ?? [] }) }, { once: true, door: true }); }
+      try { text = await http(url.href, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ diff: a.diff, files }) }, { once: true, door: true }); }
       catch (err) {
         if (err instanceof Refusal && err.message.includes(MAYBE_STARTED)) throw new Refusal(`${err.message} (review ${t.review_id})`, err.code);
         throw err;
