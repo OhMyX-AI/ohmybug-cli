@@ -2110,6 +2110,14 @@ test("--deep --snapshot: capacity waits have their own clock; one that outlasts 
     assert.match(r.log, /HTTP 503: the service asks to wait 15s, more than the deep payload's clock leaves; nothing was started\. The upload ticket \(review rev_test\) was retired/);
     assert.deepEqual(JSON.parse(r.out).upload_ticket, { review_id: "rev_test", state: "retired" });
   } finally { await s.close() }
+  // The payload's clock keeps minTryMs for the send, not the hunt's polling reserve: 22 s of it fit a 3 s wait.
+  // Mutation: the polling reserve (20 s) on this clock -> refused before the resend.
+  s = await server({ findings: [high], ticket: { snapshot: "required", payload: [503], retryAfter: "3" } });
+  try {
+    const r = await cli(dir, DEEP, { OHMYBUG_URL: s.url }, { snapshot: { ...SNAP.snapshot, busyS: 22 } });
+    assert.equal(r.code, 1, r.log);
+    assert.equal(s.uploads.filter((u) => u.door === "payload").length, 2);
+  } finally { await s.close() }
   // A capacity wait does not come off the hunt's wait: with OHMYBUG_TIMEOUT_S at 30 s (POLL_ROOM 20 s) and a 12 s
   // wait, the hunt still starts and is followed. Mutation: the payload on the hunt's clock -> refused before the resend.
   s = await server({ findings: [high], ticket: { snapshot: "required", payload: [503], retryAfter: "12" } });
@@ -2122,14 +2130,37 @@ test("--deep --snapshot: capacity waits have their own clock; one that outlasts 
 
 test("--deep --snapshot: the ticket has its own clock, so a slow ticket leaves the upload its whole time (M2)", { skip: !hasTar && "no tar" }, async () => {
   const { dir } = changed();
-  // The ticket answers 429 first (a 2 s backoff). The snapshot door's clock of 4 s starts at its first try, so the
-  // upload still runs. Mutation: one clock over the ticket and the upload -> under minTryMs left, no upload.
-  const s = await server({ findings: [high], faults: { submit_review: 429 }, ticket: { snapshot: "required" } });
+  // The ticket answers 429 twice (2 s, then 4 s of backoff: more than the 3 s the snapshot door gets). The door's clock
+  // starts at its first try, so the upload still runs. Mutation: one clock over the ticket and the upload -> refused.
+  const s = await server({ findings: [high], faults: { submit_review: [429, 429] }, ticket: { snapshot: "required" } });
   try {
-    const r = await cli(dir, DEEP, { OHMYBUG_URL: s.url }, { snapshot: { waitS: 4, minTryMs: 500, ticketS: 30 } });
+    const r = await cli(dir, DEEP, { OHMYBUG_URL: s.url }, { snapshot: { waitS: 3, minTryMs: 500, ticketS: 30 } });
     assert.equal(r.code, 1, r.log);
-    assert.equal(s.calls.filter((c) => c.name === "submit_review").length, 2);
+    assert.equal(s.calls.filter((c) => c.name === "submit_review").length, 3);
     assert.deepEqual(s.uploads.map((u) => u.door), ["repo", "payload"]);
+  } finally { await s.close() }
+});
+
+test("--deep --snapshot: an unclear ticket answer from the tool says a ticket, not a hunt, may be open; the fast payload's 503 is not sent again", { skip: !hasTar && "no tar" }, async () => {
+  const { dir } = changed();
+  for (const fault of ["garble", "internal"]) {
+    const s = await server({ faults: { submit_review: fault }, ticket: { snapshot: "required" } });
+    try {
+      const r = await cli(dir, DEEP, { OHMYBUG_URL: s.url }, SNAP);
+      assert.equal(r.code, 2, r.log);
+      assert.match(r.log, /A deep upload ticket may have been opened/, fault);
+      assert.doesNotMatch(r.log, /A hunt may have started/, fault);
+      assert.deepEqual([JSON.parse(r.out).outcome, JSON.parse(r.out).upload_ticket], ["not_run", { review_id: null, state: "unknown" }], fault);
+      assert.equal(s.calls.filter((c) => c.name === "submit_review").length, 1, fault);
+    } finally { await s.close() }
+  }
+  // busy503 is the deep payload's only: a fast payload's 503 (even with a JSON error) may have started a hunt.
+  const s = await server({ faults: NEEDS_SNAPSHOT(), ticket: { snapshot: "required", payload: [503], retryAfter: "1" } });
+  try {
+    const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url }, SNAP);
+    assert.equal(r.code, 2, r.log);
+    assert.equal(s.uploads.filter((u) => u.door === "payload").length, 1);
+    assert.equal(JSON.parse(r.out).outcome, "maybe_started");
   } finally { await s.close() }
 });
 
