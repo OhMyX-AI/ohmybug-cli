@@ -31,7 +31,8 @@ ohmybug                  # review <base>...HEAD: the commits of this branch
 ohmybug --base develop   # the same against another base
 ohmybug --uncommitted    # review the working tree against HEAD, untracked files included (not ignored ones)
 ohmybug --mode lite      # a lite hunt of the pushed HEAD (see Hunt modes)
-ohmybug --deep           # the deep hunt of the pushed HEAD (GitHub, public or with the OhMyBug App): the service reads the whole repository; up to 2 hours
+ohmybug --deep           # the deep hunt of HEAD: on GitHub (public or with the OhMyBug App) the service reads the pushed commit; up to 2 hours
+ohmybug --deep --snapshot  # the deep hunt of HEAD in a repository off github.com: a snapshot of it is uploaded (opt-in)
 ```
 
 The base is `--base`, else `$CI_MERGE_REQUEST_TARGET_BRANCH_NAME` (GitLab merge request pipelines), else `origin/main`. The CI clone must contain the base: fetch it, or clone with enough depth.
@@ -47,12 +48,12 @@ The CLI prints each finding (severity, file:line, title, failure scenario) and a
 | Variable | Default | |
 |---|---|---|
 | `OHMYBUG_API_KEY` | required | your key |
-| `OHMYBUG_TIMEOUT_S` | `1800` (`10800` with `--deep`) | how long to wait for each review, 30 to 86400 seconds. The service may run a quick first step and continue it with the fast hunt: then the first step and the fast hunt each get this wait, and the service's decision between them up to 27 minutes (or this value, if longer). Give a CI job three times this value, or twice it plus 30 minutes if that is longer, plus 15 minutes when the run uploads a repository snapshot, plus the time to clone and install: the GitLab and Bitbucket jobs below allow two hours, enough at the default. The service never continues `--deep` |
+| `OHMYBUG_TIMEOUT_S` | `1800` (`10800` with `--deep`) | how long to wait for each review, 30 to 86400 seconds. The service may run a quick first step and continue it with the fast hunt: then the first step and the fast hunt each get this wait, and the service's decision between them up to 27 minutes (or this value, if longer). Give a CI job three times this value, or twice it plus 30 minutes if that is longer, plus 15 minutes when the run uploads a repository snapshot (50 with `--deep --snapshot`), plus the time to clone and install: the GitLab and Bitbucket jobs below allow two hours, enough at the default; a job that runs `--deep` needs about four hours (`timeout: 4h`, `max-time: 240`): three hours of wait, up to 50 minutes for the snapshot, and the clone and install. The service never continues `--deep` |
 | `OHMYBUG_URL` | `https://mcp.ohmybug.ai` | the service |
 | `OHMYBUG_STORY` | `auto` | the `--story` value when the flag is not given |
 | `OHMYBUG_FORMAT` | `text` | the `--format` value when the flag is not given |
 | `OHMYBUG_MODE` | none | the `--mode` value when the flag is not given; not used with `--deep` |
-| `OHMYBUG_SNAPSHOT` | none | `off`: never upload a repository snapshot; a run the service asks for one stops instead (below) |
+| `OHMYBUG_SNAPSHOT` | none | `off`: never upload a repository snapshot; a run the service asks for one stops instead (below). `on`: the same as `--snapshot` for `--deep` off github.com; a fast hunt does not read it |
 
 ## Output for scripts and CI summaries
 
@@ -84,6 +85,7 @@ exit $code
 | `findings` | most severe first, each `{id, severity, blocking, file, line, title, body, suggested_fix}`; `severity` one of `critical`, `high`, `medium`, `low` (P0-P3 map to them) or `unrated` for none or one this CLI does not know; `blocking` is medium or worse or unrated; `body` is the failure scenario |
 | `counts` | `{total, blocking, critical, high, medium, low, unrated}` |
 | `error` | null, or `{code, message}` when the run stopped without a result or the review failed: `code` is the service's error code when it refused, else null |
+| `upload_ticket` | null, or `{review_id, state}` when a `--deep --snapshot` run stopped after asking for its upload ticket: `state` is `retired` (the run retired it), `open` (it could not; the ticket counts as a running review on the account until it expires, and nothing runs on it), `gone` (used or expired) or `unknown` (the ticket's answer, or the start of the hunt, was not clear); `review_id` is null when the ticket named none |
 
 Within `ohmybug-cli/result/1`, fields and values are only added, never renamed, removed or retyped: ignore fields you do not know, and treat an `outcome` you do not know by `exit_code`. A breaking change gets a new schema name.
 
@@ -144,7 +146,7 @@ pipelines:
 
 ## What is sent
 
-With `--deep`, no code is sent: only the GitHub repository name (from the origin remote, else `$GITHUB_REPOSITORY`), the HEAD commit, the base branch and the branch name; the service reads the repository from GitHub (public, or with the OhMyBug App installed).
+With `--deep` on a GitHub repository, no code is sent: only the GitHub repository name (from the origin remote, else `$GITHUB_REPOSITORY`), the HEAD commit, the base branch and the branch name; the service reads the repository from GitHub (public, or with the OhMyBug App installed); a HEAD that is not pushed there is refused. With `--deep` on a repository that is not on github.com (no github.com origin and no `$GITHUB_REPOSITORY`, or `$GITHUB_SERVER_URL` names another host: GitLab, Bitbucket, a local repository), the deep hunt runs only when you opt in with `--snapshot` (or `OHMYBUG_SNAPSHOT=on`); without it the run refuses, names the flag and sends nothing. With it the deep hunt runs over a snapshot: the run asks for a deep upload ticket, uploads a snapshot of the HEAD commit exactly as described below for the fast hunt's snapshot (files named like secrets left out), then sends the diff against the base (`--base`, else `$GITHUB_BASE_REF`, else the merge request's target branch, else `origin/main`; in a clone without an origin, pass `--base`) and up to 29 related files, less those the snapshot leaves out. The snapshot is packed before the ticket is asked for, and the packing (up to 15 minutes), the ticket (2 minutes), the snapshot upload (up to 15 minutes) and the diff upload (up to 15 minutes, while the service's deep hunts are at capacity: it asks the run to send the diff again later) each have their own time, while the review's own wait is paused. Until the diff is uploaded, an open deep ticket starts nothing and is never charged, but counts as one running review on the account: a run that stops after the ticket retires it when no hunt can have started, and otherwise names its review (the JSON result carries it as `upload_ticket`). A ticket a run could not retire expires on its own. An account set to diff-only reviews gets no deep hunt off github.com: the deep ticket must ask for the snapshot, and the run stops when it does not. The repository name and the commit are not sent. `OHMYBUG_SNAPSHOT=off` stops such a run before anything is sent.
 
 Without `--deep` and `--uncommitted`, when HEAD is pushed to a github.com repository (the origin remote, else `$GITHUB_REPOSITORY`) and the base is an origin branch at the same commit as here, the diff is left out: the repository name, the HEAD commit and the base branch go instead, and the service reads the change from GitHub and runs its full fast hunt. If the service does not take the change from GitHub (it cannot read the repository: a private one without the OhMyBug App installed, or one off the key's repository list; or the compare fails, is empty or is too large), the run says so and sends the same review again with the diff, without the rest of the repository unless the service then asks for it (below); with `--mode lite` or `snap` it stops there instead, since those modes need the repository. Otherwise the diff is sent, and the run says why.
 
