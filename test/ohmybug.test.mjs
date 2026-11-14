@@ -2032,7 +2032,7 @@ test("--deep --snapshot: every stop after the ticket's answer retires or names t
     // G3 on a server without DELETE (prod before #3670): any answer but 200 + retired is open.
     ["payload 400, DELETE 404", { snapshot: "required", payload: [400] }, OPEN, { review_id: "rev_test", state: "open" }, 1],
     ["payload 400, DELETE 200 without retired", { snapshot: "required", payload: [400], del: 200 }, OPEN, { review_id: "rev_test", state: "open" }, 1],
-    // D4: no snapshot ask. D3: no review id (retired, but named without an id).
+    // D4: no snapshot ask. D3: no review id (DELETE tried; open here, named without an id).
     ["no snapshot ask", { del: "retired" }, RETIRED, { review_id: "rev_test", state: "retired" }, 1],
     ["no review id", { snapshot: "required", noId: true }, /The upload ticket is still open/, { review_id: null, state: "open" }, 1],
     // E4: the snapshot door refuses. E5 and G4: a door says the ticket is gone, so no DELETE.
@@ -2067,15 +2067,18 @@ test("--deep --snapshot: a retire that hangs costs one short try and leaves the 
     const r = await cli(dir, DEEP, { OHMYBUG_URL: s.url }, { snapshot: { ...SNAP.snapshot, retireMs: 300 } });
     assert.equal(r.code, 2, r.log);
     assert.match(r.log, OPEN);
-    assert.ok(Date.now() - t0 < 10_000);
+    assert.equal(s.deletes.length, 1);
+    assert.match(r.log, /the upload ticket was not retired \(/);
+    assert.ok(Date.now() - t0 < 5_000);
   } finally { await s.close() }
 });
 
 test("--deep --snapshot: a hunt that may have started is named, never retired; a 503 at capacity is sent again", { skip: !hasTar && "no tar" }, async () => {
   const { dir } = changed();
   // G7: a proxy's 502 or a reset at the payload: a hunt may run. Mutation: retire it, or call it "not started".
-  for (const payload of [[502], ["reset"]]) {
-    const s = await server({ ticket: { snapshot: "required", payload, del: "retired", body: payload[0] === 502 ? { payload: "<html>bad gateway</html>" } : undefined } });
+  // A proxy's 503 (no JSON error) is not the service's "at capacity": not sent again. Mutation: any 503 is busy.
+  for (const payload of [[502], [503], ["reset"]]) {
+    const s = await server({ ticket: { snapshot: "required", payload, del: "retired", body: payload[0] !== "reset" ? { payload: "<html>bad gateway</html>" } : undefined } });
     try {
       const r = await cli(dir, DEEP, { OHMYBUG_URL: s.url }, SNAP);
       assert.equal(r.code, 2, r.log);
@@ -2097,13 +2100,33 @@ test("--deep --snapshot: a hunt that may have started is named, never retired; a
   } finally { await s.close() }
 });
 
+test("--deep --snapshot: capacity waits have their own clock; one that outlasts it retires the ticket", { skip: !hasTar && "no tar" }, async () => {
+  const { dir } = changed();
+  // The service asks for 15 s; the payload's clock of 30 s keeps 20 s for the start: stop before the wait, retire.
+  let s = await server({ ticket: { snapshot: "required", payload: [503, 503], retryAfter: "15", del: "retired" } });
+  try {
+    const r = await cli(dir, DEEP, { OHMYBUG_URL: s.url }, { snapshot: { ...SNAP.snapshot, busyS: 30 } });
+    assert.equal(r.code, 2, r.log);
+    assert.match(r.log, /HTTP 503: the service asks to wait 15s, more than the deep payload's clock leaves; nothing was started\. The upload ticket \(review rev_test\) was retired/);
+    assert.deepEqual(JSON.parse(r.out).upload_ticket, { review_id: "rev_test", state: "retired" });
+  } finally { await s.close() }
+  // A capacity wait does not come off the hunt's wait: with OHMYBUG_TIMEOUT_S at 30 s (POLL_ROOM 20 s) and a 12 s
+  // wait, the hunt still starts and is followed. Mutation: the payload on the hunt's clock -> refused before the resend.
+  s = await server({ findings: [high], ticket: { snapshot: "required", payload: [503], retryAfter: "12" } });
+  try {
+    const r = await cli(dir, DEEP, { OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: "30" }, { snapshot: { waitS: 60, minTryMs: 500 } });
+    assert.equal(r.code, 1, r.log);
+    assert.equal(s.uploads.filter((u) => u.door === "payload").length, 2);
+  } finally { await s.close() }
+});
+
 test("--deep --snapshot: the ticket has its own clock, so a slow ticket leaves the upload its whole time (M2)", { skip: !hasTar && "no tar" }, async () => {
   const { dir } = changed();
-  // The ticket answers 429 first (a 2 s backoff). The snapshot door's clock of 2 s starts at its first try, so the
+  // The ticket answers 429 first (a 2 s backoff). The snapshot door's clock of 4 s starts at its first try, so the
   // upload still runs. Mutation: one clock over the ticket and the upload -> under minTryMs left, no upload.
   const s = await server({ findings: [high], faults: { submit_review: 429 }, ticket: { snapshot: "required" } });
   try {
-    const r = await cli(dir, DEEP, { OHMYBUG_URL: s.url }, { snapshot: { waitS: 2, minTryMs: 500, ticketS: 30 } });
+    const r = await cli(dir, DEEP, { OHMYBUG_URL: s.url }, { snapshot: { waitS: 4, minTryMs: 500, ticketS: 30 } });
     assert.equal(r.code, 1, r.log);
     assert.equal(s.calls.filter((c) => c.name === "submit_review").length, 2);
     assert.deepEqual(s.uploads.map((u) => u.door), ["repo", "payload"]);

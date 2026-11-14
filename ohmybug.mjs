@@ -46,7 +46,7 @@ Environment:
                       service may run a quick first step and continue it with the fast hunt: then the first step and
                       the fast hunt each get this wait, and the service's decision between them up to 27 minutes (or
                       this value, if longer). Give a CI job three times this value, or twice it plus 30 minutes if that
-                      is longer, plus 15 minutes when the run uploads a repository snapshot (35 with --deep --snapshot), plus the time to clone
+                      is longer, plus 15 minutes when the run uploads a repository snapshot (50 with --deep --snapshot), plus the time to clone
                       and install. The service never continues --deep
   OHMYBUG_STORY       the --story value when the flag is not given
   OHMYBUG_FORMAT      the --format value when the flag is not given
@@ -81,8 +81,9 @@ const MAX_FILES = 30, MAX_EXTRA = 20, MAX_BYTES = 9 * 1024 * 1024, MAX_BODY = 11
 const MAX_TREE = 1024 * 1024;
 // A repository snapshot: 128 MiB compressed and 1 GiB unpacked at most (the service's caps), uploaded on its own clock
 // (the hunt's is paused meanwhile), no try started with under 30 s of it left. A deep run gives the pack, the ticket
-// (ticketS) and the upload a clock each, and retires a ticket it cannot use in one try of retireMs.
-const SNAPSHOT = { waitS: 900, maxBytes: 128 * 1024 * 1024, maxUnpacked: 1024 * 1024 * 1024, minTryMs: 30_000, ticketS: 120, retireMs: 10_000 };
+// (ticketS), the upload and the diff upload (busyS, the waits while deep hunts are at capacity) a clock each, and
+// retires a ticket it cannot use in one try of retireMs.
+const SNAPSHOT = { waitS: 900, maxBytes: 128 * 1024 * 1024, maxUnpacked: 1024 * 1024 * 1024, minTryMs: 30_000, ticketS: 120, busyS: 900, retireMs: 10_000 };
 // Failures before any byte reached a server: safe to send again, even a call that starts a hunt.
 const UNREACHABLE = new Set(["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH", "UND_ERR_CONNECT_TIMEOUT"]);
 // Text from the service on its way to a terminal and the result: control characters (C0, DEL, C1) dropped, capped.
@@ -716,13 +717,13 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
    * cleaned. No redirect is followed: the body would go to wherever it points.
    */
   let reached = false;
-  // `ctx` names the clock and the risk of a once call: a hunt's start by default, a deep upload ticket on the snapshot's clock.
+  // `ctx` names the clock and the risk of a once call: a hunt's start by default; a deep upload ticket, or a deep payload, on its own clock.
   async function http(url, init, { once = false, door = false, ctx = {}, busy503 = false } = {}) {
-    const { clock = "OHMYBUG_TIMEOUT_S", maybe = MAYBE_STARTED, act = "start a hunt", second = "start a second hunt" } = ctx;
+    const { clock = "OHMYBUG_TIMEOUT_S", maybe = MAYBE_STARTED, act = "start a hunt and wait for it", second = "start a second hunt" } = ctx;
     for (let attempt = 0; ; attempt++) {
       const left = deadline - Date.now();
       if (left <= 0) throw new Deadline("timed out");
-      if (once && left <= POLL_ROOM) throw new Refusal(`too little of ${clock} is left to ${act} and wait for it; nothing was started`);
+      if (once && left <= POLL_ROOM) throw new Refusal(`too little of ${clock} is left to ${act}; nothing was started`);
       let why, retryAfter = 0;
       try {
         const res = await fetch(url, { ...init, redirect: "error", signal: AbortSignal.timeout(once ? left - POLL_ROOM : Math.min(60_000, left)) });
@@ -820,8 +821,12 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
   async function retire(u) {
     try {
       const res = await fetch(u, { method: "DELETE", redirect: "error", signal: AbortSignal.timeout(snap.retireMs) });
-      return res.status === 200 && (await res.json()).retired === true;
-    } catch { return false; }
+      const text = await res.text();
+      let retired = false;
+      try { retired = res.status === 200 && JSON.parse(text).retired === true; } catch {}
+      if (!retired) log(`the upload ticket was not retired (HTTP ${res.status}${res.status === 200 ? "" : ` ${clean(text, 120)}`})`);
+      return retired;
+    } catch (e) { log(`the upload ticket was not retired (${clean(e.cause?.code ?? e.cause?.message ?? e.message, 80)})`); return false; }
   }
 
   let rpcId = 0;
@@ -1002,7 +1007,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
       const sendPayload = async () => {
         let text;
         // A deep payload the service refuses as at capacity (a 503 with its own error) keeps its ticket: sent again.
-        try { text = await http(url.href, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ diff: a.diff, files }) }, { once: true, door: true, busy503: deep }); }
+        try { text = await http(url.href, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ diff: a.diff, files }) }, { once: true, door: true, busy503: deep, ...(deep ? { ctx: { clock: "the deep payload's clock" } } : {}) }); }
         catch (err) {
           if (err instanceof Refusal && err.message.includes(MAYBE_STARTED)) throw new Refusal(`${err.message} (review ${t.review_id})`, err.code);
           throw err;
@@ -1035,10 +1040,11 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
       try {
         readTicket();
         await paused(snap.waitS * 1000, "the repository snapshot", sendSnapshot);
-        return await sendPayload();
+        // On its own clock too: waits while the service's deep hunts are at capacity never shorten the hunt's own wait.
+        return await paused(snap.busyS * 1000, "the deep payload", sendPayload);
       } catch (e) {
-        if (!(e instanceof Refusal || e instanceof Deadline)) throw e;
-        const message = e instanceof Deadline ? "OHMYBUG_TIMEOUT_S ran out before the hunt was started; nothing was started" : e.message;
+        if (!(e instanceof Refusal)) throw e;
+        const message = e.message;
         // A hunt may run: the ticket is not retired (that would not stop it), and the message already names it.
         if (message.includes(MAYBE_STARTED)) { rec.ticket = { review_id: ticketId, state: "unknown" }; throw e; }
         const state = e.status === 404 || e.status === 410 ? "gone" : url && await retire(url) ? "retired" : "open";
