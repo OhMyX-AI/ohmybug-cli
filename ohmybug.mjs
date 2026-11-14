@@ -17,9 +17,9 @@ const USAGE = `ohmybug ${VERSION}: review this repository's changes with OhMyBug
 Usage:
   ohmybug [--base <ref>]     review <base>...HEAD (the committed changes of this branch)
   ohmybug --uncommitted      review the working tree against HEAD, untracked files included
-  ohmybug --deep [--base <branch>]  the deep hunt of the HEAD commit: on github.com the service reads the pushed
-                             commit; elsewhere this machine uploads a snapshot of it; up to 2 hours, so
-                             OHMYBUG_TIMEOUT_S defaults to 10800
+  ohmybug --deep [--base <branch>] [--snapshot]  the deep hunt of the HEAD commit: on github.com the service reads
+                             the pushed commit; elsewhere it runs only with --snapshot (or OHMYBUG_SNAPSHOT=on), which
+                             lets this machine upload a snapshot of it; up to 2 hours, so OHMYBUG_TIMEOUT_S defaults to 10800
   --format text|markdown|json  what goes to stdout: text (default, for people), markdown (a block for a CI summary)
                              or json (one object, schema ohmybug-cli/result/1, for scripts); once the arguments are read, json
                              and markdown are printed on every exit, and progress stays on stderr
@@ -51,7 +51,8 @@ Environment:
   OHMYBUG_STORY       the --story value when the flag is not given
   OHMYBUG_FORMAT      the --format value when the flag is not given
   OHMYBUG_MODE        the --mode value when the flag is not given (not used with --deep)
-  OHMYBUG_SNAPSHOT    off: never upload a repository snapshot; a run the service asks for one stops instead
+  OHMYBUG_SNAPSHOT    off: never upload a repository snapshot; a run the service asks for one stops instead.
+                      on: the same as --snapshot for --deep off github.com (a fast hunt does not read it)
 
 Behind a proxy: Node's fetch reads HTTPS_PROXY only with NODE_USE_ENV_PROXY=1 (Node 22.21+, 24+).
 
@@ -64,6 +65,9 @@ const rankOf = (f) => RANK[String(f?.severity).toLowerCase()] ?? 4;
 // A gate fails closed: a severity it does not know blocks.
 const isBlocking = (f) => rankOf(f) !== 3;
 const MAYBE_STARTED = "A hunt may have started: see https://app.ohmybug.ai/me";
+// A deep upload ticket starts no hunt and is never charged, but holds a deep slot from its mint until it expires.
+const TICKET_MAYBE = "A deep upload ticket may have been minted: it holds a deep slot until it expires unused, and nothing runs or is charged on it; see https://app.ohmybug.ai/me";
+const slotHeld = (id) => `The deep upload ticket${id ? ` (review ${id})` : ""} was minted and holds a deep slot until it expires unused; nothing runs or is charged on it`;
 // Time kept after the paid call for at least one poll and get_findings.
 const POLL_ROOM = 20_000;
 // Server caps: 30 files and about 10 MiB of diff and files per call; 20 files per answer to a file request.
@@ -118,6 +122,7 @@ export function parseArgs(argv) {
     const a = argv[i];
     if (a === "--uncommitted") o.uncommitted = true;
     else if (a === "--deep") o.deep = true;
+    else if (a === "--snapshot") o.snapshot = true;
     else if (a === "--help" || a === "-h") o.help = true;
     else if (a === "--version") o.version = true;
     else if (a === "--base") { if (!argv[i + 1] || argv[i + 1].startsWith("-")) return "--base needs a ref"; o.base = argv[++i]; }
@@ -143,6 +148,7 @@ export function parseArgs(argv) {
   if (o.uncommitted && o.base) return "--uncommitted and --base do not go together";
   if (o.mode && o.deep) return "--mode picks a fast hunt's mode; --deep is its own hunt: use one of them";
   if (o.uncommitted && REPO_MODES.has(o.mode)) return `--mode ${o.mode} reads the repository, which --uncommitted cannot send: commit and push, or use --mode fast`;
+  if (o.snapshot && !o.deep) return "--snapshot goes with --deep: it lets a deep hunt of a repository off github.com upload a snapshot of it";
   if (o.uncommitted && o.deep) return "--deep reviews a commit, not the working tree: commit (and push, on GitHub) and run ohmybug --deep";
   return o;
 }
@@ -627,11 +633,11 @@ export function deepSnapshotBase(opts, env, git) {
 }
 
 /** The deep hunt's target: repoTarget with the base --base, else $GITHUB_BASE_REF, else main. A repository off
- *  github.com is `{ offGithub: true }`: its deep hunt runs over a snapshot this machine uploads. Any other gap (a GitHub
+ *  github.com is `{ offGithub: true, why }`: its deep hunt runs over a snapshot this machine uploads. Any other gap (a GitHub
  *  repository whose HEAD is not pushed, a base that is not a branch) is a refusal. */
 export function deepTarget(opts, env, git) {
   const t = repoTarget(env, git, opts.base || env.GITHUB_BASE_REF || "main");
-  if (t.offGithub) return { offGithub: true };
+  if (t.offGithub) return { offGithub: true, why: t.why };
   if (t.why) throw new Refusal(`--deep cannot run: ${t.why}`);
   return t;
 }
@@ -668,7 +674,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
   if (!env.OHMYBUG_API_KEY) return fail("OHMYBUG_API_KEY is not set: create a key at https://app.ohmybug.ai/me");
   // Under 30 s no poll fits before the deadline: refused before a paid hunt starts.
   const story = opts.story ?? (env.OHMYBUG_STORY || "auto");
-  if (![undefined, "", "off"].includes(env.OHMYBUG_SNAPSHOT)) return fail(`OHMYBUG_SNAPSHOT must be off or unset, not ${env.OHMYBUG_SNAPSHOT}`);
+  if (![undefined, "", "off", "on"].includes(env.OHMYBUG_SNAPSHOT)) return fail(`OHMYBUG_SNAPSHOT must be off, on or unset, not ${env.OHMYBUG_SNAPSHOT}`);
   if (!STORY.has(story)) return fail(`OHMYBUG_STORY must be auto, private or never, not ${env.OHMYBUG_STORY}`);
   // Sent only to narrow: an absent meta.story is the account's and key's settings alone.
   const storyMeta = story === "auto" ? {} : { story };
@@ -701,11 +707,13 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
    * cleaned. No redirect is followed: the body would go to wherever it points.
    */
   let reached = false;
-  async function http(url, init, { once = false, door = false } = {}) {
+  // `ctx` names the clock and the risk of a once call: a hunt's start by default, a deep upload ticket on the snapshot's clock.
+  async function http(url, init, { once = false, door = false, ctx = {} } = {}) {
+    const { clock = "OHMYBUG_TIMEOUT_S", maybe = MAYBE_STARTED, act = "start a hunt", second = "start a second hunt" } = ctx;
     for (let attempt = 0; ; attempt++) {
       const left = deadline - Date.now();
       if (left <= 0) throw new Deadline("timed out");
-      if (once && left <= POLL_ROOM) throw new Refusal("too little of OHMYBUG_TIMEOUT_S is left to start a hunt and wait for it; nothing was started");
+      if (once && left <= POLL_ROOM) throw new Refusal(`too little of ${clock} is left to ${act} and wait for it; nothing was started`);
       let why, retryAfter = 0;
       try {
         const res = await fetch(url, { ...init, redirect: "error", signal: AbortSignal.timeout(once ? left - POLL_ROOM : Math.min(60_000, left)) });
@@ -716,7 +724,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
         const retryable = res.status === 429 || (!once && (res.status === 408 || res.status >= 500));
         if (!retryable) {
           const said = door ? doorSaid(text) : { message: clean(text) };
-          throw new Refusal(`HTTP ${res.status} ${said.message}${once && res.status >= 500 ? `. ${MAYBE_STARTED}` : ""}`, said.code);
+          throw new Refusal(`HTTP ${res.status} ${said.message}${once && res.status >= 500 ? `. ${maybe}` : ""}`, said.code);
         }
         why = `HTTP ${res.status}`;
         const after = res.headers.get("retry-after");
@@ -727,7 +735,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
         // Failures before any byte reached a server: safe to send again, even the paid call.
         const unreachable = UNREACHABLE.has(e.cause?.code);
         if (once && !unreachable) {
-          throw new Refusal(`no clear answer (${why}); not sent again, so as not to start a second hunt. ${MAYBE_STARTED}`);
+          throw new Refusal(`no clear answer (${why}); not sent again, so as not to ${second}. ${maybe}`);
         }
         // A host never reached is a wrong OHMYBUG_URL or a proxy-only runner, not a blip worth the whole timeout.
         if (unreachable && !reached && attempt >= 3) {
@@ -738,7 +746,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
       const wait = Math.max(retryAfter, Math.min(30_000, 2000 * 2 ** attempt));
       // A wait the deadline cannot fit ends now, not after idling to the deadline.
       if (wait >= deadline - Date.now() - (once ? POLL_ROOM : 0)) {
-        if (once) throw new Refusal(`${why}: the service asks to wait ${Math.round(wait / 1000)}s, more than OHMYBUG_TIMEOUT_S leaves; nothing was started`);
+        if (once) throw new Refusal(`${why}: the service asks to wait ${Math.round(wait / 1000)}s, more than ${clock} leaves; nothing was started`);
         throw new Deadline("timed out");
       }
       log(`${why}; retrying in ${Math.round(wait / 1000)}s`);
@@ -798,7 +806,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
   }
 
   let rpcId = 0;
-  async function tool(name, args, once = false) {
+  async function tool(name, args, once = false, ctx = {}) {
     for (let attempt = 0; ; attempt++) {
       const text = await http(`${api}/mcp`, {
         method: "POST",
@@ -806,7 +814,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
         headers: { authorization: `Bearer ${env.OHMYBUG_API_KEY}`, "content-type": "application/json", accept: "application/json, text/event-stream",
           ...(name === "submit_review" ? { "x-ohmybug-follows": "continued_by" } : {}) },
         body: JSON.stringify({ jsonrpc: "2.0", id: ++rpcId, method: "tools/call", params: { name, arguments: args } }),
-      }, { once });
+      }, { once, ctx });
       let msg = null, body = null, raw = "";
       try {
         msg = rpcMessage(text);
@@ -817,7 +825,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
       // answer, and is not resent.
       if (!body) {
         const what = !msg ? "unreadable answer" : msg.error ? `protocol error: ${msg.error.message}` : raw.slice(0, 300) || "empty answer";
-        if (once) throw new Refusal(`${name}: ${what}; not sent again. ${MAYBE_STARTED}`);
+        if (once) throw new Refusal(`${name}: ${what}; not sent again. ${ctx.maybe ?? MAYBE_STARTED}`);
         log(`${name}: ${what}; retrying`);
         await sleep(Math.min(30_000, 2000 * 2 ** attempt));
         if (Date.now() >= deadline) throw new Deadline("timed out");
@@ -826,7 +834,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
       if (!msg.result?.isError) return body;
       // An internal error may come after the hunt was created: a paid call retries only a rate limit, and says so.
       if (!TRANSIENT_TOOL.has(body.error) || (once && body.error !== "rate_limited")) {
-        throw new Refusal(`${body.error ?? name}: ${body.message ?? raw.slice(0, 300)}${once && body.error === "internal" ? `. ${MAYBE_STARTED}` : ""}`, body.error);
+        throw new Refusal(`${body.error ?? name}: ${body.message ?? raw.slice(0, 300)}${once && body.error === "internal" ? `. ${ctx.maybe ?? MAYBE_STARTED}` : ""}`, body.error);
       }
       const wait = Math.min(60_000, 5000 * 2 ** attempt);
       log(`${body.error}; retrying in ${wait / 1000}s`);
@@ -872,12 +880,13 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
     const deepSnapshot = !!deepAt?.offGithub;
     // Before any ticket: a deep ticket takes a deep slot when it is minted.
     if (deepSnapshot && env.OHMYBUG_SNAPSHOT === "off") throw new Refusal("--deep on a repository that is not on github.com uploads a snapshot of it, and OHMYBUG_SNAPSHOT=off keeps the repository on this machine; nothing was sent and nothing started");
+    // Opt-in: a run that sent no code before never starts sending the repository on its own.
+    if (deepSnapshot && !opts.snapshot && env.OHMYBUG_SNAPSHOT !== "on") throw new Refusal(`--deep cannot run: ${deepAt.why}. A deep hunt off github.com reads a snapshot of the repository this machine uploads: run ohmybug --deep --snapshot (or set OHMYBUG_SNAPSHOT=on) to send one; nothing was sent and nothing started`);
     if (opts.deep && !deepSnapshot) {
       // The service fetches the repository and the diff itself: only where to find them goes up.
       read = () => null;
       args = { deep: true, meta: { ...ciMeta(env, git), ...storyMeta, ...deepAt } };
       log(`deep hunt of ${args.meta.repo} at ${args.meta.ref.slice(0, 12)} against ${args.meta.base_branch}; waiting up to ${timeoutS}s`);
-      if (timeoutS < 7200) log("a deep hunt takes up to 2 hours: OHMYBUG_TIMEOUT_S under 7200 may end the wait before the result");
     } else {
       change = selectChange(deepSnapshot ? { ...opts, base: deepSnapshotBase(opts, env, git) } : opts, env, git, () => snapshotTree(git, (extra, ...a) => execGit(root, a, extra).toString(), root));
       if (!change.diff.trim()) { out(`Nothing to review: no changes against ${change.base}.`); rec.noChanges = true; return 0; }
@@ -904,10 +913,9 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
       };
       log(`reviewing ${change.changed.length} changed file(s) against ${change.base}`);
       // With the repository the service runs the full fast hunt; with the diff alone, a review without it.
-      const target = opts.uncommitted ? { why: "--uncommitted reviews the working tree, which only this machine has" } : repoTarget(env, git, change.base, true);
+      const target = deepSnapshot ? {} : opts.uncommitted ? { why: "--uncommitted reviews the working tree, which only this machine has" } : repoTarget(env, git, change.base, true);
       if (deepSnapshot) {
         log(`deep hunt over a snapshot of this repository (it is not on github.com): the reviewed commit and the diff against ${change.base} are uploaded; waiting up to ${timeoutS}s`);
-        if (timeoutS < 7200) log("a deep hunt takes up to 2 hours: OHMYBUG_TIMEOUT_S under 7200 may end the wait before the result");
         args = payload();
       } else if (target.why) {
         log(`reviewing the diff only, without the repository: ${target.why}`);
@@ -922,6 +930,8 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
       }
     }
 
+    if (opts.deep && timeoutS < 7200) log("a deep hunt takes up to 2 hours: OHMYBUG_TIMEOUT_S under 7200 may end the wait before the result");
+
     /**
      * A diff sent alone that the service refuses with snapshot_required (an account not set to diff-only reviews) goes
      * again by upload: a ticket, then, only when the ticket says `snapshot: "required"`, the reviewed tree as a tar.gz
@@ -934,22 +944,26 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
      */
     const submitByUpload = async (a, deep = false) => {
       if (!deep) log("the service asks for the repository with this diff (snapshot_required): sending the review again by upload");
-      let t, url = null, files = a.files ?? [], tree = null;
-      await paused(snap.waitS * 1000, "the upload ticket and the repository snapshot", async () => {
+      let t, url = null, files = a.files ?? [], tree = null, minted = null;
+      try { await paused(snap.waitS * 1000, "the upload ticket and the repository snapshot", async () => {
         if (deep) {
           tree = await packTree(root, change.rev, { ...snap, timeoutMs: deadline - Date.now() });
           if (tree.cannot) throw new Refusal(`${tree.cannot}; nothing was sent and nothing started`);
+          // Room for the ticket call and one upload try: a ticket minted without it would hold a slot it cannot use.
+          if (deadline - Date.now() < POLL_ROOM + 2 * snap.minTryMs) throw new Refusal(`packing the repository snapshot left too little of the snapshot's clock of ${snap.waitS}s for the ticket and the upload; nothing was sent and nothing started`);
         }
         // A deep ticket carries no repo or ref: with them the service takes the GitHub path (#2010's contract).
-        t = await tool("submit_review", { upload: true, ...(a.meta ? { meta: a.meta } : {}), ...(deep ? { deep: true } : modeArg) }, deep);
+        t = await tool("submit_review", { upload: true, ...(a.meta ? { meta: a.meta } : {}), ...(deep ? { deep: true } : modeArg) }, deep,
+          deep ? { clock: "the snapshot's clock", maybe: TICKET_MAYBE, act: "ask for the deep upload ticket", second: "mint a second deep ticket" } : {});
+        minted = { id: typeof t.review_id === "string" && REVIEW_ID.test(t.review_id) ? t.review_id : null };
         try { if (typeof t.upload_url === "string") url = new URL(t.upload_url, api); } catch {}
         // The address is a capability: only its host is ever printed.
         if (!url || url.origin !== apiUrl.origin) throw new Refusal(`the upload ticket named no usable address${url ? ` (it named another host, ${url.host})` : ""}; nothing was sent and nothing started`);
-        if (typeof t.review_id !== "string" || !REVIEW_ID.test(t.review_id)) throw new Refusal("the upload ticket carried no review id; nothing was sent and nothing started");
+        if (!minted.id) throw new Refusal("the upload ticket carried no review id; nothing was sent and nothing started");
         // Only on a positive ask: a ticket that does not say "required" never gets the repository. A deep hunt reads the
         // repository, so a deep ticket without that ask is refused here rather than run on the diff alone.
         if (t.snapshot !== "required") {
-          if (deep) throw new Refusal(`the deep upload ticket did not ask for the repository snapshot; nothing was sent and nothing started (review ${t.review_id} expires unused)`);
+          if (deep) throw new Refusal("the deep upload ticket did not ask for the repository snapshot; nothing was sent and nothing started");
           log("the upload ticket takes the diff only: the repository is not uploaded"); return;
         }
         if (env.OHMYBUG_SNAPSHOT === "off") throw new Refusal("the service asks for a snapshot of the repository, and OHMYBUG_SNAPSHOT=off keeps it on this machine; no snapshot was sent, nothing started, and the upload ticket expires unused (diff-only reviews are chosen in the hunting policy: https://app.ohmybug.ai/me/policy)");
@@ -963,7 +977,9 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
         const door = new URL(url);
         door.pathname = `${door.pathname.replace(/\/$/, "")}/repo`;
         await uploadSnapshot(door.href, tree.tgz);
-      });
+      }); }
+      // After a deep mint every stop names the ticket: its slot stays taken until it expires.
+      catch (e) { if (deep && minted && e instanceof Refusal) throw new Refusal(`${e.message}. ${slotHeld(minted.id)}`, e.code); throw e; }
       let text;
       try { text = await http(url.href, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ diff: a.diff, files }) }, { once: true, door: true }); }
       catch (err) {

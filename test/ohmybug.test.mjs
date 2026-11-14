@@ -1906,7 +1906,7 @@ test("--deep off github.com: a deep upload ticket with no repo or ref, the store
   const { dir } = changed();
   const s = await server({ findings: [high], ticket: { snapshot: "required" } });
   try {
-    const r = await cli(dir, ["--deep", "--format", "json"], { OHMYBUG_URL: s.url }, SNAP);
+    const r = await cli(dir, ["--deep", "--snapshot", "--format", "json"], { OHMYBUG_URL: s.url }, SNAP);
     assert.equal(r.code, 1, r.log);
     const subs = s.calls.filter((c) => c.name === "submit_review");
     // One submit, the ticket: deep and upload, no payload, no mode, and meta without the commit key the GitHub path takes.
@@ -1933,9 +1933,9 @@ test("--deep off github.com: a deep ticket that does not ask for the snapshot is
   const { dir } = changed();
   const s = await server({ findings: [high], ticket: {} });
   try {
-    const r = await cli(dir, ["--deep"], { OHMYBUG_URL: s.url }, SNAP);
+    const r = await cli(dir, ["--deep", "--snapshot"], { OHMYBUG_URL: s.url }, SNAP);
     assert.equal(r.code, 2, r.log);
-    assert.match(r.log, /the deep upload ticket did not ask for the repository snapshot; nothing was sent and nothing started/);
+    assert.match(r.log, /the deep upload ticket did not ask for the repository snapshot; nothing was sent and nothing started\. The deep upload ticket \(review rev_\w+\) was minted and holds a deep slot until it expires unused/);
     assert.deepEqual(s.uploads, []);
     assert.deepEqual(s.calls.map((c) => c.name), ["submit_review"]);
   } finally { await s.close() }
@@ -1949,7 +1949,7 @@ test("--deep off github.com: the base is --base, else $GITHUB_BASE_REF (origin/<
     const s = await server({ ticket: { snapshot: "required" } });
     try {
       // Both bases are HEAD: nothing to review, and nothing is asked of the service.
-      const r = await cli(dir, ["--deep", ...argv], { OHMYBUG_URL: s.url, ...env }, SNAP);
+      const r = await cli(dir, ["--deep", "--snapshot", ...argv], { OHMYBUG_URL: s.url, ...env }, SNAP);
       assert.equal(r.code, 0, r.log);
       assert.match(r.out, new RegExp(`Nothing to review: no changes against ${base}\\.`));
       assert.equal(s.calls.length, 0);
@@ -1961,7 +1961,7 @@ test("--deep on GitHub Enterprise (GITHUB_SERVER_URL another host) takes the sna
   const { dir } = changed();
   const s = await server({ findings: [high], ticket: { snapshot: "required" } });
   try {
-    const r = await cli(dir, ["--deep"], { OHMYBUG_URL: s.url, GITHUB_SERVER_URL: "https://ghe.example.com" }, SNAP);
+    const r = await cli(dir, ["--deep"], { OHMYBUG_URL: s.url, GITHUB_SERVER_URL: "https://ghe.example.com", OHMYBUG_SNAPSHOT: "on", GITHUB_REPOSITORY: "acme/app" }, SNAP);
     assert.equal(r.code, 1, r.log);
     const sub = s.calls.find((c) => c.name === "submit_review");
     assert.deepEqual([sub.args.deep, sub.args.upload, sub.args.meta.repo], [true, true, undefined]);
@@ -1973,7 +1973,7 @@ test("--deep off github.com: the tree is packed before the ticket (a failed pack
   const { dir } = changed();
   let s = await server({ ticket: { snapshot: "required" } });
   try {
-    const r = await cli(dir, ["--deep"], { OHMYBUG_URL: s.url }, { snapshot: { waitS: 60, minTryMs: 500, maxBytes: 10 } });
+    const r = await cli(dir, ["--deep", "--snapshot"], { OHMYBUG_URL: s.url }, { snapshot: { waitS: 60, minTryMs: 500, maxBytes: 10 } });
     assert.equal(r.code, 2, r.log);
     assert.match(r.log, /compressed.*nothing was sent and nothing started/);
     assert.equal(s.calls.length, 0);
@@ -1981,10 +1981,42 @@ test("--deep off github.com: the tree is packed before the ticket (a failed pack
   // A deep ticket holds a slot from its mint: an unclear answer is not resent. Mutation: ask it with retries -> 2 calls.
   s = await server({ faults: { submit_review: 503 }, ticket: { snapshot: "required" } });
   try {
-    const r = await cli(dir, ["--deep"], { OHMYBUG_URL: s.url }, SNAP);
+    const r = await cli(dir, ["--deep", "--snapshot"], { OHMYBUG_URL: s.url }, SNAP);
     assert.notEqual(r.code, 0, r.log);
+    assert.match(r.log, /A deep upload ticket may have been minted: it holds a deep slot/);
+    assert.doesNotMatch(r.log, /A hunt may have started/);
     assert.equal(s.calls.filter((c) => c.name === "submit_review").length, 1);
     assert.deepEqual(s.uploads, []);
+  } finally { await s.close() }
+});
+
+test("--deep off github.com is opt-in: without --snapshot or OHMYBUG_SNAPSHOT=on it refuses, names the flag and sends nothing", async () => {
+  assert.equal(typeof parseArgs(["--snapshot"]), "string");
+  assert.equal(parseArgs(["--deep", "--snapshot"]).snapshot, true);
+  const { dir } = changed();
+  const s = await server({ findings: [high], ticket: { snapshot: "required" } });
+  try {
+    const r = await cli(dir, ["--deep"], { OHMYBUG_URL: s.url }, SNAP);
+    assert.equal(r.code, 2, r.log);
+    assert.match(r.log, /--deep cannot run: no GitHub repository.*ohmybug --deep --snapshot \(or set OHMYBUG_SNAPSHOT=on\).*nothing was sent and nothing started/);
+    const bad = await cli(dir, ["--deep"], { OHMYBUG_URL: s.url, OHMYBUG_SNAPSHOT: "yes" }, SNAP);
+    assert.equal(bad.code, 2, bad.log);
+    assert.match(bad.log, /OHMYBUG_SNAPSHOT must be off, on or unset/);
+    assert.equal(s.calls.length, 0);
+    assert.deepEqual(s.uploads, []);
+  } finally { await s.close() }
+});
+
+test("--deep off github.com: a pack that leaves too little of the snapshot's clock stops before the ticket", { skip: !hasTar && "no tar" }, async () => {
+  const { dir } = changed();
+  const s = await server({ ticket: { snapshot: "required" } });
+  try {
+    // 5 s of clock against 20 s of ticket room plus two upload tries: refused after packing. Mutation: no check -> a ticket.
+    const r = await cli(dir, ["--deep", "--snapshot"], { OHMYBUG_URL: s.url }, { snapshot: { waitS: 5, minTryMs: 500, maxBytes: 1 << 20, maxUnpacked: 1 << 24 } });
+    assert.equal(r.code, 2, r.log);
+    assert.match(r.log, /packing the repository snapshot left too little of the snapshot's clock of 5s.*nothing was sent and nothing started/);
+    assert.doesNotMatch(r.log.trim().split("\n").at(-1), /OHMYBUG_TIMEOUT_S/);
+    assert.equal(s.calls.length, 0);
   } finally { await s.close() }
 });
 
@@ -2316,7 +2348,7 @@ test("OHMYBUG_SNAPSHOT=off: a ticket that asks for the snapshot stops with nothi
   } finally { await s.close() }
   const r = await cli(dir, [], { OHMYBUG_SNAPSHOT: "0" });
   assert.equal(r.code, 2);
-  assert.match(r.log, /OHMYBUG_SNAPSHOT must be off or unset, not 0/);
+  assert.match(r.log, /OHMYBUG_SNAPSHOT must be off, on or unset, not 0/);
 });
 
 test("a review that uploads a snapshot leaves out of its files whatever the snapshot leaves out, sent with the diff or on request", async () => {
