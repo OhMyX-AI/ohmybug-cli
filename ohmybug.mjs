@@ -49,6 +49,7 @@ Environment:
   OHMYBUG_STORY       the --story value when the flag is not given
   OHMYBUG_FORMAT      the --format value when the flag is not given
   OHMYBUG_MODE        the --mode value when the flag is not given (not used with --deep)
+  OHMYBUG_SNAPSHOT    off: never upload a repository snapshot; a run the service asks for one stops instead
 
 Behind a proxy: Node's fetch reads HTTPS_PROXY only with NODE_USE_ENV_PROXY=1 (Node 22.21+, 24+).
 
@@ -275,18 +276,23 @@ function byteReader(stream) {
 /**
  * The reviewed tree as a tar.gz of the blobs git stores: read raw with `cat-file --batch`, so no checkout filter runs
  * (an encrypted file stays encrypted, an LFS pointer stays a pointer) and no export-ignore, export-subst or eol rule
- * applies. A symlink goes as a regular file holding its target's name; a submodule is left out. Returns { tgz, files,
- * gitlinks } or { cannot } (a reason, not thrown: it matters only when the service asks for the snapshot).
+ * applies. A symlink goes as a regular file holding its target's name; a submodule and a secret-named file are left out. Returns { tgz, files,
+ * gitlinks, secrets } or { cannot } (a reason, not thrown: it matters only when the service asks for the snapshot).
  * shortcut: a symlink is not a link entry, so an import through a symlinked directory does not resolve on the
  * service; send typeflag 2 if the service asks for it.
  */
-export async function packTree(root, rev, { maxBytes, maxUnpacked }) {
+// File names that hold secrets, as the plugin's secret scan names them: left out of a snapshot whatever their content.
+const SECRET_FILE = /(^|\/)(id_(rsa|dsa|ecdsa|ed25519)|[^/]+\.(pem|p12|pfx|key)|\.env(\.(?!example$|sample$|template$|dist$)[^/]+)?)$/;
+
+export async function packTree(root, rev, { maxBytes, maxUnpacked, timeoutMs }) {
   const mib = (n) => Math.ceil(n / 1048576);
   let listing;
-  try { listing = execFileSync("git", ["-C", root, "ls-tree", "-r", "-l", "-z", rev], { maxBuffer: 256 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] }); }
+  const until = Date.now() + timeoutMs;
+  // A blobless clone fetches each blob on demand: both git calls end with the snapshot's clock.
+  try { listing = execFileSync("git", ["-C", root, "ls-tree", "-r", "-l", "-z", rev], { maxBuffer: 256 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"], timeout: timeoutMs }); }
   catch (e) { return { cannot: `could not list the reviewed tree (${clean(e.message, 200)})` }; }
   const files = [];
-  let gitlinks = 0, unpacked = 1024;
+  let gitlinks = 0, secrets = 0, unpacked = 1024;
   for (let at = 0; at < listing.length;) {
     let end = listing.indexOf(0, at);
     if (end < 0) end = listing.length;
@@ -297,12 +303,14 @@ export async function packTree(root, rev, { maxBytes, maxUnpacked }) {
     const [mode, type, oid, size] = rec.subarray(0, tab).toString().trim().split(/\s+/);
     const path = rec.subarray(tab + 1);
     if (type !== "blob") { gitlinks++; continue; }
+    if (SECRET_FILE.test(path.toString())) { secrets++; continue; }
     files.push({ mode, oid, size: Number(size), path });
-    unpacked += 512 + Math.ceil(Number(size) / 512) * 512 + (path.length > 100 ? 1024 : 0);
+    unpacked += (path.length > 100 ? tarEntry(path, 0o644, 0).length : 512) + Math.ceil(Number(size) / 512) * 512;
   }
   if (!files.length) return { cannot: "the reviewed tree has no files to send" };
+  if (until - Date.now() < 1) return { cannot: "could not pack the repository snapshot in time" };
   if (unpacked > maxUnpacked) return { cannot: `the reviewed tree is ${mib(unpacked)} MiB unpacked, over the ${mib(maxUnpacked)} MiB the service takes` };
-  const git = spawn("git", ["-C", root, "cat-file", "--batch"], { stdio: ["pipe", "pipe", "ignore"] });
+  const git = spawn("git", ["-C", root, "cat-file", "--batch"], { stdio: ["pipe", "pipe", "ignore"], timeout: until - Date.now() });
   git.on("error", () => {});
   git.stdin.on("error", () => {});
   git.stdin.end(files.map((f) => `${f.oid}\n`).join(""));
@@ -325,7 +333,7 @@ export async function packTree(root, rev, { maxBytes, maxUnpacked }) {
   } catch (e) {
     return { cannot: e === over ? `the repository snapshot is over ${mib(maxBytes)} MiB compressed, the most the service takes` : `could not pack the repository snapshot (${clean(e.message, 200)})` };
   } finally { git.kill(); }
-  return { tgz: Buffer.concat(out), files: files.length, gitlinks };
+  return { tgz: Buffer.concat(out), files: files.length, gitlinks, secrets };
 }
 
 /**
@@ -616,6 +624,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
   if (!env.OHMYBUG_API_KEY) return fail("OHMYBUG_API_KEY is not set: create a key at https://app.ohmybug.ai/me");
   // Under 30 s no poll fits before the deadline: refused before a paid hunt starts.
   const story = opts.story ?? (env.OHMYBUG_STORY || "auto");
+  if (![undefined, "", "off"].includes(env.OHMYBUG_SNAPSHOT)) return fail(`OHMYBUG_SNAPSHOT must be off or unset, not ${env.OHMYBUG_SNAPSHOT}`);
   if (!STORY.has(story)) return fail(`OHMYBUG_STORY must be auto, private or never, not ${env.OHMYBUG_STORY}`);
   // Sent only to narrow: an absent meta.story is the account's and key's settings alone.
   const storyMeta = story === "auto" ? {} : { story };
@@ -706,14 +715,14 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
 
   /**
    * The snapshot to <upload_url>/repo, retried until it lands or the clock is out. A 409 (the ticket holds a snapshot)
-   * is our own earlier try only if one may have arrived: a 5xx, 408, timeout or reset after sending, not a 429 or a
+   * is our own earlier try only if one may have arrived: a 5xx, timeout or reset after sending, not a 429 or a
    * connection never made. Starts nothing, so it is not cut at 60 s; no try starts with under minTryMs left.
    */
   async function uploadSnapshot(url, tgz) {
     let delivered = false, why = "";
-    const out = () => new Refusal(`the repository snapshot did not finish uploading within ${snap.waitS}s${why ? ` (last: ${why})` : ""}; nothing was started`);
+    const gaveUp = () => new Refusal(`the repository snapshot did not finish uploading within ${snap.waitS}s${why ? ` (last: ${why})` : ""}; nothing was started`);
     for (let attempt = 0; ; attempt++) {
-      if (deadline - Date.now() < snap.minTryMs) throw out();
+      if (deadline - Date.now() < snap.minTryMs) throw gaveUp();
       let wait = Math.min(30_000, 2000 * 2 ** attempt);
       try {
         const res = await fetch(url, { method: "POST", headers: { "content-type": "application/gzip" }, body: tgz, redirect: "error", signal: AbortSignal.timeout(deadline - Date.now()) });
@@ -726,7 +735,8 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
           wait = Math.max(wait, Number(after) * 1000 || Date.parse(after) - Date.now() || 0);
         } else if (res.status === 408 || res.status >= 500) {
           why = `HTTP ${res.status}`;
-          delivered = true;
+          // A 408 is a body the server gave up on before it had all of it.
+          if (res.status !== 408) delivered = true;
         } else {
           const said = doorSaid(text);
           throw new Refusal(`HTTP ${res.status} ${said.message}${res.status === 409 ? ": the upload ticket already holds a snapshot this run did not send" : ""}; nothing was started`, said.code);
@@ -737,7 +747,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
         why = clean(e.cause?.code ?? e.name ?? e.message, 80);
         if (!UNREACHABLE.has(e.cause?.code)) delivered = true;
       }
-      if (wait + snap.minTryMs > deadline - Date.now()) throw out();
+      if (wait + snap.minTryMs > deadline - Date.now()) throw gaveUp();
       log(`the snapshot upload: ${why}; retrying in ${Math.round(wait / 1000)}s`);
       await new Promise((r) => setTimeout(r, wait));
     }
@@ -868,8 +878,6 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
      */
     const submitByUpload = async (a) => {
       log("the service asks for the repository with this diff (snapshot_required): sending the review again by upload");
-      const pack = await packTree(root, change.rev, snap);
-      if (pack.gitlinks) log(`${pack.gitlinks} submodule(s) left out of the snapshot`);
       let t, url = null;
       await paused(snap.waitS * 1000, "the upload ticket and the repository snapshot", async () => {
         t = await tool("submit_review", { upload: true, ...(a.meta ? { meta: a.meta } : {}), ...modeArg });
@@ -879,11 +887,14 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
         if (typeof t.review_id !== "string" || !REVIEW_ID.test(t.review_id)) throw new Refusal("the upload ticket carried no review id; nothing was sent and nothing started");
         // Only on a positive ask: a ticket that does not say "required" never gets the repository.
         if (t.snapshot !== "required") { log("the upload ticket takes the diff only: the repository is not uploaded"); return; }
-        if (pack.cannot) throw new Refusal(`${pack.cannot}; nothing was sent, and the upload ticket expires unused`);
-        log(`uploading the repository snapshot (${pack.files} files, ${Math.ceil(pack.tgz.length / 1024)} KiB)`);
+        if (env.OHMYBUG_SNAPSHOT === "off") throw new Refusal("the service asks for a snapshot of the repository, and OHMYBUG_SNAPSHOT=off keeps it on this machine; nothing was sent, and the upload ticket expires unused (diff-only reviews are chosen in the hunting policy: https://app.ohmybug.ai/me/policy)");
+        // Packed on the snapshot's clock, and only when the ticket wants it.
+        const tree = await packTree(root, change.rev, { ...snap, timeoutMs: deadline - Date.now() });
+        if (tree.cannot) throw new Refusal(`${tree.cannot}; nothing was sent, and the upload ticket expires unused`);
+        log(`uploading the repository snapshot (${tree.files} files, ${Math.ceil(tree.tgz.length / 1024)} KiB${tree.gitlinks ? `; ${tree.gitlinks} submodule(s) left out` : ""}${tree.secrets ? `; ${tree.secrets} secret-named file(s) such as .env or *.pem left out` : ""})`);
         const door = new URL(url);
         door.pathname = `${door.pathname.replace(/\/$/, "")}/repo`;
-        await uploadSnapshot(door.href, pack.tgz);
+        await uploadSnapshot(door.href, tree.tgz);
       });
       let text;
       try { text = await http(url.href, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ diff: a.diff, files: a.files ?? [] }) }, { once: true, door: true }); }
@@ -896,7 +907,9 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
       if (j?.ok !== true) throw new Refusal(`the diff upload answered unclearly (${clean(text, 120)}). ${MAYBE_STARTED} (review ${t.review_id})`);
       const id = typeof j.review_id === "string" && REVIEW_ID.test(j.review_id) ? j.review_id : t.review_id;
       if (id !== t.review_id) log(`the same change is already being hunted as review ${id}: following it`);
-      return { ...t, ...Object.fromEntries(["live_url", "hunt_mode", "recent_median_minutes"].filter((k) => j[k] != null).map((k) => [k, j[k]])), review_id: id };
+      const keep = (o) => Object.fromEntries([["live_url", "string"], ["hunt_mode", "string"], ["recent_median_minutes", "number"]].filter(([k, type]) => typeof o[k] === type).map(([k]) => [k, o[k]]));
+      // Another review's answer never borrows the ticket's link or mode: those describe the ticket's own review.
+      return { ...(id === t.review_id ? keep(t) : {}), ...keep(j), review_id: id };
     };
     const submit = async (a) => {
       try { return await tool("submit_review", { ...a, ...modeArg }, true); }

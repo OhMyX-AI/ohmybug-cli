@@ -37,11 +37,11 @@ function repo() {
  * "slow429" (a 429 asking for 15 s) | a URL (a 307 there) | { error, message } (that tool error) | a list of these, one per call };
  * `filesStatus` answers the file upload with that status, or with each of a list in turn (a 307 goes to
  * `filesLocation`); `filesUrl` replaces the
- * file request's address; `submitExtra` adds fields to the submit answer; `requestedAgain` makes the second wait_review a second request at the same address.
+ * file request's address; `huntMs` keeps wait_review running that long after its first call, each answer after up to 1 s; `submitExtra` adds fields to the submit answer; `requestedAgain` makes the second wait_review a second request at the same address.
  */
-async function server({ findings = [], status = "done", review_of_record = true, httpStatus = 200, requested, requestedAgain, sse = false, submitStatus, submitBody, toolError, faults = {}, filesStatus = 200, filesUrl, filesLocation, extra = {}, submitExtra = {}, ticket } = {}, port = 0) {
+async function server({ huntMs = 0, findings = [], status = "done", review_of_record = true, httpStatus = 200, requested, requestedAgain, sse = false, submitStatus, submitBody, toolError, faults = {}, filesStatus = 200, filesUrl, filesLocation, extra = {}, submitExtra = {}, ticket } = {}, port = 0) {
   const calls = [], posted = [], uploads = [];
-  let url, asks = 0;
+  let url, asks = 0, huntFrom;
   const srv = createServer((req, res) => {
     let body = "";
     const chunks = [];
@@ -55,6 +55,7 @@ async function server({ findings = [], status = "done", review_of_record = true,
         uploads.push({ door, path: req.url, type: req.headers["content-type"], body: Buffer.concat(chunks) });
         const st = (ticket?.[door] ?? []).shift() ?? 200;
         if (st === "reset") return req.socket.destroy();
+        if (String(st).startsWith("http")) { res.writeHead(307, { location: st }); return res.end(); }
         const answer = ticket?.body?.[door] ?? JSON.stringify(st === 200
           ? (door === "payload" ? { ok: true, review_id: ticket?.payloadId ?? "rev_test", status: "running", live_url: "https://example.test/live/up", hunt_mode: "fast" } : { ok: true })
           : { error: `${door} refused: see https://app.ohmybug.ai/me/policy`, ...(st === 409 && door === "payload" ? { code: "snapshot_required" } : {}) });
@@ -92,14 +93,17 @@ async function server({ findings = [], status = "done", review_of_record = true,
       const ask = name === "wait_review" && requested ? [requested, requestedAgain][asks] : undefined;
       if (ask) asks++;
       const result = toolError ? toolError
-        : name === "submit_review" && args.upload ? { ...(ticket?.noId ? {} : { review_id: "rev_test" }), status: "awaiting_upload", ...(ticket?.url === null ? {} : { upload_url: ticket?.url ?? `${url}/u/tok-secret${ticket?.slash ? "/" : ""}` }), ...(ticket?.snapshot ? { snapshot: ticket.snapshot } : {}) }
+        : name === "submit_review" && args.upload ? { ...(ticket?.noId ? {} : { review_id: "rev_test" }), status: "awaiting_upload", ...(ticket?.live ? { live_url: ticket.live } : {}), ...(ticket?.url === null ? {} : { upload_url: ticket?.url ?? `${url}/u/tok-secret${ticket?.slash ? "/" : ""}` }), ...(ticket?.snapshot ? { snapshot: ticket.snapshot } : {}) }
         : name === "submit_review" ? { review_id: "rev_test", status: "running", ...submitExtra }
         : ask ? { review_id: "rev_test", status: "needs_files", requested_files: ask, files_url: filesUrl ?? `${url}/files` }
-        : name === "wait_review" ? { review_id: "rev_test", status }
+        : name === "wait_review" ? { review_id: "rev_test", status: Date.now() - (huntFrom ??= Date.now()) < huntMs ? "running" : status }
         : { review_id: "rev_test", status, findings, review_of_record, live_url: "https://example.test/live/x", ...extra };
       const answer = JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: JSON.stringify(result) }], ...(toolError ? { isError: true } : {}) } });
-      res.writeHead(200, { "content-type": sse ? "text/event-stream" : "application/json" });
-      res.end(sse ? `event: message\ndata: ${answer}\n\n` : answer);
+      const send = () => {
+        res.writeHead(200, { "content-type": sse ? "text/event-stream" : "application/json" });
+        res.end(sse ? `event: message\ndata: ${answer}\n\n` : answer);
+      };
+      return result.status === "running" && name === "wait_review" && huntMs ? setTimeout(send, 1000) : send();
     });
   });
   // Node's 5 s default races the client's 5 s retry: a reused socket the server just closed reads as a reset.
@@ -1794,6 +1798,8 @@ test("packTree: the stored blobs, raw: no filter, export rule or eol rule runs; 
   symlinkSync("app.js", join(dir, "link.js"));
   const p100 = `${"a".repeat(96)}.txt`, p101 = `${"b".repeat(97)}.txt`, p300 = `${"c".repeat(150)}/${"d".repeat(145)}.txt`;
   for (const p of [p100, p101, p300]) { mkdirSync(join(dir, p, ".."), { recursive: true }); writeFileSync(join(dir, p), `${p.length}\n`); }
+  const secret = [".env", "web/.env.local", "certs/server.pem", "deploy/id_ed25519", "tls.key"], kept = [".env.example", "web/envelope.js", "keys.md"];
+  for (const p of [...secret, ...kept]) { mkdirSync(join(dir, p, ".."), { recursive: true }); writeFileSync(join(dir, p), "x\n"); }
   writeFileSync(join(dir, "secret.bin"), "ciphertext\n");
   writeFileSync(join(dir, "crlf.txt"), "one\ntwo\n");
   writeFileSync(join(dir, "ver.txt"), "$Format:%H$\n");
@@ -1809,10 +1815,13 @@ test("packTree: the stored blobs, raw: no filter, export rule or eol rule runs; 
   git("update-index", "--add", "--cacheinfo", `160000,${git("rev-parse", "HEAD").trim()},vendor/sub`);
   git("commit", "-qm", "sub");
   const rev = git("rev-parse", "HEAD^{tree}").trim();
-  const caps = { maxBytes: 1 << 30, maxUnpacked: 1 << 30 };
+  const caps = { maxBytes: 1 << 30, maxUnpacked: 1 << 30, timeoutMs: 60_000 };
   const a = await packTree(dir, rev, caps), b = await packTree(dir, rev, caps);
   assert.ok(a.tgz && !a.cannot, a.cannot);
   assert.equal(a.gitlinks, 1);
+  assert.equal(a.secrets, secret.length);
+  for (const p of secret) assert.ok(!tarNames(a.tgz).includes(p), `${p} is left out`);
+  for (const p of kept) assert.ok(tarNames(a.tgz).includes(p), `${p} is kept`);
   assert.ok(a.tgz.equals(b.tgz), "a tree packs to the same bytes");
   const out = untar(a.tgz);
   const stored = (p) => execFileSync("git", ["-C", dir, "cat-file", "blob", `${rev}:${p}`]);
@@ -1831,10 +1840,10 @@ function existsSafe(p) { try { readFileSync(p); return true; } catch { return fa
 test("packTree: over the compressed or the unpacked cap, or an empty tree, is a reason, not a throw", async () => {
   const { dir, git } = repo();
   const rev = git("rev-parse", "HEAD^{tree}").trim();
-  assert.match((await packTree(dir, rev, { maxBytes: 10, maxUnpacked: 1 << 30 })).cannot, /over 1 MiB compressed/);
-  assert.match((await packTree(dir, rev, { maxBytes: 1 << 30, maxUnpacked: 100 })).cannot, /MiB unpacked, over the 1 MiB/);
+  assert.match((await packTree(dir, rev, { maxBytes: 10, maxUnpacked: 1 << 30, timeoutMs: 60_000 })).cannot, /over 1 MiB compressed/);
+  assert.match((await packTree(dir, rev, { maxBytes: 1 << 30, maxUnpacked: 100, timeoutMs: 60_000 })).cannot, /MiB unpacked, over the 1 MiB/);
   const empty = git("hash-object", "-t", "tree", "/dev/null").trim();
-  assert.match((await packTree(dir, empty, { maxBytes: 1 << 30, maxUnpacked: 1 << 30 })).cannot, /no files/);
+  assert.match((await packTree(dir, empty, { maxBytes: 1 << 30, maxUnpacked: 1 << 30, timeoutMs: 60_000 })).cannot, /no files/);
 });
 
 test("snapshot_required: a ticket, the stored tree as gzip, then the same diff and files; the result follows the diff upload's answer", { skip: !hasTar && "no tar" }, async () => {
@@ -1850,11 +1859,29 @@ test("snapshot_required: a ticket, the stored tree as gzip, then the same diff a
     assert.equal(readFileSync(join(untar(s.uploads[0].body), "app.js"), "utf8"), "export const a = 2\n");
     assert.deepEqual(Object.keys(JSON.parse(s.uploads[1].body)).sort(), ["diff", "files"]);
     assert.equal(JSON.parse(s.uploads[1].body).diff, subs[0].args.diff);
+    assert.deepEqual(JSON.parse(s.uploads[1].body).files, subs[0].args.files);
+    assert.ok(subs[0].args.files.some((f) => f.path === ".review-client/tree.txt"));
     const j = JSON.parse(r.out);
     assert.equal(j.review.id, "rev_test");
     assert.match(r.log, /started in fast mode/);
     assert.match(r.log, /live progress: https:\/\/example\.test\/live\/up/);
   } finally { await s.close() }
+});
+
+test("an upload address ending in / still takes the snapshot at <address>/repo and the diff at the address", async () => {
+  const { dir } = changed();
+  const s = await server({ faults: NEEDS_SNAPSHOT(), ticket: { snapshot: "required", slash: true } });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: s.url }, SNAP);
+    assert.equal(r.code, 0, r.log);
+    assert.deepEqual(s.uploads.map((u) => u.path), ["/u/tok-secret/repo", "/u/tok-secret/"]);
+  } finally { await s.close() }
+});
+
+test("packTree: the git calls end with the snapshot's clock", async () => {
+  const { dir, git } = repo();
+  const rev = git("rev-parse", "HEAD^{tree}").trim();
+  assert.match((await packTree(dir, rev, { maxBytes: 1 << 30, maxUnpacked: 1 << 30, timeoutMs: 1 })).cannot, /could not (list|pack)/);
 });
 
 test("--uncommitted: the snapshot is the working tree with untracked files, never ignored ones, and the index is untouched", { skip: !hasTar && "no tar" }, async () => {
@@ -1914,7 +1941,7 @@ test("the upload address is a capability: another host, none, or no review id st
   }
 });
 
-test("the snapshot door: a 409 is our earlier try only after a try that may have arrived (5xx, reset), never after a 429", async () => {
+test("the snapshot door: a 409 is our earlier try only after a try that may have arrived (5xx, reset), never after a 429 or a 408", async () => {
   const { dir } = changed();
   for (const repo of [[500, 409], ["reset", 409]]) {
     const s = await server({ faults: NEEDS_SNAPSHOT(), ticket: { snapshot: "required", repo } });
@@ -1925,7 +1952,7 @@ test("the snapshot door: a 409 is our earlier try only after a try that may have
       assert.match(r.log, /arrived on an earlier try/);
     } finally { await s.close() }
   }
-  for (const repo of [[409], [429, 409]]) {
+  for (const repo of [[409], [429, 409], [408, 409]]) {
     const s = await server({ faults: NEEDS_SNAPSHOT(), ticket: { snapshot: "required", repo } });
     try {
       const r = await cli(dir, [], { OHMYBUG_URL: s.url }, SNAP);
@@ -1962,6 +1989,16 @@ test("the snapshot door: a refusal stops before the diff, cleaned and capped; a 
     assert.doesNotMatch(r.log, /\u001b/);
     assert.ok(!r.log.includes("y".repeat(300)));
   } finally { await s.close() }
+  // A redirect from the snapshot door is a refusal: the tree never goes to the host it names.
+  const other = await server();
+  s = await server({ faults: NEEDS_SNAPSHOT(), ticket: { snapshot: "required", repo: [`${other.url}/u/steal/repo`] } });
+  try {
+    const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url }, SNAP);
+    assert.equal(r.code, 2);
+    assert.match(r.log, /the snapshot upload was redirected, and a redirect is not followed; nothing was started/);
+    assert.equal(other.uploads.length, 0);
+    assert.deepEqual(s.uploads.map((u) => u.door), ["repo"]);
+  } finally { await s.close(); await other.close() }
   // An HTTP refusal on /mcp whose body happens to be JSON with a code is not the service's snapshot_required.
   s = await server({ submitStatus: 400, submitBody: JSON.stringify({ error: "x", code: "snapshot_required" }), ticket: { snapshot: "required" } });
   try {
@@ -1993,6 +2030,17 @@ test("the hunt's clock is paused while the snapshot goes: a slow upload does not
     const r = await cli(dir, [], { OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: "30" }, SNAP);
     assert.equal(r.code, 0, r.log);
     assert.doesNotMatch(r.log, /too little of OHMYBUG_TIMEOUT_S/);
+  } finally { await s.close() }
+});
+
+test("after the snapshot the hunt has its own time left, not what is left of the snapshot's clock", async () => {
+  const { dir } = changed();
+  const s = await server({ faults: NEEDS_SNAPSHOT(), ticket: { snapshot: "required" }, huntMs: 4000 });
+  try {
+    // A 2 s snapshot clock: a hunt that kept it would end before the 4 s the review runs.
+    const r = await cli(dir, [], { OHMYBUG_URL: s.url, OHMYBUG_TIMEOUT_S: "40" }, { snapshot: { waitS: 2, minTryMs: 100 } });
+    assert.equal(r.code, 0, r.log);
+    assert.ok(s.calls.filter((c) => c.name === "wait_review").length >= 2);
   } finally { await s.close() }
 });
 
@@ -2032,7 +2080,7 @@ test("the ticket starts nothing and is retried; the diff upload starts the hunt:
 
 test("the diff upload: a refusal is final and not_run with its code; the same payload already hunted is followed", async () => {
   const { dir } = changed();
-  for (const st of [409, 404, 410]) {
+  for (const st of [409, 404, 410, 401, 403]) {
     const s = await server({ faults: NEEDS_SNAPSHOT(), ticket: { snapshot: "off", payload: [st] } });
     try {
       const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url }, SNAP);
@@ -2040,9 +2088,17 @@ test("the diff upload: a refusal is final and not_run with its code; the same pa
       const j = JSON.parse(r.out);
       assert.deepEqual([j.outcome, j.error.code], ["not_run", st === 409 ? "snapshot_required" : null]);
       assert.deepEqual(s.uploads.map((u) => u.door), ["payload"]);
-      assert.doesNotMatch(r.log, /may still be running|may have started/);
+      assert.doesNotMatch(r.log, /may still be running|may have started|API key was refused/);
+      assert.match(r.log, new RegExp(`HTTP ${st} payload refused`));
     } finally { await s.close() }
   }
+  // The followed review's answer carries no link: the ticket's link, for the ticket's own review, is not shown for it.
+  const bare = await server({ faults: NEEDS_SNAPSHOT(), ticket: { snapshot: "off", live: "https://example.test/live/ticket", body: { payload: JSON.stringify({ ok: true, review_id: "rev_other", status: "running" }) } } });
+  try {
+    const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: bare.url }, SNAP);
+    assert.equal(r.code, 0, r.log);
+    assert.doesNotMatch(r.log + r.out, /live\/ticket/);
+  } finally { await bare.close() }
   const s = await server({ faults: NEEDS_SNAPSHOT(), ticket: { snapshot: "off", payloadId: "rev_other" } });
   try {
     const r = await cli(dir, [], { OHMYBUG_URL: s.url }, SNAP);
@@ -2067,6 +2123,27 @@ test("a diff resent after a refused GitHub read takes the snapshot path; a GitHu
     assert.equal(r.code, 2);
     assert.equal(s.uploads.length, 0);
   } finally { await s.close() }
+});
+
+test("OHMYBUG_SNAPSHOT=off: a ticket that asks for the snapshot stops with nothing sent; a diff-only ticket still goes; another value is refused", async () => {
+  const { dir } = changed();
+  let s = await server({ faults: NEEDS_SNAPSHOT(), ticket: { snapshot: "required" } });
+  try {
+    const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url, OHMYBUG_SNAPSHOT: "off" }, SNAP);
+    assert.equal(r.code, 2);
+    assert.match(r.log, /OHMYBUG_SNAPSHOT=off keeps it on this machine; nothing was sent/);
+    assert.equal(s.uploads.length, 0);
+    assert.equal(JSON.parse(r.out).outcome, "not_run");
+  } finally { await s.close() }
+  s = await server({ faults: NEEDS_SNAPSHOT(), ticket: { snapshot: "off" } });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: s.url, OHMYBUG_SNAPSHOT: "off" }, SNAP);
+    assert.equal(r.code, 0, r.log);
+    assert.deepEqual(s.uploads.map((u) => u.door), ["payload"]);
+  } finally { await s.close() }
+  const r = await cli(dir, [], { OHMYBUG_SNAPSHOT: "0" });
+  assert.equal(r.code, 2);
+  assert.match(r.log, /OHMYBUG_SNAPSHOT must be off or unset, not 0/);
 });
 
 test("the README budget names the snapshot's 15 minutes", () => {
