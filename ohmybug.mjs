@@ -764,7 +764,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
       const wait = Math.max(retryAfter, Math.min(30_000, 2000 * 2 ** attempt));
       // A wait the deadline cannot fit ends now, not after idling to the deadline.
       if (wait >= deadline - Date.now() - (once ? POLL_ROOM : 0)) {
-        if (once) throw new Refusal(`${why}: ${retryAfter ? "the service asks to wait" : "the next try would be in"} ${Math.round(wait / 1000)}s, more than ${clock} leaves; nothing was started`);
+        if (once) throw new Refusal(`${why}: ${retryAfter >= wait ? "the service asks to wait" : "the next try would be in"} ${Math.round(wait / 1000)}s, more than ${clock} leaves; nothing was started`);
         throw new Deadline("timed out");
       }
       log(`${why}; retrying in ${Math.round(wait / 1000)}s`);
@@ -790,10 +790,11 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
    */
   async function uploadSnapshot(url, tgz) {
     let delivered = false, why = "";
-    const gaveUp = (wait = 0) => new Refusal(`${wait > 0 && why === "HTTP 429" ? `the snapshot door asks to wait ${Math.round(wait / 1000)}s, more than the snapshot's clock leaves` : `the repository snapshot did not finish uploading on the snapshot's clock of ${snap.waitS}s`}${why ? ` (last: ${why})` : " (no time was left to try)"}; nothing was started`);
+    // `asked`: the door's own Retry-After; only a wait it set is called its ask.
+    const gaveUp = (wait = 0, asked = 0) => new Refusal(`${wait > 0 && why === "HTTP 429" && asked >= wait ? `the snapshot door asks to wait ${Math.round(wait / 1000)}s, more than the snapshot's clock leaves` : `the repository snapshot did not finish uploading on the snapshot's clock of ${snap.waitS}s`}${why ? ` (last: ${why})` : " (no time was left to try)"}; nothing was started`);
     for (let attempt = 0; ; attempt++) {
       if (deadline - Date.now() < snap.minTryMs) throw gaveUp();
-      let wait = Math.min(30_000, 2000 * 2 ** attempt);
+      let wait = Math.min(30_000, 2000 * 2 ** attempt), asked = 0;
       try {
         const res = await fetch(url, { method: "POST", headers: { "content-type": "application/gzip" }, body: tgz, redirect: "error", signal: AbortSignal.timeout(deadline - Date.now()) });
         const text = await res.text();
@@ -802,7 +803,8 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
         if (res.status === 429) {
           why = "HTTP 429";
           const after = res.headers.get("retry-after");
-          wait = Math.max(wait, Number(after) * 1000 || Date.parse(after) - Date.now() || 0);
+          asked = Math.max(0, Number(after) * 1000 || Date.parse(after) - Date.now() || 0);
+          wait = Math.max(wait, asked);
         } else if (res.status === 408 || res.status >= 500) {
           why = `HTTP ${res.status}`;
           // A 408 is a body the server gave up on before it had all of it.
@@ -817,7 +819,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
         why = clean(e.cause?.code ?? e.cause?.message ?? e.message, 80);
         if (!UNREACHABLE.has(e.cause?.code)) delivered = true;
       }
-      if (wait + snap.minTryMs > deadline - Date.now()) throw gaveUp(wait);
+      if (wait + snap.minTryMs > deadline - Date.now()) throw gaveUp(wait, asked);
       log(`the snapshot upload: ${why}; retrying in ${Math.round(wait / 1000)}s`);
       await new Promise((r) => setTimeout(r, wait));
     }

@@ -90,6 +90,7 @@ async function server({ huntMs = 0, findings = [], status = "done", review_of_re
           return res.end(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { isError: true, content: [{ type: "text", text: JSON.stringify(typeof fault === "object" ? fault : { error: fault, message: "blip" }) }] } }));
         }
         if (fault === "reset") return req.socket.destroy();
+        if (fault === "slow1") { res.writeHead(429, { "retry-after": "1" }); return res.end("slow down"); }
         if (fault === "slow429") { res.writeHead(429, { "retry-after": "15" }); return res.end("slow down"); }
         if (fault === "hour429") { res.writeHead(429, { "retry-after": "3600" }); return res.end("slow down"); }
         if (fault === "rpcerror") {
@@ -485,14 +486,19 @@ test("submit_review: a 429 is sent again and starts one hunt; a reset or an inte
     [{ submitStatus: 502 }, 2, 1],
     [{ faults: { submit_review: "reset" } }, 2, 1],
     [{ toolError: { error: "internal", message: "late failure" } }, 2, 1],
+    [{ submitExtra: { review_id: undefined } }, 2, 1],
   ]) {
     const s = await server(opts);
     try {
-      const r = await cli(dir, [], { OHMYBUG_URL: s.url });
+      const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url });
       assert.equal(r.code, code, JSON.stringify(opts) + r.log);
       assert.equal(s.calls.filter((c) => c.name === "submit_review").length, submits, JSON.stringify(opts));
-      // The server counts what it received: one hunt, however many attempts reached it.
-      if (code === 2) assert.match(r.log, /A hunt may have started/);
+      // The server counts what it received: one hunt, however many attempts reached it. The result says so too: a
+      // refusal's fate, not its text, makes the outcome (a dropped fate on any of these throws reads not_run).
+      if (code === 2) {
+        assert.match(r.log, /A hunt may have started/);
+        assert.equal(JSON.parse(r.out).outcome, "maybe_started", JSON.stringify(opts));
+      }
     } finally { await s.close() }
   }
 });
@@ -737,6 +743,14 @@ test("a Retry-After longer than the time left stops at once, before a hunt start
     assert.match(r.log, /HTTP 429: the next try would be in \d+s, more than OHMYBUG_TIMEOUT_S leaves; nothing was started/);
     assert.doesNotMatch(r.log, /asks to wait/);
   } finally { await bare.close() }
+  // A Retry-After shorter than the backoff it lost to is not the service's ask either.
+  const short = await server({ faults: { submit_review: ["slow1", "slow1", "slow1", "slow1"] } });
+  try {
+    const r = await cli(dir, [], { OHMYBUG_URL: short.url, OHMYBUG_TIMEOUT_S: "30" });
+    assert.equal(r.code, 2, r.log);
+    assert.match(r.log, /the next try would be in \d+s/);
+    assert.doesNotMatch(r.log, /asks to wait/);
+  } finally { await short.close() }
 });
 
 test("a file over 512 KiB is not sent, as context or on request", async () => {
@@ -2401,6 +2415,16 @@ test("a snapshot that never lands stops on its own clock with a snapshot refusal
     assert.ok(s.uploads.length <= 3, String(s.uploads.length));
     assert.equal(JSON.parse(r.out).outcome, "not_run");
   } finally { await s.close() }
+  // A 429 with no Retry-After (or a shorter one) is the client's backoff running out, not the door's ask.
+  for (const retryAfter of [undefined, "1"]) {
+    const t = await server({ faults: NEEDS_SNAPSHOT(), ticket: { snapshot: "required", repo: Array(50).fill(429), retryAfter } });
+    try {
+      const r = await cli(dir, [], { OHMYBUG_URL: t.url }, { snapshot: { waitS: 5, minTryMs: 1000 } });
+      assert.equal(r.code, 2, r.log);
+      assert.match(r.log, /did not finish uploading on the snapshot's clock of 5s \(last: HTTP 429\)/, String(retryAfter));
+      assert.doesNotMatch(r.log, /door asks to wait/, String(retryAfter));
+    } finally { await t.close() }
+  }
 });
 
 test("the hunt's clock is paused while the snapshot goes: a slow upload does not leave the hunt too little time", async () => {
