@@ -277,10 +277,12 @@ function byteReader(stream) {
 // names, *.pem, *.key, *.p12, *.pfx, *.ppk, *.jks, *.keystore, *.tfstate*, *.tfvars*, .npmrc, .netrc, .pgpass, .pypirc,
 // .git-credentials, kubeconfig, .kube, .docker, .ssh, .aws, .gnupg): a file or folder of that name at any depth, in any
 // case, stays out of a snapshot, whatever its content. With a snapshot, the files sent beside it follow it too.
-const SNAPSHOT_SECRET = /(^|\/)(\.env[^/]*|[^/]*(secret|credential)[^/]*|id_(rsa|dsa|ecdsa|ed25519)[^/]*|[^/]*\.(pem|key|p12|pfx|ppk|jks|keystore)|[^/]*\.(tfstate|tfvars)[^/]*|\.(npmrc|netrc|pgpass|pypirc|git-credentials|kube|docker|ssh|aws|gnupg)|kubeconfig)(\/|$)/i;
-// Files never sent as files on a review without a snapshot: the list above minus what a review needs as context, code
-// named like secrets.ts or credentials.json, .env.example (.sample, .template, .dist) and public keys (*.pub).
-const SECRET_FILE = /(^|\/)(\.env(?!\.(example|sample|template|dist)(\/|$))[^/]*|id_(rsa|dsa|ecdsa|ed25519)(?![^/]*\.pub(\/|$))[^/]*|[^/]*\.(pem|key|p12|pfx|ppk|jks|keystore)|[^/]*\.(tfstate|tfvars)[^/]*|\.(npmrc|netrc|pgpass|pypirc|git-credentials|kube|docker|ssh|aws|gnupg)|kubeconfig)(\/|$)/i;
+export const SNAPSHOT_SECRET = /(^|\/)(\.env[^/]*|[^/]*(secret|credential)[^/]*|id_(rsa|dsa|ecdsa|ed25519)[^/]*|[^/]*\.(pem|key|p12|pfx|ppk|jks|keystore)|[^/]*\.(tfstate|tfvars)[^/]*|\.(npmrc|netrc|pgpass|pypirc|git-credentials|kube|docker|ssh|aws|gnupg)|kubeconfig)(\/|$)/i;
+// Files never sent as files on a review without a snapshot: the list above, per path part, except a file whose own
+// name a review needs as context: source code named like secrets.ts or credentials.go, .env.example (.sample,
+// .template, .dist) and a public key (id_*.pub). A folder named like a secret keeps everything in it out.
+const CONTEXT_OK = /^(\.env\.(example|sample|template|dist)|id_(rsa|dsa|ecdsa|ed25519)\.pub|[^/]*(secret|credential)[^/]*\.(ts|tsx|js|jsx|mjs|cjs|py|go|java|kt|kts|rb|rs|cs|php|swift|scala|c|cc|cpp|h|hpp|m|ex|exs|dart|lua))$/i;
+const SECRET_FILE = { test: (path) => path.split("/").some((part, i, all) => SNAPSHOT_SECRET.test(part) && !(i === all.length - 1 && CONTEXT_OK.test(part))) };
 
 /**
  * The reviewed tree as a tar.gz of the blobs git stores: read raw with `cat-file --batch`, so no checkout filter runs

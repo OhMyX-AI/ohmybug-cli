@@ -7,7 +7,7 @@ import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync, readFileSync, utime
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ciMeta, DECISION_WAIT_S, exitCodeFor, fileReader, fitBody, packTree, parseArgs, resolveBase, resultMarkdown, resultOf, rpcMessage, run, silentBillLine, trimDiff, VERSION } from "../ohmybug.mjs";
+import { ciMeta, DECISION_WAIT_S, exitCodeFor, fileReader, fitBody, packTree, SNAPSHOT_SECRET, parseArgs, resolveBase, resultMarkdown, resultOf, rpcMessage, run, silentBillLine, trimDiff, VERSION } from "../ohmybug.mjs";
 
 // The tests own their git config: a developer's or a runner's own (a git-lfs filter, say) would change what they see.
 process.env.GIT_CONFIG_GLOBAL = "/dev/null";
@@ -1929,15 +1929,21 @@ test("fileReader: secrets and credential stores are never read, in any case; cod
   const { dir, git } = repo();
   const out = [".env", "web/.env.local", ".envrc", ".env.example.bak", "Prod.PEM", "c.p12", "cert.pfx", "tls.key", "k.ppk", "a.jks", "b.keystore",
     "id_rsa", "id_dsa", "id_ecdsa", "k/ID_ED25519", "k2/id_ed25519_sk", "id_rsa.bak", ".npmrc", ".git-credentials", ".netrc", ".pgpass", ".pypirc",
-    "kubeconfig", ".aws/config", ".kube/config", ".docker/config.json", ".ssh/known_hosts", ".gnupg/x", "infra/x.tfstate", "v.tfvars.json"];
-  const kept = [".env.example", ".env.sample", "w/.env.template", "w2/.env.DIST", "src/Secrets.ts", "a/credentials.json", "secrets/db.yml",
-    "id_rsa.pub", "k3/ID_ED25519.PUB", "conf.js", "my.npmrc", ".dockerignore", "app.env"];
+    "kubeconfig", ".aws/config", ".kube/config", ".docker/config.json", ".ssh/known_hosts", ".gnupg/x", "infra/x.tfstate", "v.tfvars.json",
+    // Secret-named data files and folders stay out; only source code named like secrets is context.
+    "a/credentials.json", "secrets.yml", "client_secret.json", "secrets/db.yml", "secrets/manager.ts", "prod-credentials/x.js", "id_rsa.pub.bak"];
+  const kept = [".env.example", ".env.sample", "w/.env.template", "w2/.env.DIST", "src/Secrets.ts", "lib/credentials.go", "id_rsa.pub",
+    "k3/ID_ED25519.PUB", "conf.js", "my.npmrc", ".dockerignore", "app.env"];
   for (const p of [...out, ...kept]) { mkdirSync(join(dir, p, ".."), { recursive: true }); writeFileSync(join(dir, p), "x\n"); }
   git("add", ".");
   git("commit", "-qm", "secrets");
   const read = fileReader({ all: [...out, ...kept], rev: git("rev-parse", "HEAD").trim() }, (...a) => execFileSync("git", ["-C", dir, ...a]));
   for (const p of out) assert.equal(read(p), null, p);
   for (const p of kept) assert.equal(read(p), "x\n", p);
+  // Beside a snapshot the reader takes the snapshot's list: the context-only names are not read either.
+  const beside = fileReader({ all: [...out, ...kept], rev: git("rev-parse", "HEAD").trim() }, (...a) => execFileSync("git", ["-C", dir, ...a]), SNAPSHOT_SECRET);
+  for (const p of [".env.example", "src/Secrets.ts", "lib/credentials.go", "id_rsa.pub"]) assert.equal(beside(p), null, p);
+  assert.equal(beside("conf.js"), "x\n");
 });
 
 test("--uncommitted: the snapshot is the working tree with untracked files, never ignored ones, and the index is untouched", { skip: !hasTar && "no tar" }, async () => {
@@ -2202,21 +2208,21 @@ test("OHMYBUG_SNAPSHOT=off: a ticket that asks for the snapshot stops with nothi
   assert.match(r.log, /OHMYBUG_SNAPSHOT must be off or unset, not 0/);
 });
 
-test("a review that uploads a snapshot leaves out of its files whatever the snapshot leaves out, sent with the diff or on request", { skip: !hasTar && "no tar" }, async () => {
+test("a review that uploads a snapshot leaves out of its files whatever the snapshot leaves out, sent with the diff or on request", async () => {
   const { dir, git } = repo();
   git("update-ref", "refs/remotes/origin/main", "HEAD");
-  for (const p of ["src/secrets.ts", ".npmrc", "lib.js"]) { mkdirSync(join(dir, p, ".."), { recursive: true }); writeFileSync(join(dir, p), `// ${p}\n`); }
+  for (const p of ["src/secrets.ts", ".env.example", "id_rsa.pub", "lib.js"]) { mkdirSync(join(dir, p, ".."), { recursive: true }); writeFileSync(join(dir, p), `// ${p}\n`); }
   git("add", ".");
   git("commit", "-qm", "secret-named");
-  const s = await server({ faults: NEEDS_SNAPSHOT(), ticket: { snapshot: "required" }, requested: ["src/secrets.ts", ".npmrc", "lib.js"] });
+  const s = await server({ faults: NEEDS_SNAPSHOT(), ticket: { snapshot: "required" }, requested: ["src/secrets.ts", ".env.example", "id_rsa.pub", "lib.js"] });
   try {
     const r = await cli(dir, [], { OHMYBUG_URL: s.url }, SNAP);
     assert.equal(r.code, 0, r.log);
     const first = s.calls.find((c) => c.name === "submit_review").args.files.map((f) => f.path);
     assert.ok(first.includes("src/secrets.ts"), "the diff-only try sends it");
     const sent = JSON.parse(s.uploads.find((u) => u.door === "payload").body).files.map((f) => f.path);
-    assert.ok(!sent.includes("src/secrets.ts") && !sent.includes(".npmrc"), sent.join(","));
-    assert.ok(!tarNames(s.uploads.find((u) => u.door === "repo").body).includes("src/secrets.ts"));
+    for (const p of ["src/secrets.ts", ".env.example", "id_rsa.pub"]) assert.ok(!sent.includes(p), `${p}: ${sent.join(",")}`);
+    if (hasTar) assert.ok(!tarNames(s.uploads.find((u) => u.door === "repo").body).includes("src/secrets.ts"));
     assert.deepEqual(s.posted[0].files.map((f) => f.path), ["lib.js"]);
   } finally { await s.close() }
   // A ticket that takes the diff alone keeps those files beside it.
