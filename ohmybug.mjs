@@ -278,11 +278,19 @@ function byteReader(stream) {
 // .git-credentials, kubeconfig, .kube, .docker, .ssh, .aws, .gnupg): a file or folder of that name at any depth, in any
 // case, stays out of a snapshot, whatever its content. With a snapshot, the files sent beside it follow it too.
 export const SNAPSHOT_SECRET = /(^|\/)(\.env[^/]*|[^/]*(secret|credential)[^/]*|id_(rsa|dsa|ecdsa|ed25519)[^/]*|[^/]*\.(pem|key|p12|pfx|ppk|jks|keystore)|[^/]*\.(tfstate|tfvars)[^/]*|\.(npmrc|netrc|pgpass|pypirc|git-credentials|kube|docker|ssh|aws|gnupg)|kubeconfig)(\/|$)/i;
-// Files never sent as files on a review without a snapshot: the list above, per path part, except a file whose own
-// name a review needs as context: source code named like secrets.ts or credentials.go, .env.example (.sample,
-// .template, .dist) and a public key (id_*.pub). A folder named like a secret keeps everything in it out.
-const CONTEXT_OK = /^(\.env\.(example|sample|template|dist)|id_(rsa|dsa|ecdsa|ed25519)\.pub|[^/]*(secret|credential)[^/]*\.(ts|tsx|js|jsx|mjs|cjs|py|go|java|kt|kts|rb|rs|cs|php|swift|scala|c|cc|cpp|h|hpp|m|ex|exs|dart|lua))$/i;
-const SECRET_FILE = { test: (path) => path.split("/").some((part, i, all) => SNAPSHOT_SECRET.test(part) && !(i === all.length - 1 && CONTEXT_OK.test(part))) };
+// Files never sent as files on a review without a snapshot: the snapshot list, per path part. Only the file's own
+// name may trip it, and only two ways: an exact env example or public key name, or source code whose name trips
+// nothing but the secret/credential words (secrets.ts, credentials.go). A folder that trips keeps its contents out.
+const CONTEXT_EXACT = /^(\.env\.(example|sample|template|dist)|id_(rsa|dsa|ecdsa|ed25519)\.pub)$/i;
+const CODE_NAME = /\.(ts|tsx|js|jsx|mjs|cjs|py|go|java|kt|kts|rb|rs|cs|php|swift|scala|c|cc|cpp|h|hpp|m|ex|exs|dart|lua)$/i;
+export function contextDenied(path) {
+  const dirs = path.split("/");
+  const name = dirs.pop();
+  if (dirs.some((dir) => SNAPSHOT_SECRET.test(dir))) return true;
+  if (!SNAPSHOT_SECRET.test(name) || CONTEXT_EXACT.test(name)) return false;
+  // The words blanked: what still trips the list is another rule (.env*, id_rsa*, *.tfvars*), and that one has no exemption.
+  return !(CODE_NAME.test(name) && !SNAPSHOT_SECRET.test(name.replace(/secret|credential/gi, "x")));
+}
 
 /**
  * The reviewed tree as a tar.gz of the blobs git stores: read raw with `cat-file --batch`, so no checkout filter runs
@@ -349,14 +357,14 @@ export async function packTree(root, rev, { maxBytes, maxUnpacked, timeoutMs }) 
 
 /**
  * path → text or null, from the reviewed tree. Only a path in it is read, so a request cannot reach an ignored file,
- * .git, or anything outside the repository, and a path `deny` names (SECRET_FILE, or SNAPSHOT_SECRET beside a snapshot) is never read; a symlink reads as its target's name. Missing, binary, LFS pointers and
+ * .git, or anything outside the repository, and a path `denied` names (contextDenied, or the snapshot list beside a snapshot) is never read; a symlink reads as its target's name. Missing, binary, LFS pointers and
  * files over MAX_FILE read as null.
  */
-export function fileReader(change, gitBuf, deny = SECRET_FILE) {
+export function fileReader(change, gitBuf, denied = contextDenied) {
   const known = new Set(change.all);
   return (requested) => {
     const path = String(requested).replace(/^\/+/, "");
-    if (!known.has(path) || deny.test(path)) return null;
+    if (!known.has(path) || denied(path)) return null;
     try {
       if (Number(gitBuf("cat-file", "-s", `${change.rev}:${path}`).toString()) > MAX_FILE) return null;
       const buf = gitBuf("cat-file", "blob", `${change.rev}:${path}`);
@@ -904,7 +912,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
         if (tree.cannot) throw new Refusal(`${tree.cannot}; no snapshot was sent, nothing started, and the upload ticket expires unused`);
         log(`uploading the repository snapshot (${tree.files} file(s), ${Math.ceil(tree.tgz.length / 1024)} KiB${tree.gitlinks ? `; ${tree.gitlinks} submodule(s) left out` : ""}${tree.secrets ? `; ${tree.secrets} file(s) named like secrets, or in folders named like them, left out` : ""})`);
         // From here the review holds a snapshot: the files beside it, sent now or on request, leave out what it leaves out.
-        read = fileReader(change, gitBuf, SNAPSHOT_SECRET);
+        read = fileReader(change, gitBuf, (p) => SNAPSHOT_SECRET.test(p));
         files = files.filter((f) => !SNAPSHOT_SECRET.test(f.path));
         const door = new URL(url);
         door.pathname = `${door.pathname.replace(/\/$/, "")}/repo`;

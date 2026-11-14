@@ -7,7 +7,7 @@ import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync, readFileSync, utime
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ciMeta, DECISION_WAIT_S, exitCodeFor, fileReader, fitBody, packTree, SNAPSHOT_SECRET, parseArgs, resolveBase, resultMarkdown, resultOf, rpcMessage, run, silentBillLine, trimDiff, VERSION } from "../ohmybug.mjs";
+import { ciMeta, contextDenied, DECISION_WAIT_S, exitCodeFor, fileReader, fitBody, packTree, SNAPSHOT_SECRET, parseArgs, resolveBase, resultMarkdown, resultOf, rpcMessage, run, silentBillLine, trimDiff, VERSION } from "../ohmybug.mjs";
 
 // The tests own their git config: a developer's or a runner's own (a git-lfs filter, say) would change what they see.
 process.env.GIT_CONFIG_GLOBAL = "/dev/null";
@@ -1925,6 +1925,23 @@ test("packTree: a git call that stalls (a blobless clone fetching blobs) ends wi
   } finally { process.env.PATH = path; delete process.env.OMB_SLOW; }
 });
 
+test("contextDenied: the snapshot list per path part; only the file's own name may pass, as an exact example or key, or as code named only like a secret", () => {
+  const denied = [".env.secrets.js", ".env.credentials.py", "id_rsa_secret.rb", "prod.tfvars.secret.py", "x.tfstate.credentials.js", "secrets.tfvars.py",
+    "credentials.tfstate.backup.js", "credentials.json", "secrets.yml", "client_secret.json", "credentials.xml", "secrets.sh", "secrets.sql", "secret",
+    "secret.key", "secret.pem", "x.secret.keystore", "secrets.ts.bak", "secrets.ts.enc", "secrets/db.yml", "secrets/manager.ts", "src/secrets.js/index.js",
+    "secrets.js/prod.yml", "credentials.go/x.go", "id_rsa.pub/id_rsa", "id_rsa.pub/readme.md", ".env.example/x", "src/.env.example/readme.md",
+    ".env.secret/app.ts", ".git-credentials/helper.go", "a/.ssh/keys.go", ".kube/secrets.go", "kubeconfig/a.go", ".Docker/config.json", ".aws/config",
+    ".env", ".envrc", ".env.example.bak", ".env.examples", ".env.local.example", ".env.js", ".env.example.js", ".env.example.ts", "id_rsa",
+    "id_rsa.pub.bak", "id_rsa.ts", "id_rsa.pub.ts", "id_ed25519_sk", "id_ed25519_sk.pub", ".npmrc", ".git-credentials", "kubeconfig", "server.pem", "tls.key"];
+  const allowed = ["secrets.ts", "src/Secrets.ts", "lib/credentials.go", "SECRETS.TS", "secrets.d.ts", "secrets.json.js", "src/auth/secretManager.test.ts",
+    "src/credential_store.py", "secretsecret.go", "secsecretret.go", "id_secretrsa.ts", "secret.key.go", "secrets.pem.js", "x.keystore.secret.java",
+    "kubeconfig.secret.go", ".git-credentials.js", ".npmrc.secret.js", ".env.example", ".ENV.Sample", ".env.template", ".env.dist", "id_rsa.pub",
+    "ID_ED25519.PUB", "k/id_dsa.pub", "k/id_ecdsa.pub", "my.npmrc", "kubeconfig.yaml", ".dockerignore", "app.env", "example.env", "server.pem.ts",
+    "tls.key.ts", "app.js"];
+  for (const p of denied) assert.equal(contextDenied(p), true, p);
+  for (const p of allowed) assert.equal(contextDenied(p), false, p);
+});
+
 test("fileReader: secrets and credential stores are never read, in any case; code named like secrets, examples and public keys are", () => {
   const { dir, git } = repo();
   const out = [".env", "web/.env.local", ".envrc", ".env.example.bak", "Prod.PEM", "c.p12", "cert.pfx", "tls.key", "k.ppk", "a.jks", "b.keystore",
@@ -1941,7 +1958,7 @@ test("fileReader: secrets and credential stores are never read, in any case; cod
   for (const p of out) assert.equal(read(p), null, p);
   for (const p of kept) assert.equal(read(p), "x\n", p);
   // Beside a snapshot the reader takes the snapshot's list: the context-only names are not read either.
-  const beside = fileReader({ all: [...out, ...kept], rev: git("rev-parse", "HEAD").trim() }, (...a) => execFileSync("git", ["-C", dir, ...a]), SNAPSHOT_SECRET);
+  const beside = fileReader({ all: [...out, ...kept], rev: git("rev-parse", "HEAD").trim() }, (...a) => execFileSync("git", ["-C", dir, ...a]), (p) => SNAPSHOT_SECRET.test(p));
   for (const p of [".env.example", "src/Secrets.ts", "lib/credentials.go", "id_rsa.pub"]) assert.equal(beside(p), null, p);
   assert.equal(beside("conf.js"), "x\n");
 });
