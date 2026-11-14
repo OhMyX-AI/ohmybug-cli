@@ -2,13 +2,16 @@
 // ohmybug: review the git diff of the current folder with the OhMyBug hosted bug hunt, from a CI job or a shell.
 // One file, no dependencies, Node 18+. Exit 0: no medium or worse bug. 1: at least one. 2: the review could not run,
 // or was cut short with no medium or worse bug.
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { appendFileSync, copyFileSync, realpathSync, rmSync, statSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { Readable, Writable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import { createGzip } from "node:zlib";
 
-export const VERSION = "0.9.0";
+export const VERSION = "0.10.0";
 const USAGE = `ohmybug ${VERSION}: review this repository's changes with OhMyBug.
 
 Usage:
@@ -28,7 +31,8 @@ Usage:
 
 Without --uncommitted, a pushed HEAD of a github.com repository whose base is an origin branch (at the same commit as
 here) is read by the service from GitHub (public, or with the OhMyBug GitHub App installed), which runs the full fast
-hunt; otherwise, or when the service does not take it from GitHub, the diff is sent and reviewed without the repository.
+hunt; otherwise, or when the service does not take it from GitHub, the diff is sent without the repository. If the
+service then asks for the repository (snapshot_required), the reviewed tree goes too, as git stores it (see the README).
 
 The base is --base, else $CI_MERGE_REQUEST_TARGET_BRANCH_NAME (GitLab merge request pipelines),
 else origin/main. With --deep it is a branch name: --base, else $GITHUB_BASE_REF, else main.
@@ -40,7 +44,8 @@ Environment:
                       service may run a quick first step and continue it with the fast hunt: then the first step and
                       the fast hunt each get this wait, and the service's decision between them up to 27 minutes (or
                       this value, if longer). Give a CI job three times this value, or twice it plus 30 minutes if that
-                      is longer, plus the time to clone and install. The service never continues --deep
+                      is longer, plus 15 minutes when the run uploads a repository snapshot, plus the time to clone
+                      and install. The service never continues --deep
   OHMYBUG_STORY       the --story value when the flag is not given
   OHMYBUG_FORMAT      the --format value when the flag is not given
   OHMYBUG_MODE        the --mode value when the flag is not given (not used with --deep)
@@ -61,6 +66,19 @@ const POLL_ROOM = 20_000;
 // Server caps: 30 files and about 10 MiB of diff and files per call; 20 files per answer to a file request.
 const MAX_FILES = 30, MAX_EXTRA = 20, MAX_BYTES = 9 * 1024 * 1024, MAX_BODY = 11_500_000, MAX_FILE = 512 * 1024;
 const MAX_TREE = 1024 * 1024;
+// A repository snapshot: 128 MiB compressed and 1 GiB unpacked at most (the service's caps), uploaded on its own clock
+// (the hunt's is paused meanwhile), no try started with under 30 s of it left.
+const SNAPSHOT = { waitS: 900, maxBytes: 128 * 1024 * 1024, maxUnpacked: 1024 * 1024 * 1024, minTryMs: 30_000 };
+// Failures before any byte reached a server: safe to send again, even a call that starts a hunt.
+const UNREACHABLE = new Set(["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH", "UND_ERR_CONNECT_TIMEOUT"]);
+// Text from the service on its way to a terminal and the result: control characters (C0, DEL, C1) dropped, capped.
+const clean = (s, n = 300) => String(s).replace(/[\x00-\x1f\x7f-\x9f]/g, " ").slice(0, n);
+/** An upload door's refusal: its JSON `error` (else the raw text), cleaned, and its code when it is a plain one. */
+function doorSaid(text) {
+  let j = null;
+  try { j = JSON.parse(text); } catch {}
+  return { message: clean(typeof j?.error === "string" ? j.error : text), code: typeof j?.code === "string" && PLAIN_CODE.test(j.code) ? j.code : undefined };
+}
 // Pinned diff format, whatever the user's git config says (noprefix, mnemonicPrefix, textconv drivers).
 const DIFF_FLAGS = ["--no-color", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/"];
 const TRANSIENT_TOOL = new Set(["internal", "rate_limited"]);
@@ -200,6 +218,114 @@ export function trimDiff(diff, log = () => {}) {
   if (kept.length === parts.length || !kept.some((p) => p.startsWith("diff --git "))) return diff;
   log(`diff trimmed: left out ${parts.length - kept.length} file(s) over ${MAX_ENTRY} bytes`);
   return kept.join("");
+}
+
+/**
+ * The tar headers of one file: a ustar header, after a pax `path` record when the path is over 100 bytes. `path` is
+ * the raw bytes git stores. Owner, group and time are zero, so a tree packs to the same bytes every time.
+ */
+export function tarEntry(path, mode, size) {
+  const header = (name, type, len) => {
+    const h = Buffer.alloc(512);
+    name.copy(h, 0, 0, Math.min(100, name.length));
+    h.write(`${mode.toString(8).padStart(7, "0")}\0`, 100, "ascii");
+    h.write("0000000\0", 108, "ascii");
+    h.write("0000000\0", 116, "ascii");
+    h.write(`${len.toString(8).padStart(11, "0")}\0`, 124, "ascii");
+    h.write("00000000000\0", 136, "ascii");
+    h.fill(0x20, 148, 156);
+    h.write(type, 156, "ascii");
+    h.write("ustar\0", 257, "ascii");
+    h.write("00", 263, "ascii");
+    let sum = 0;
+    for (const b of h) sum += b;
+    h.write(`${sum.toString(8).padStart(6, "0")}\0 `, 148, "ascii");
+    return h;
+  };
+  if (path.length <= 100) return header(path, "0", size);
+  // A pax record is "<length> path=<path>\n", the length counting its own digits.
+  const body = Buffer.concat([Buffer.from(" path="), path, Buffer.from("\n")]);
+  let n = body.length + 1;
+  while (n !== body.length + String(n).length) n = body.length + String(n).length;
+  const record = Buffer.concat([Buffer.from(String(n)), body]);
+  return Buffer.concat([header(Buffer.from("PaxHeader"), "x", record.length), record, Buffer.alloc((512 - record.length % 512) % 512), header(path, "0", size)]);
+}
+
+/** Bytes read in order from a stream: a line, or exactly n bytes. */
+function byteReader(stream) {
+  const it = stream[Symbol.asyncIterator]();
+  let buf = Buffer.alloc(0);
+  const fill = async (n) => {
+    const parts = [buf];
+    let len = buf.length;
+    while (len < n) {
+      const { value, done } = await it.next();
+      if (done) throw new Error("git cat-file ended early");
+      parts.push(value);
+      len += value.length;
+    }
+    buf = Buffer.concat(parts, len);
+  };
+  return {
+    async line() { let i; while ((i = buf.indexOf(10)) < 0) await fill(buf.length + 1); const l = buf.subarray(0, i).toString(); buf = buf.subarray(i + 1); return l; },
+    async take(n) { if (buf.length < n) await fill(n); const out = buf.subarray(0, n); buf = buf.subarray(n); return out; },
+  };
+}
+
+/**
+ * The reviewed tree as a tar.gz of the blobs git stores: read raw with `cat-file --batch`, so no checkout filter runs
+ * (an encrypted file stays encrypted, an LFS pointer stays a pointer) and no export-ignore, export-subst or eol rule
+ * applies. A symlink goes as a regular file holding its target's name; a submodule is left out. Returns { tgz, files,
+ * gitlinks } or { cannot } (a reason, not thrown: it matters only when the service asks for the snapshot).
+ * shortcut: a symlink is not a link entry, so an import through a symlinked directory does not resolve on the
+ * service; send typeflag 2 if the service asks for it.
+ */
+export async function packTree(root, rev, { maxBytes, maxUnpacked }) {
+  const mib = (n) => Math.ceil(n / 1048576);
+  let listing;
+  try { listing = execFileSync("git", ["-C", root, "ls-tree", "-r", "-l", "-z", rev], { maxBuffer: 256 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] }); }
+  catch (e) { return { cannot: `could not list the reviewed tree (${clean(e.message, 200)})` }; }
+  const files = [];
+  let gitlinks = 0, unpacked = 1024;
+  for (let at = 0; at < listing.length;) {
+    let end = listing.indexOf(0, at);
+    if (end < 0) end = listing.length;
+    const rec = listing.subarray(at, end);
+    at = end + 1;
+    if (!rec.length) continue;
+    const tab = rec.indexOf(9);
+    const [mode, type, oid, size] = rec.subarray(0, tab).toString().trim().split(/\s+/);
+    const path = rec.subarray(tab + 1);
+    if (type !== "blob") { gitlinks++; continue; }
+    files.push({ mode, oid, size: Number(size), path });
+    unpacked += 512 + Math.ceil(Number(size) / 512) * 512 + (path.length > 100 ? 1024 : 0);
+  }
+  if (!files.length) return { cannot: "the reviewed tree has no files to send" };
+  if (unpacked > maxUnpacked) return { cannot: `the reviewed tree is ${mib(unpacked)} MiB unpacked, over the ${mib(maxUnpacked)} MiB the service takes` };
+  const git = spawn("git", ["-C", root, "cat-file", "--batch"], { stdio: ["pipe", "pipe", "ignore"] });
+  git.on("error", () => {});
+  git.stdin.on("error", () => {});
+  git.stdin.end(files.map((f) => `${f.oid}\n`).join(""));
+  const r = byteReader(git.stdout);
+  async function* entries() {
+    for (const f of files) {
+      const head = (await r.line()).split(" ");
+      if (head[0] !== f.oid || head[1] !== "blob" || Number(head[2]) !== f.size) throw new Error(`git cat-file answered "${clean(head.join(" "), 80)}" for ${f.oid}`);
+      yield tarEntry(f.path, f.mode === "100755" ? 0o755 : 0o644, f.size);
+      yield await r.take(f.size);
+      await r.take(1);
+      if (f.size % 512) yield Buffer.alloc(512 - f.size % 512);
+    }
+    yield Buffer.alloc(1024);
+  }
+  const out = [], over = new Error("over");
+  let gz = 0;
+  try {
+    await pipeline(Readable.from(entries()), createGzip(), new Writable({ write(c, _, cb) { gz += c.length; if (gz > maxBytes) return cb(over); out.push(c); cb(); } }));
+  } catch (e) {
+    return { cannot: e === over ? `the repository snapshot is over ${mib(maxBytes)} MiB compressed, the most the service takes` : `could not pack the repository snapshot (${clean(e.message, 200)})` };
+  } finally { git.kill(); }
+  return { tgz: Buffer.concat(out), files: files.length, gitlinks };
 }
 
 /**
@@ -462,7 +588,7 @@ export function deepTarget(opts, env, git) {
 const REPO_REFUSED = new Set(["diff_required", "repo_not_listed", "diff_fetch_failed", "empty_compare", "diff_too_large"]);
 
 /** One review, start to end. Returns the exit code; never calls process.exit itself (the tests drive it). */
-export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s + "\n"), log = (s) => process.stderr.write(`ohmybug: ${s}\n`), decisionWaitS = DECISION_WAIT_S }) {
+export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s + "\n"), log = (s) => process.stderr.write(`ohmybug: ${s}\n`), decisionWaitS = DECISION_WAIT_S, snapshot = {} }) {
   const opts = parseArgs(argv);
   if (typeof opts === "string") { log(opts); log("see ohmybug --help"); return 2; }
   if (opts.help) { out(USAGE); return 0; }
@@ -471,7 +597,7 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
   if (!FORMATS.has(format)) { log(`OHMYBUG_FORMAT must be text, markdown or json, not ${env.OHMYBUG_FORMAT}`); return 2; }
   const rec = { deep: opts.deep };
   // The text lines go to stdout only in text; the other formats print the one result below.
-  const code = await review({ opts, env, cwd, out: format === "text" ? out : () => {}, log, rec, decisionWaitS });
+  const code = await review({ opts, env, cwd, out: format === "text" ? out : () => {}, log, rec, decisionWaitS, snap: { ...SNAPSHOT, ...snapshot } });
   const res = format === "text" && !opts.stepSummary ? null : resultOf(rec, code);
   if (format === "json") out(JSON.stringify(res));
   if (format === "markdown") out(resultMarkdown(res));
@@ -483,7 +609,7 @@ export async function run({ argv, env, cwd, out = (s) => process.stdout.write(s 
   return code;
 }
 
-async function review({ opts, env, cwd, out, log, rec, decisionWaitS }) {
+async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
   if (!Number.isSafeInteger(decisionWaitS) || decisionWaitS < 1) throw new TypeError(`decisionWaitS must be a whole number of seconds, got ${decisionWaitS}`);
   // A run that stops before a hunt says why in the result too.
   const fail = (message) => { log(message); rec.error = { code: null, message }; return 2; };
@@ -517,11 +643,12 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS }) {
    * POST and return the body text, retrying network errors, 408, 429 and 5xx until the deadline; a host never reached
    * fails after four tries. With `once` (the call that starts a paid hunt) only failures that prove the server never
    * took the request are retried, and the request is not cut at 60 s (a multi-MB upload on a slow uplink takes longer)
-   * but at POLL_ROOM before the deadline, so a started hunt always gets polled. No redirect is followed: the body
-   * would go to wherever it points.
+   * but at POLL_ROOM before the deadline, so a started hunt always gets polled. With `door` (the upload doors) a
+   * refusal is read as {error, code}. A 401/403 is a refused key only on a call that sends one. Every refusal text is
+   * cleaned. No redirect is followed: the body would go to wherever it points.
    */
   let reached = false;
-  async function http(url, init, { once = false } = {}) {
+  async function http(url, init, { once = false, door = false } = {}) {
     for (let attempt = 0; ; attempt++) {
       const left = deadline - Date.now();
       if (left <= 0) throw new Deadline("timed out");
@@ -532,9 +659,12 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS }) {
         reached = true;
         const text = await res.text();
         if (res.ok) return text;
-        if (res.status === 401 || res.status === 403) throw new Refusal(`the API key was refused, or the request blocked (HTTP ${res.status} ${text.slice(0, 200)})`);
+        if ((res.status === 401 || res.status === 403) && init.headers?.authorization) throw new Refusal(`the API key was refused, or the request blocked (HTTP ${res.status} ${clean(text, 200)})`);
         const retryable = res.status === 429 || (!once && (res.status === 408 || res.status >= 500));
-        if (!retryable) throw new Refusal(`HTTP ${res.status} ${text.slice(0, 300)}${once && res.status >= 500 ? `. ${MAYBE_STARTED}` : ""}`);
+        if (!retryable) {
+          const said = door ? doorSaid(text) : { message: clean(text) };
+          throw new Refusal(`HTTP ${res.status} ${said.message}${once && res.status >= 500 ? `. ${MAYBE_STARTED}` : ""}`, said.code);
+        }
         why = `HTTP ${res.status}`;
         const after = res.headers.get("retry-after");
         retryAfter = Math.max(0, Number(after) * 1000 || Date.parse(after) - Date.now() || 0);
@@ -542,7 +672,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS }) {
         if (e instanceof Refusal) throw e;
         why = e.cause?.code ?? e.message;
         // Failures before any byte reached a server: safe to send again, even the paid call.
-        const unreachable = ["ECONNREFUSED", "ENOTFOUND", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH", "UND_ERR_CONNECT_TIMEOUT"].includes(e.cause?.code);
+        const unreachable = UNREACHABLE.has(e.cause?.code);
         if (once && !unreachable) {
           throw new Refusal(`no clear answer (${why}); not sent again, so as not to start a second hunt. ${MAYBE_STARTED}`);
         }
@@ -562,6 +692,57 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS }) {
       await sleep(wait);
     }
   }
+  /**
+   * `fn` on its own clock of `ms`; the clock that was running resumes with what it had left. A deadline inside is a
+   * refusal naming `what`, never "no result within OHMYBUG_TIMEOUT_S": nothing has started yet.
+   */
+  async function paused(ms, what, fn) {
+    const left = deadline - Date.now();
+    deadline = Date.now() + ms;
+    try { return await fn(); }
+    catch (e) { if (e instanceof Deadline) throw new Refusal(`${what} did not finish within ${Math.round(ms / 1000)}s; nothing was started`); throw e; }
+    finally { deadline = Date.now() + left; }
+  }
+
+  /**
+   * The snapshot to <upload_url>/repo, retried until it lands or the clock is out. A 409 (the ticket holds a snapshot)
+   * is our own earlier try only if one may have arrived: a 5xx, 408, timeout or reset after sending, not a 429 or a
+   * connection never made. Starts nothing, so it is not cut at 60 s; no try starts with under minTryMs left.
+   */
+  async function uploadSnapshot(url, tgz) {
+    let delivered = false, why = "";
+    const out = () => new Refusal(`the repository snapshot did not finish uploading within ${snap.waitS}s${why ? ` (last: ${why})` : ""}; nothing was started`);
+    for (let attempt = 0; ; attempt++) {
+      if (deadline - Date.now() < snap.minTryMs) throw out();
+      let wait = Math.min(30_000, 2000 * 2 ** attempt);
+      try {
+        const res = await fetch(url, { method: "POST", headers: { "content-type": "application/gzip" }, body: tgz, redirect: "error", signal: AbortSignal.timeout(deadline - Date.now()) });
+        const text = await res.text();
+        if (res.ok) return;
+        if (res.status === 409 && delivered) { log("the snapshot arrived on an earlier try"); return; }
+        if (res.status === 429) {
+          why = "HTTP 429";
+          const after = res.headers.get("retry-after");
+          wait = Math.max(wait, Number(after) * 1000 || Date.parse(after) - Date.now() || 0);
+        } else if (res.status === 408 || res.status >= 500) {
+          why = `HTTP ${res.status}`;
+          delivered = true;
+        } else {
+          const said = doorSaid(text);
+          throw new Refusal(`HTTP ${res.status} ${said.message}${res.status === 409 ? ": the upload ticket already holds a snapshot this run did not send" : ""}; nothing was started`, said.code);
+        }
+      } catch (e) {
+        if (e instanceof Refusal) throw e;
+        if (/redirect/i.test(String(e.cause?.message ?? ""))) throw new Refusal("the snapshot upload was redirected, and a redirect is not followed; nothing was started");
+        why = clean(e.cause?.code ?? e.name ?? e.message, 80);
+        if (!UNREACHABLE.has(e.cause?.code)) delivered = true;
+      }
+      if (wait + snap.minTryMs > deadline - Date.now()) throw out();
+      log(`the snapshot upload: ${why}; retrying in ${Math.round(wait / 1000)}s`);
+      await new Promise((r) => setTimeout(r, wait));
+    }
+  }
+
   let rpcId = 0;
   async function tool(name, args, once = false) {
     for (let attempt = 0; ; attempt++) {
@@ -631,7 +812,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS }) {
     try { root = realpathSync(execGit(cwd, ["rev-parse", "--show-toplevel"]).toString().trim()); }
     catch { throw new Refusal("this folder is not inside a git repository"); }
     const gitBuf = (...a) => execGit(root, a), git = (...a) => gitBuf(...a).toString();
-    let args;
+    let args, change;
     if (opts.deep) {
       // The service fetches the repository and the diff itself: only where to find them goes up.
       read = () => null;
@@ -639,7 +820,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS }) {
       log(`deep hunt of ${args.meta.repo} at ${args.meta.ref.slice(0, 12)} against ${args.meta.base_branch}; waiting up to ${timeoutS}s`);
       if (timeoutS < 7200) log("a deep hunt takes up to 2 hours: OHMYBUG_TIMEOUT_S under 7200 may end the wait before the result");
     } else {
-      const change = selectChange(opts, env, git, () => snapshotTree(git, (extra, ...a) => execGit(root, a, extra).toString(), root));
+      change = selectChange(opts, env, git, () => snapshotTree(git, (extra, ...a) => execGit(root, a, extra).toString(), root));
       if (!change.diff.trim()) { out(`Nothing to review: no changes against ${change.base}.`); rec.noChanges = true; return 0; }
       read = fileReader(change, gitBuf);
       // The reviewers can ask for any file by path; without the list they cannot name a caller to ask for.
@@ -678,13 +859,59 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS }) {
       }
     }
 
+    /**
+     * A diff sent alone that the service refuses with snapshot_required (an account not set to diff-only reviews) goes
+     * again by upload: a ticket, then, only when the ticket says `snapshot: "required"`, the reviewed tree as a tar.gz
+     * of the stored blobs, then the same diff and files. The refusal started nothing; the ticket and the snapshot run on
+     * their own clock while the hunt's is paused. The diff upload starts the hunt and is sent once; its answer names
+     * the review (another one when the same payload is already being hunted).
+     */
+    const submitByUpload = async (a) => {
+      log("the service asks for the repository with this diff (snapshot_required): sending the review again by upload");
+      const pack = await packTree(root, change.rev, snap);
+      if (pack.gitlinks) log(`${pack.gitlinks} submodule(s) left out of the snapshot`);
+      let t, url = null;
+      await paused(snap.waitS * 1000, "the upload ticket and the repository snapshot", async () => {
+        t = await tool("submit_review", { upload: true, ...(a.meta ? { meta: a.meta } : {}), ...modeArg });
+        try { if (typeof t.upload_url === "string") url = new URL(t.upload_url, api); } catch {}
+        // The address is a capability: only its host is ever printed.
+        if (!url || url.origin !== apiUrl.origin) throw new Refusal(`the upload ticket named no usable address${url ? ` (it named another host, ${url.host})` : ""}; nothing was sent and nothing started`);
+        if (typeof t.review_id !== "string" || !REVIEW_ID.test(t.review_id)) throw new Refusal("the upload ticket carried no review id; nothing was sent and nothing started");
+        // Only on a positive ask: a ticket that does not say "required" never gets the repository.
+        if (t.snapshot !== "required") { log("the upload ticket takes the diff only: the repository is not uploaded"); return; }
+        if (pack.cannot) throw new Refusal(`${pack.cannot}; nothing was sent, and the upload ticket expires unused`);
+        log(`uploading the repository snapshot (${pack.files} files, ${Math.ceil(pack.tgz.length / 1024)} KiB)`);
+        const door = new URL(url);
+        door.pathname = `${door.pathname.replace(/\/$/, "")}/repo`;
+        await uploadSnapshot(door.href, pack.tgz);
+      });
+      let text;
+      try { text = await http(url.href, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ diff: a.diff, files: a.files ?? [] }) }, { once: true, door: true }); }
+      catch (err) {
+        if (err instanceof Refusal && err.message.includes(MAYBE_STARTED)) throw new Refusal(`${err.message} (review ${t.review_id})`, err.code);
+        throw err;
+      }
+      let j = null;
+      try { j = JSON.parse(text); } catch {}
+      if (j?.ok !== true) throw new Refusal(`the diff upload answered unclearly (${clean(text, 120)}). ${MAYBE_STARTED} (review ${t.review_id})`);
+      const id = typeof j.review_id === "string" && REVIEW_ID.test(j.review_id) ? j.review_id : t.review_id;
+      if (id !== t.review_id) log(`the same change is already being hunted as review ${id}: following it`);
+      return { ...t, ...Object.fromEntries(["live_url", "hunt_mode", "recent_median_minutes"].filter((k) => j[k] != null).map((k) => [k, j[k]])), review_id: id };
+    };
+    const submit = async (a) => {
+      try { return await tool("submit_review", { ...a, ...modeArg }, true); }
+      catch (e) {
+        if (!(e instanceof Refusal) || e.code !== "snapshot_required" || !a.diff) throw e;
+        return submitByUpload(a);
+      }
+    };
     let sub;
-    try { sub = await tool("submit_review", { ...args, ...modeArg }, true); }
+    try { sub = await submit(args); }
     catch (e) {
       if (!fallback || !(e instanceof Refusal) || !REPO_REFUSED.has(e.code)) throw e;
       // A diff alone cannot run a mode that reads the repository: say so instead of a second, refused call.
       if (REPO_MODES.has(mode)) throw new Refusal(`${e.message}; --mode ${mode} needs the repository, so the diff was not sent alone: use --mode fast to review the diff without it`, e.code);
-      sub = await tool("submit_review", { ...fallback(e.code), ...modeArg }, true);
+      sub = await submit(fallback(e.code));
     }
     if (!sub.review_id) throw new Refusal(`submit_review answered without a review id: ${JSON.stringify(sub).slice(0, 300)}. ${MAYBE_STARTED}`);
     started = sub;
