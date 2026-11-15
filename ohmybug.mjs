@@ -359,13 +359,14 @@ export async function packTree(root, rev, { maxBytes, maxUnpacked, timeoutMs, se
     files.push({ mode, oid, size: Number(size), path });
   }
   if (!files.length) return { cannot: "the reviewed tree has no files to send" };
-  // The partial copy (`select`, selectPartial): its list or, with a reason, the whole tree. It never fails the pack.
+  // The partial copy (`select`, selectPartial): its list or, with a reason, the whole tree. It never fails the pack: the
+  // list gets at most half of the clock left, so a list that runs out of time still leaves the whole tree time to pack.
   let partial, partialWhy, packed = files;
   if (select) {
     try {
-      const r = await select(files, until);
+      const r = await select(files, Date.now() + Math.floor((until - Date.now()) / 2));
       if (r.keep.size) { partial = r.stats; packed = files.filter((f) => r.keep.has(f.path.toString("latin1"))); }
-      else partialWhy = r.stats.changedInTree ? "every changed file is over 4 MiB, binary or a git-lfs pointer" : "no changed file is in the reviewed tree";
+      else partialWhy = r.stats.changedInTree ? "every changed file is over 4 MiB, binary or a git-lfs pointer" : "no changed file is in the reviewed tree, or every one is named like a secret";
     } catch (e) { partialWhy = `the file list could not be built (${clean(e?.message ?? e, 160)})`; }
   }
   for (const f of packed) unpacked += (f.path.length > 100 ? tarEntry(f.path, 0o644, 0).length : 512) + Math.ceil(f.size / 512) * 512;
@@ -417,13 +418,17 @@ export const OS_DOC2 = /(^|\/)(LICEN[CS]E|CHANGELOG|NOTICE)([-_.][^/]*)?$/;
 export const NAME = /(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]{3,})\s*\(|(?:def|function|class|interface|fn|func|fun)\s+([A-Za-z_][A-Za-z0-9_]{3,})/g;
 const LFS = Buffer.from("version https://git-lfs.github.com/spec/");
 
-/** Names on the added lines (each starting with byte 0x01, git's --output-indicator-new): calls and definitions,
- *  keywords out, longest first, at most PARTIAL.names. No diff header is ever read as a line. */
-export function addedNames(added) {
+/** Names on the added lines of a -U0 diff: calls and definitions, keywords out, longest first, at most PARTIAL.names.
+ *  A line counts only inside a hunk (after its @@ line, before the next file's header), so a header such as +++ is
+ *  never read as one, and no option newer than git 2.0 is needed (--output-indicator-new is 2.25). */
+export function addedNames(diff) {
   const found = new Set();
-  for (const ln of added.toString("utf8").split("\n")) {
-    if (!ln.startsWith("\x01")) continue;
-    for (const m of ln.matchAll(NAME)) { const n = m[1] ?? m[2]; if (!OS_KW.has(n)) found.add(n); }
+  let hunk = false;
+  for (const ln of diff.toString("utf8").split("\n")) {
+    if (ln.startsWith("diff --git ")) { hunk = false; continue; }
+    if (ln.startsWith("@@")) { hunk = true; continue; }
+    if (!hunk || !ln.startsWith("+")) continue;
+    for (const m of ln.slice(1).matchAll(NAME)) { const n = m[1] ?? m[2]; if (!OS_KW.has(n)) found.add(n); }
   }
   return [...found].sort((a, b) => b.length - a.length || (a < b ? -1 : a > b ? 1 : 0)).slice(0, PARTIAL.names);
 }
@@ -496,7 +501,7 @@ export async function selectPartial(root, range, rev, changed, files, until, lim
   else if (regular.reduce((n, f) => n + f.size, 0) > limits.bytes) cut = "bytes";
   else if (run(["config", "--get-regexp", "^(extensions\\.partialclone|remote\\..*\\.promisor)$"], [0, 1]).length) cut = "partial clone";
   let callers = [];
-  const names = cut === "-" ? addedNames(run(["diff", ...range, ...DIFF_FLAGS, "-U0", "--output-indicator-new=\x01"])) : [];
+  const names = cut === "-" ? addedNames(run(["diff", ...range, ...DIFF_FLAGS, "-U0"])) : [];
   if (names.length) {
     const out = run(["grep", "-F", "-w", "-I", "-l", "-z", ...names.flatMap((n) => ["-e", n]), rev], [0, 1]);
     const pre = Buffer.from(`${rev}:`);

@@ -2711,7 +2711,7 @@ test("partial L2: four fixtures give the service rule's lists, in its order (the
 test("partial L1: an added line whose text starts with '++' gives a name; a context line that looks like a header does not", async () => {
   const { dir } = twoCommits({ "m.py": "x = 1\n+++ fake_name_here()\n", "u1.py": "call_me_now()\n", "u2.py": "fake_name_here()\n" }, { "m.py": "x = 1\n+++ fake_name_here()\n++ call_me_now()\n" });
   assert.equal((await partialOf(dir)).list, "m.py u1.py");
-  assert.deepEqual(addedNames(Buffer.from("+++ b/x.py\n\x01++ call_me_now()\n\x01def made_here(): pass\n\x01print(x)\n")), ["call_me_now", "made_here"]);
+  assert.deepEqual(addedNames(Buffer.from("diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/fake_header_name(x).py\n@@ -1,0 +2,3 @@\n++ call_me_now()\n+def made_here(): pass\n+print(x)\n-gone_name_here()\n")), ["call_me_now", "made_here"]);
 });
 
 test("partial L4: a NUL by byte 8000 is binary, past it is not; 4 MiB kept, one byte over skipped", async () => {
@@ -2820,4 +2820,32 @@ test("partial upload: --deep packs the whole tree before its ticket and never ma
     assert.match(s.uploads[0].path, /\/repo$/);
     assert.doesNotMatch(r.log, /partial/);
   } finally { await s.close() }
+});
+
+test("partial: a file the 16 MiB cap skips does not stop the list: a later one that fits still goes", async () => {
+  const big = "#".repeat(3900 * 1024) + "\n";
+  const { dir } = twoCommits({ "a1.py": "x\n", "a2.py": "x\n", "a3.py": "x\n", "a4.py": "x\n", "b5.py": "x\n", "c6.py": "x\n" },
+    { "a1.py": big, "a2.py": big, "a3.py": big, "a4.py": big, "b5.py": "#".repeat(1 << 20) + "\n", "c6.py": "y\n" });
+  assert.equal((await partialOf(dir)).list, "a1.py a2.py a3.py a4.py c6.py");
+});
+
+test("partial upload: base...HEAD and --uncommitted both bring a caller of the change, and leave an unrelated file out", { skip: !hasTar && "no tar" }, async () => {
+  for (const uncommitted of [false, true]) {
+    const { dir, git } = repo();
+    writeFileSync(join(dir, "use.js"), "export const u = compute_total_sum(1)\n");
+    writeFileSync(join(dir, "unrelated.js"), "export const z = 9\n");
+    git("add", "-A"); git("commit", "-qm", "more"); git("update-ref", "refs/remotes/origin/main", "HEAD");
+    writeFileSync(join(dir, "app.js"), "export function compute_total_sum(x) { return x }\n");
+    if (!uncommitted) git("commit", "-qam", "change");
+    const s = await server({ findings: [high], faults: NEEDS_SNAPSHOT(), ticket: { snapshot: "required", pack: "partial" } });
+    try {
+      const r = await cli(dir, [...(uncommitted ? ["--uncommitted"] : []), "--format", "json"], { OHMYBUG_URL: s.url }, SNAP);
+      assert.equal(r.code, 1, r.log);
+      assert.match(s.uploads[0].path, /\/repo\?pack=partial$/);
+      const root = untar(s.uploads[0].body);
+      assert.equal(readFileSync(join(root, "use.js"), "utf8"), "export const u = compute_total_sum(1)\n", `uncommitted=${uncommitted}`);
+      assert.throws(() => statSync(join(root, "unrelated.js")));
+      assert.match(r.log, /1 changed, 0 build manifest\(s\), 1 caller\(s\)/);
+    } finally { await s.close() }
+  }
 });
