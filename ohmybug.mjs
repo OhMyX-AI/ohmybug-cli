@@ -3,9 +3,9 @@
 // One file, no dependencies, Node 18+. Exit 0: no medium or worse bug. 1: at least one. 2: the review could not run,
 // or was cut short with no medium or worse bug.
 import { execFileSync, spawn } from "node:child_process";
-import { appendFileSync, copyFileSync, mkdtempSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { appendFileSync, copyFileSync, mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { Readable, Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -370,10 +370,12 @@ export async function packTree(root, rev, { maxBytes, maxUnpacked, timeoutMs, se
       else partialWhy = r.stats.changedInTree ? "every changed file is over 4 MiB, binary or a git-lfs pointer" : "no changed file is in the reviewed tree, or every one is named like a secret";
     } catch (e) { partialWhy = `the file list could not be built (${clean(e?.message ?? e, 160)})`; }
   }
+  // A refusal after the list keeps its reason: the run then says a partial copy was asked for and why none was built.
+  const cannot = (why) => ({ cannot: why, ...(partialWhy ? { partialWhy } : {}) });
   for (const f of packed) unpacked += (f.path.length > 100 ? tarEntry(f.path, 0o644, 0).length : 512) + Math.ceil(f.size / 512) * 512;
   const left = until - Date.now();
-  if (left < 1) return { cannot: "could not pack the repository snapshot in time" };
-  if (unpacked > maxUnpacked) return { cannot: `the reviewed tree is ${mib(unpacked)} MiB unpacked, over the ${mib(maxUnpacked)} MiB the service takes` };
+  if (left < 1) return cannot("could not pack the repository snapshot in time");
+  if (unpacked > maxUnpacked) return cannot(`the reviewed tree is ${mib(unpacked)} MiB unpacked, over the ${mib(maxUnpacked)} MiB the service takes`);
   const git = spawn("git", ["-C", root, "cat-file", "--batch"], { stdio: ["pipe", "pipe", "ignore"], timeout: left });
   git.on("error", () => {});
   git.stdin.on("error", () => {});
@@ -395,9 +397,9 @@ export async function packTree(root, rev, { maxBytes, maxUnpacked, timeoutMs, se
   try {
     await pipeline(Readable.from(entries()), createGzip(), new Writable({ write(c, _, cb) { gz += c.length; if (gz > maxBytes) return cb(over); out.push(c); cb(); } }));
   } catch (e) {
-    return { cannot: e === over ? `the repository snapshot is over ${mib(maxBytes)} MiB compressed, the most the service takes`
+    return cannot(e === over ? `the repository snapshot is over ${mib(maxBytes)} MiB compressed, the most the service takes`
       : Date.now() >= until ? `could not pack the repository snapshot within ${Math.round(timeoutMs / 1000)}s (git was still reading the blobs)`
-      : `could not pack the repository snapshot (${clean(e.message, 200)})` };
+      : `could not pack the repository snapshot (${clean(e.message, 200)})`);
   } finally { git.kill(); }
   return { tgz: Buffer.concat(out), files: packed.length, gitlinks, secrets, ...(partial ? { partial } : {}), ...(partialWhy ? { partialWhy } : {}) };
 }
@@ -437,42 +439,54 @@ export function addedNames(diff) {
 }
 
 /*
- * Every git call of the partial list runs under no system or global git setting, as the plugin's upload script runs
- * its own (0.164.0). The contract, so nobody has to derive it again:
- * - The environment is the run's own minus what configures git or its output: GIT_CONFIG*, GIT_PAGER, PAGER,
- *   GIT_ATTR_*, GIT_EXTERNAL_DIFF, LANG, LANGUAGE, LC_*, HOME, XDG_CONFIG_HOME. GIT_DIR, GIT_WORK_TREE and the object
- *   store variables stay, as they do for selectChange and the pack.
- * - The system config is off (GIT_CONFIG_NOSYSTEM). The global config is a file this run writes in its own mkdtemp
- *   folder and removes on exit: safe.directory = * and the repository's path (git 2.35.2 reads only exact paths,
- *   `*` from 2.35.3; before protected config, git 2.38, safe.directory is read from system and global config only,
- *   never from -c), core.attributesFile = /dev/null, no pager, no color. HOME and XDG_CONFIG_HOME point there too.
- * - The repository's own config still applies, so color and pager are also overridden on the command line, where they
- *   outrank it. An alias cannot shadow a built-in command. The locale is C.
- * The repository passed git's ownership check under the user's own config in selectChange; this answers it again for
- * the list only. The whole tree's pack keeps the user's git (a partial clone may need its credential helpers).
+ * The partial list's git (the contract, so nobody has to derive it again; OhMyBug#3856). Two calls read the user's
+ * repository, under the user's own git and env as ls-tree and the whole-tree pack do: `rev-parse --git-path objects`
+ * (git 2.5) and the promisor `config` read. Every content call (`grep`, `cat-file --batch`) runs in a bare git folder
+ * this list creates and removes, reading the user's objects through GIT_OBJECT_DIRECTORY, as the plugin's upload
+ * script runs its own list in a private repository:
+ * - An explicit GIT_DIR: no discovery, so no ownership check (safe.directory) on any git, and none of the
+ *   repository's own config, info/attributes or hooks.
+ * - HOME and XDG_CONFIG_HOME point at that empty folder and GIT_CONFIG_GLOBAL is never set, so every git (2.32 added
+ *   GIT_CONFIG_GLOBAL) finds no global config and no attributes file the same way. GIT_CONFIG_NOSYSTEM and
+ *   GIT_ATTR_NOSYSTEM turn the system files off. Every other GIT_* variable is dropped, except
+ *   GIT_ALTERNATE_OBJECT_DIRECTORIES (the reviewed objects may live there) and git's own test switch
+ *   GIT_TEST_ASSUME_DIFFERENT_OWNER (a user who sets it already fails at ls-tree). The locale is C.
+ * - No remote: a blob a partial clone lacks answers "missing", the list fails, and the whole tree goes, its pack
+ *   fetching under the user's git. Below git 2.5 the object folder is not found and the whole tree goes too.
  */
-const NOT_INHERITED = /^(GIT_CONFIG.*|GIT_PAGER|PAGER|GIT_ATTR_.*|GIT_EXTERNAL_DIFF|LANG|LANGUAGE|LC_.*|HOME|XDG_CONFIG_HOME)$/;
-let noUserHome;
-const quoted = (v) => `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
-const noUserGit = (root, args) => ["--no-pager", "-c", "color.ui=never", "-c", "color.grep=never", "-c", "core.pager=cat", "-C", root, ...args];
-function noUserEnv(root) {
-  if (!noUserHome) {
-    noUserHome = mkdtempSync(join(tmpdir(), "ohmybug-git-"));
-    const home = noUserHome;
-    process.once("exit", () => { try { rmSync(home, { recursive: true, force: true }); } catch {} });
-    let real = root; try { real = realpathSync(root); } catch {}
-    writeFileSync(join(home, "gitconfig"), `[safe]\n\tdirectory = *\n\tdirectory = ${quoted(real)}\n[core]\n\tattributesFile = /dev/null\n\tpager = cat\n[color]\n\tui = never\n\tgrep = never\n`, { mode: 0o600 });
-  }
-  const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !NOT_INHERITED.test(k)));
-  return { ...env, HOME: noUserHome, XDG_CONFIG_HOME: noUserHome, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: join(noUserHome, "gitconfig"), GIT_TERMINAL_PROMPT: "0", LC_ALL: "C" };
+const LIST_DROPPED = /^(GIT_.*|PAGER|LANG|LANGUAGE|LC_.*|HOME|XDG_CONFIG_HOME)$/i;
+const LIST_KEPT = /^(GIT_ALTERNATE_OBJECT_DIRECTORIES|GIT_TEST_ASSUME_DIFFERENT_OWNER)$/i;
+/** The list's private git folder over `root`'s objects: { dir, env }. The caller removes `dir`. */
+function listRepo(root, sha256, until) {
+  let objects;
+  try {
+    const out = execFileSync("git", ["-C", root, "rev-parse", "--git-path", "objects"], { stdio: ["ignore", "pipe", "pipe"], timeout: Math.max(1, until - Date.now()) });
+    objects = resolve(root, out.toString().replace(/\r?\n$/, ""));
+    if (!statSync(objects).isDirectory()) objects = undefined;
+  } catch { objects = undefined; }
+  if (!objects) throw new Error("the object folder was not found (git 2.5 or newer is needed)");
+  const dir = mkdtempSync(join(tmpdir(), "ohmybug-git-"));
+  try {
+    mkdirSync(join(dir, "refs"));
+    writeFileSync(join(dir, "HEAD"), "ref: refs/heads/x\n");
+    writeFileSync(join(dir, "config"), sha256 ? "[core]\n\trepositoryformatversion = 1\n\tbare = true\n[extensions]\n\tobjectformat = sha256\n" : "[core]\n\trepositoryformatversion = 0\n\tbare = true\n");
+  } catch (e) { rmSync(dir, { recursive: true, force: true }); throw e; }
+  const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !LIST_DROPPED.test(k) || LIST_KEPT.test(k)));
+  return { dir, env: { ...env, GIT_DIR: dir, GIT_OBJECT_DIRECTORY: objects, HOME: dir, XDG_CONFIG_HOME: dir, GIT_CONFIG_NOSYSTEM: "1", GIT_ATTR_NOSYSTEM: "1", LC_ALL: "C" } };
 }
+/** A git failure's message: the cause from its stderr's last line, or that it ran out of time. */
+const gitFailed = (args, e) => {
+  if (e.code === "ETIMEDOUT") return new Error(`git ${args[0]} failed (out of time)`);
+  const last = String(e.stderr ?? "").trim().split("\n").pop();
+  return new Error(`git ${args[0]} failed${last ? `: ${clean(last, 160)}` : ""}`);
+};
 
 /** Blobs in order through one `git cat-file --batch`: calls `each(file, data)` until it returns false. */
-async function eachBlob(root, list, until, each) {
+async function eachBlob(own, list, until, each) {
   if (!list.length) return;
   const left = until - Date.now();
   if (left < 1) throw new Error("out of time on the list's share of the snapshot's clock");
-  const git = spawn("git", noUserGit(root, ["cat-file", "--batch"]), { stdio: ["pipe", "pipe", "ignore"], timeout: left, env: noUserEnv(root) });
+  const git = spawn("git", ["--no-pager", "cat-file", "--batch"], { cwd: own.dir, env: own.env, stdio: ["pipe", "pipe", "ignore"], timeout: left });
   git.on("error", () => {});
   git.stdin.on("error", () => {});
   git.stdin.end(list.map((f) => `${f.oid}\n`).join(""));
@@ -501,9 +515,18 @@ async function eachBlob(root, list, until, each) {
  * Returns { keep: Set of paths (latin1 keys), stats }; throws when git cannot answer (the caller packs the whole tree).
  */
 export async function selectPartial(root, diff, rev, changed, files, until, limits = PARTIAL_SEARCH) {
-  const run = (args, ok = [0]) => {
-    try { return execFileSync("git", noUserGit(root, args), { maxBuffer: 256 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"], timeout: Math.max(1, until - Date.now()), env: noUserEnv(root) }); }
-    catch (e) { if (ok.includes(e.status) && e.stdout) return e.stdout; throw new Error(`git ${args[0]} failed${e.code === "ETIMEDOUT" ? " (out of time)" : ""}`); }
+  const own = listRepo(root, files[0]?.oid.length === 64, until);
+  try { return await listIn(own, root, diff, rev, changed, files, until, limits); }
+  finally { try { rmSync(own.dir, { recursive: true, force: true, maxRetries: 3 }); } catch {} }
+}
+
+async function listIn(own, root, diff, rev, changed, files, until, limits) {
+  // `user`: a call that reads the user's repository, under the user's git; otherwise the list's own folder.
+  const run = (args, ok = [0], user = false) => {
+    try {
+      return execFileSync("git", user ? ["-C", root, ...args] : ["--no-pager", ...args], { maxBuffer: 256 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"],
+        timeout: Math.max(1, until - Date.now()), ...(user ? {} : { cwd: own.dir, env: own.env }) });
+    } catch (e) { if (ok.includes(e.status) && e.stdout) return e.stdout; throw gitFailed(args, e); }
   };
   const key = (f) => f.path.toString("latin1");
   const byPath = new Map(files.map((f) => [f.path.toString(), f]));
@@ -513,8 +536,8 @@ export async function selectPartial(root, diff, rev, changed, files, until, limi
   const dir = (p) => { const i = p.lastIndexOf("/"); return i < 0 ? "" : p.slice(0, i); };
   const byBytes = (a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b));
   // A partial clone: extensions.partialClone names its remote; a remote.<name>.promisor counts only when true.
-  const promisor = () => run(["config", "--get-regexp", "^extensions\\.partialclone$"], [0, 1]).toString().trim() !== ""
-    || /\strue$/m.test(run(["config", "--bool", "--get-regexp", "^remote\\..*\\.promisor$"], [0, 1]).toString());
+  const promisor = () => run(["config", "--get-regexp", "^extensions\\.partialclone$"], [0, 1], true).toString().trim() !== ""
+    || /\strue$/m.test(run(["config", "--bool", "--get-regexp", "^remote\\..*\\.promisor$"], [0, 1], true).toString());
 
   // 1. The changed files in the tree (a changed symlink too), in the diff's order.
   const head = changed.map((p) => byPath.get(p)).filter(Boolean).slice(0, PARTIAL.changed);
@@ -558,7 +581,7 @@ export async function selectPartial(root, diff, rev, changed, files, until, limi
     const filesOf = new Map(names.map((n) => [n, []]));
     const live = new Set(names);
     const word = new Map(names.map((n) => [n, new RegExp(`(?<![A-Za-z0-9_])${n}(?![A-Za-z0-9_])`)]));
-    await eachBlob(root, cand.filter(Boolean), until, (f, data) => {
+    await eachBlob(own, cand.filter(Boolean), until, (f, data) => {
       const text = data.toString("latin1");
       for (const n of [...live]) if (text.includes(n) && word.get(n).test(text)) { filesOf.get(n).push(f); if (filesOf.get(n).length > PARTIAL.perName) live.delete(n); }
       return live.size > 0;
@@ -575,7 +598,7 @@ export async function selectPartial(root, diff, rev, changed, files, until, limi
   // 6. The caps, in rank order: sizes from the tree, the NUL and LFS check on each candidate's first bytes.
   const ranked = [...head, ...manifests, ...callers].filter((f) => f.size <= PARTIAL.file);
   const binary = new Set();
-  await eachBlob(root, ranked, until, (f, data) => { if (data.subarray(0, PARTIAL.nulScan).includes(0) || data.subarray(0, LFS.length).equals(LFS)) binary.add(key(f)); });
+  await eachBlob(own, ranked, until, (f, data) => { if (data.subarray(0, PARTIAL.nulScan).includes(0) || data.subarray(0, LFS.length).equals(LFS)) binary.add(key(f)); });
   const keep = new Set();
   let total = 0;
   for (const f of ranked) {
@@ -1208,7 +1231,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
         // A fast ticket with `pack: "partial"` gets the partial copy (OhMyBug#3856), or the whole tree when no list is built.
         const select = t.pack === "partial" ? (fs, until) => selectPartial(root, change.diff, change.rev, change.changed, fs, until) : undefined;
         if (!tree) tree = await packTree(root, change.rev, { ...snap, timeoutMs: deadline - Date.now(), ...(select ? { select } : {}) });
-        if (tree.cannot) throw new Refusal(`${tree.cannot}; no snapshot was sent, nothing started, and the upload ticket expires unused`);
+        if (tree.cannot) throw new Refusal(`${tree.cannot}${tree.partialWhy ? `; the upload ticket asks for a partial copy of the repository and none was built (${tree.partialWhy}), so the whole tree was tried` : ""}; no snapshot was sent, nothing started, and the upload ticket expires unused`);
         if (tree.partialWhy) log(`the upload ticket asks for a partial copy of the repository and none was built (${tree.partialWhy}): the whole tree goes`);
         const p = tree.partial;
         const cutWhy = { files: "the tree has too many files", bytes: "the tree is too big", "partial clone": "this is a partial clone, where it would fetch every file" };

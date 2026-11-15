@@ -2652,7 +2652,7 @@ async function partialOf(dir, limits, selectEnv = {}) {
   }
   const diff = git("diff", ...range, "--no-color", "--no-ext-diff", "--no-textconv").toString();
   const saved = Object.fromEntries(Object.keys(selectEnv).map((k) => [k, process.env[k]]));
-  Object.assign(process.env, selectEnv);
+  for (const [k, v] of Object.entries(selectEnv)) if (v === undefined) delete process.env[k]; else process.env[k] = v;
   let r;
   try { r = await selectPartial(dir, diff, rev, changed, files, Date.now() + 60_000, limits); }
   finally { for (const [k, v] of Object.entries(saved)) if (v === undefined) delete process.env[k]; else process.env[k] = v; }
@@ -2767,27 +2767,102 @@ test("partial: a partial (promisor) clone runs no caller search, where one grep 
   }
 });
 
-test("partial: a hostile user config (color, a pager, grep settings, global attributes) changes nothing in the list", async () => {
-  const { dir, git } = twoCommits({ "m.py": "pass\n", "u.py": "color_name_here()\n" }, { "m.py": "pass\ncolor_name_here()\n" });
-  // The repository's own config: color and a pager that would mangle every line.
+test("partial: no user, system or repository git setting changes the list (color, pager, grep settings, attributes from every source)", async () => {
+  const { dir, git } = twoCommits({ "m.py": "pass\n", "u.py": "color_name_here()\n", ".gitattributes": "u.py binary\n" }, { "m.py": "pass\ncolor_name_here()\n" });
+  // The repository's own config and attributes: color, a pager, and u.py (an unchanged caller) called binary three ways.
   git("config", "color.ui", "always"); git("config", "color.grep", "always"); git("config", "core.pager", "sed s/^/X/");
   git("config", "pager.grep", "true");
-  // A global config (the tests run with GIT_CONFIG_GLOBAL=/dev/null; point it at a hostile one for this case): color,
-  // a regex grep, line numbers, and an attributes file that calls every .py file binary.
+  writeFileSync(join(dir, ".git", "info", "attributes"), "u.py binary\n");
   const home = mkdtempSync(join(tmpdir(), "ohmybug-hostile-"));
-  writeFileSync(join(home, "attributes"), "*.py binary\n");
-  writeFileSync(join(home, "gitconfig"), `[color]\n\tui = always\n[grep]\n\tpatternType = perl\n\tlineNumber = true\n[core]\n\tattributesFile = ${join(home, "attributes")}\n`);
-  // Only the selection runs under it: the diff it reads is the one the change already sent.
-  assert.equal((await partialOf(dir, undefined, { GIT_CONFIG_GLOBAL: join(home, "gitconfig") })).list, "m.py u.py");
+  writeFileSync(join(home, "attributes"), "u.py binary\n");
+  git("config", "core.attributesFile", join(home, "attributes"));
+  // A user's global config where git before 2.32 looks for it ($HOME/.gitconfig, $XDG_CONFIG_HOME/git/config):
+  // color, a regex grep, line numbers, the same attributes.
+  const hostile = `[color]\n\tui = always\n[grep]\n\tpatternType = perl\n\tlineNumber = true\n[core]\n\tattributesFile = ${join(home, "attributes")}\n`;
+  writeFileSync(join(home, ".gitconfig"), hostile);
+  mkdirSync(join(home, "git")); writeFileSync(join(home, "git", "config"), hostile); writeFileSync(join(home, "git", "attributes"), "u.py binary\n");
+  assert.equal((await partialOf(dir, undefined, { HOME: home, XDG_CONFIG_HOME: home, GIT_CONFIG_GLOBAL: undefined })).list, "m.py u.py");
 });
 
-test("partial: a checkout owned by another user (git's ownership check) still gets its list: the run's own global config trusts it", async () => {
+test("partial: a checkout owned by another user, which the user's git trusts, gets its list on any git: the list's own folder has no ownership check", async () => {
   const { dir } = twoCommits({ "m.py": "pass\n", "u.py": "owner_name_here()\n" }, { "m.py": "pass\nowner_name_here()\n" });
   // git's own test switch makes every repository look foreign-owned; under an empty global config git refuses it.
   const foreign = { ...process.env, GIT_TEST_ASSUME_DIFFERENT_OWNER: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
   const refused = (() => { try { execFileSync("git", ["-C", dir, "rev-parse", "HEAD"], { env: foreign, stdio: "pipe" }); return false; } catch { return true; } })();
   assert.ok(refused, "this git honours GIT_TEST_ASSUME_DIFFERENT_OWNER");
-  assert.equal((await partialOf(dir, undefined, { GIT_TEST_ASSUME_DIFFERENT_OWNER: "1" })).list, "m.py u.py");
+  // As on a CI runner: the user's own global config trusts the checkout (else ls-tree, before the list, fails).
+  const trust = join(mkdtempSync(join(tmpdir(), "ohmybug-trust-")), "gitconfig");
+  writeFileSync(trust, "[safe]\n\tdirectory = *\n");
+  assert.equal((await partialOf(dir, undefined, { GIT_TEST_ASSUME_DIFFERENT_OWNER: "1", GIT_CONFIG_GLOBAL: trust })).list, "m.py u.py");
+});
+
+test("partial: the list's content calls run in a private git folder with no config source, and the folder is gone after, on success and on failure", async () => {
+  const { dir } = twoCommits({ "m.py": "pass\n", "u.py": "env_name_here()\n" }, { "m.py": "pass\nenv_name_here()\n" });
+  const bin = mkdtempSync(join(tmpdir(), "ohmybug-envgit-"));
+  const log = join(bin, "log");
+  const real = execFileSync("sh", ["-c", "command -v git"]).toString().trim();
+  writeFileSync(join(bin, "git"), `#!/bin/sh\ncase " $* " in *" grep "*|*" cat-file "*) { echo "ARGS $*"; env; echo "---"; } >> "${log}";; esac\nexec "${real}" "$@"\n`, { mode: 0o755 });
+  const sneak = { PATH: `${bin}:${process.env.PATH}`, GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "color.ui", GIT_CONFIG_VALUE_0: "always", GIT_PAGER: "false" };
+  assert.equal((await partialOf(dir, undefined, sneak)).list, "m.py u.py");
+  const calls = readFileSync(log, "utf8").split("---\n").filter((c) => c.trim());
+  assert.ok(calls.some((c) => / grep /.test(c)) && calls.some((c) => / cat-file /.test(c)), "both content calls ran");
+  const vars = (c) => Object.fromEntries(c.split("\n").filter((l) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(l)).map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)]));
+  for (const c of calls) {
+    const v = vars(c);
+    assert.doesNotMatch(c.split("\n")[0], / -C /);
+    assert.ok(v.GIT_DIR && v.HOME === v.GIT_DIR && v.XDG_CONFIG_HOME === v.GIT_DIR && !v.GIT_DIR.startsWith(dir), c.split("\n")[0]);
+    assert.deepEqual([v.GIT_CONFIG_NOSYSTEM, v.GIT_ATTR_NOSYSTEM, v.GIT_CONFIG_GLOBAL, v.GIT_CONFIG_COUNT, v.GIT_PAGER], ["1", "1", undefined, undefined, undefined]);
+    assert.throws(() => statSync(v.GIT_DIR), "the private folder is removed");
+  }
+  // A blob git lacks answers "missing" (no fetch): the list fails, and its folder is removed all the same.
+  writeFileSync(log, "");
+  const rev = execFileSync("git", ["-C", dir, "rev-parse", "HEAD^{tree}"]).toString().trim();
+  const path = process.env.PATH; process.env.PATH = sneak.PATH;
+  try {
+    await assert.rejects(selectPartial(dir, "", rev, ["m.py"], [{ mode: "100644", oid: "1".repeat(40), size: 3, path: Buffer.from("m.py") }], Date.now() + 60_000), /missing/);
+  } finally { process.env.PATH = path; }
+  const gitDir = vars(readFileSync(log, "utf8")).GIT_DIR;
+  assert.ok(gitDir); assert.throws(() => statSync(gitDir));
+});
+
+test("partial: a sha256 repository and a linked worktree get their lists", async () => {
+  const { dir, git } = twoCommits({ "m.py": "pass\n", "u.py": "wt_name_here()\n" }, { "m.py": "pass\nwt_name_here()\n" });
+  const wt = join(mkdtempSync(join(tmpdir(), "ohmybug-wt-")), "wt");
+  git("worktree", "add", "-q", "--detach", wt, "HEAD");
+  assert.equal((await partialOf(wt)).list, "m.py u.py");
+  const sha = mkdtempSync(join(tmpdir(), "ohmybug-sha256-"));
+  try { execFileSync("git", ["init", "-q", "--object-format=sha256", sha], { stdio: "ignore" }); } catch { return; } // a git with no sha256
+  const g = (...a) => execFileSync("git", ["-C", sha, "-c", "user.email=t@example.com", "-c", "user.name=t", ...a], { stdio: ["ignore", "pipe", "pipe"] });
+  writeFileSync(join(sha, "m.py"), "pass\n"); writeFileSync(join(sha, "u.py"), "sha_name_here()\n"); g("add", "-A"); g("commit", "-qm", "base");
+  writeFileSync(join(sha, "m.py"), "pass\nsha_name_here()\n"); g("commit", "-qam", "head");
+  assert.equal((await partialOf(sha)).list, "m.py u.py");
+});
+
+test("partial: a git that cannot name the object folder (before 2.5) sends the whole tree with the reason", async () => {
+  const { dir } = twoCommits({ "m.py": "pass\n", "u.py": "old_name_here()\n" }, { "m.py": "pass\nold_name_here()\n" });
+  const rev = execFileSync("git", ["-C", dir, "rev-parse", "HEAD^{tree}"]).toString().trim();
+  const diff = execFileSync("git", ["-C", dir, "diff", "HEAD~1", "HEAD", "--no-color"]).toString();
+  const bin = mkdtempSync(join(tmpdir(), "ohmybug-oldgit-"));
+  const real = execFileSync("sh", ["-c", "command -v git"]).toString().trim();
+  // An old git echoes the unknown option back and exits 0.
+  writeFileSync(join(bin, "git"), `#!/bin/sh\nfor a in "$@"; do [ "$a" = --git-path ] && { printf -- '--git-path\\nobjects\\n'; exit 0; }; done\nexec "${real}" "$@"\n`, { mode: 0o755 });
+  const path = process.env.PATH; process.env.PATH = `${bin}:${path}`;
+  try {
+    const t = await packTree(dir, rev, { maxBytes: 1 << 30, maxUnpacked: 1 << 30, timeoutMs: 60_000, select: (fs, until) => selectPartial(dir, diff, rev, ["m.py"], fs, until) });
+    assert.ok(t.tgz); assert.equal(t.files, 2); assert.equal(t.partial, undefined);
+    assert.match(t.partialWhy, /object folder was not found/);
+  } finally { process.env.PATH = path; }
+});
+
+test("partial: a whole tree refused after a failed list keeps the list's reason", async () => {
+  const { dir } = twoCommits({ "m.py": "pass\n" }, { "m.py": "pass\n\n" });
+  const rev = execFileSync("git", ["-C", dir, "rev-parse", "HEAD^{tree}"]).toString().trim();
+  const boom = () => { throw new Error("boom"); };
+  for (const caps of [{ maxBytes: 1 << 30, maxUnpacked: 1025 }, { maxBytes: 10, maxUnpacked: 1 << 30 }]) {
+    const t = await packTree(dir, rev, { ...caps, timeoutMs: 60_000, select: boom });
+    assert.match(t.cannot, caps.maxBytes === 10 ? /compressed/ : /unpacked, over/);
+    assert.match(t.partialWhy, /could not be built \(boom\)/);
+  }
 });
 
 test("partial: the list keeps the run's object-store variables (GIT_ALTERNATE_OBJECT_DIRECTORIES), as selectChange and the pack do", async () => {
@@ -2837,7 +2912,7 @@ test("partial L9: a git grep that fails fails the list, and the pack then sends 
   const t = await packTree(dir, rev, { maxBytes: 1 << 30, maxUnpacked: 1 << 30, timeoutMs: 60_000,
     select: (fs, until) => selectPartial(dir, "diff --git a/m.py b/m.py\n@@ -1 +1,2 @@\n pass\n+grep_name_here()\n", "0".repeat(40), ["m.py"], fs, until) });
   assert.equal(t.partial, undefined);
-  assert.match(t.partialWhy, /the file list could not be built \(git grep failed\)/);
+  assert.match(t.partialWhy, /the file list could not be built \(git grep failed: fatal: /);
   assert.equal(t.files, 2);
 });
 
@@ -2893,6 +2968,25 @@ test("partial upload: a list that fails (git grep exits 128) sends the whole tre
     assert.match(r.log, /the file list could not be built \(git grep failed\)/);
     assert.match(r.log, /uploading the repository snapshot/);
     statSync(join(untar(s.uploads[0].body), "other.js"));
+  } finally { process.env.PATH = path; await s.close(); }
+});
+
+test("partial upload: when the list fails and the whole tree is then too large, the refusal says a partial copy was asked for and why none was built", { skip: !hasTar && "no tar" }, async () => {
+  const { dir, git } = repo();
+  writeFileSync(join(dir, "other.js"), "fail_name_here()\n"); git("add", "-A"); git("commit", "-qm", "caller");
+  git("update-ref", "refs/remotes/origin/main", "HEAD");
+  writeFileSync(join(dir, "app.js"), "export const a = fail_name_here()\n"); git("commit", "-qam", "change");
+  const bin = mkdtempSync(join(tmpdir(), "ohmybug-badgit-"));
+  const real = execFileSync("sh", ["-c", "command -v git"]).toString().trim();
+  writeFileSync(join(bin, "git"), `#!/bin/sh\nfor a in "$@"; do [ "$a" = grep ] && exit 128; done\nexec "${real}" "$@"\n`, { mode: 0o755 });
+  const s = await server({ findings: [high], faults: NEEDS_SNAPSHOT(), ticket: { snapshot: "required", pack: "partial" } });
+  const path = process.env.PATH;
+  process.env.PATH = `${bin}:${path}`;
+  try {
+    const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url }, { snapshot: { ...SNAP.snapshot, maxBytes: 10 } });
+    assert.notEqual(r.code, 0, r.log);
+    assert.deepEqual(s.uploads.filter((u) => u.door === "repo"), []);
+    assert.match(r.log, /compressed, the most the service takes; the upload ticket asks for a partial copy of the repository and none was built \(the file list could not be built \(git grep failed\)\), so the whole tree was tried/);
   } finally { process.env.PATH = path; await s.close(); }
 });
 
