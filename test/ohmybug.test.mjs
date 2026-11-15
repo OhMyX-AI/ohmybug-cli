@@ -7,7 +7,7 @@ import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync, readFileSync, utime
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ciMeta, contextDenied, DECISION_WAIT_S, exitCodeFor, fileReader, formatFindings, fitBody, packTree, snapshotDenied, parseArgs, resolveBase, resultMarkdown, resultOf, rpcMessage, run, silentBillLine, trimDiff, VERSION, selectPartial, addedNames, PARTIAL, PARTIAL_SEARCH, OS_MANIFEST, OS_KW, OS_SKIP, OS_DOC1, OS_DOC2, NAME } from "../ohmybug.mjs";
+import { ciMeta, contextDenied, DECISION_WAIT_S, exitCodeFor, fileReader, formatFindings, fitBody, packTree, snapshotDenied, parseArgs, resolveBase, resultMarkdown, resultOf, rpcMessage, run, silentBillLine, trimDiff, VERSION, selectPartial, addedNames, PARTIAL, PARTIAL_SEARCH, PARTIAL_LIST_MS, OS_MANIFEST, OS_KW, OS_SKIP, OS_DOC1, OS_DOC2, NAME } from "../ohmybug.mjs";
 
 // The tests own their git config: a developer's or a runner's own (a git-lfs filter, say) would change what they see.
 process.env.GIT_CONFIG_GLOBAL = "/dev/null";
@@ -2650,7 +2650,8 @@ async function partialOf(dir, limits) {
     const path = rec.subarray(tab + 1);
     if (type === "blob" && !snapshotDenied(path.toString())) files.push({ mode, oid, size: Number(size), path });
   }
-  const r = await selectPartial(dir, range, rev, changed, files, Date.now() + 60_000, limits);
+  const diff = git("diff", ...range, "--no-color", "--no-ext-diff", "--no-textconv").toString();
+  const r = await selectPartial(dir, diff, rev, changed, files, Date.now() + 60_000, limits);
   return { list: [...r.keep].map((k) => Buffer.from(k, "latin1").toString()).join(" "), stats: r.stats };
 }
 
@@ -2753,11 +2754,41 @@ test("partial L7: past the search line no caller search runs: changed files and 
   assert.deepEqual([bytes.list, bytes.stats.cut], ["m.py package.json", "bytes"]);
 });
 
-test("partial: a partial (promisor) clone runs no caller search, where one grep would fetch every file", async () => {
-  const { dir, git } = twoCommits({ "m.py": "pass\n", "u.py": "clone_name_here()\n" }, { "m.py": "pass\nclone_name_here()\n" });
-  git("config", "remote.origin.promisor", "true");
-  const r = await partialOf(dir);
-  assert.deepEqual([r.list, r.stats.cut], ["m.py", "partial clone"]);
+test("partial: a partial (promisor) clone runs no caller search, where one grep would fetch every file; promisor=false is none", async () => {
+  for (const [key, value, cut] of [["remote.origin.promisor", "true", "partial clone"], ["extensions.partialClone", "origin", "partial clone"], ["remote.origin.promisor", "false", "-"]]) {
+    const { dir, git } = twoCommits({ "m.py": "pass\n", "u.py": "clone_name_here()\n" }, { "m.py": "pass\nclone_name_here()\n" });
+    git("config", key, value);
+    const r = await partialOf(dir);
+    assert.deepEqual([r.list, r.stats.cut], [cut === "-" ? "m.py u.py" : "m.py", cut], `${key}=${value}`);
+  }
+});
+
+test("partial: a user config that colors git output does not break the caller search", async () => {
+  const { dir, git } = twoCommits({ "m.py": "pass\n", "u.py": "color_name_here()\n" }, { "m.py": "pass\ncolor_name_here()\n" });
+  git("config", "color.ui", "always"); git("config", "color.grep", "always");
+  assert.equal((await partialOf(dir)).list, "m.py u.py");
+});
+
+test("partial: the list gets half of the snapshot clock, at most PARTIAL_LIST_MS; the rest is the pack's", async () => {
+  const { dir } = twoCommits({ "m.py": "pass\n" }, { "m.py": "pass\n\n" });
+  const rev = execFileSync("git", ["-C", dir, "rev-parse", "HEAD^{tree}"]).toString().trim();
+  for (const [timeoutMs, most] of [[10_000, 5_000], [3_600_000, PARTIAL_LIST_MS]]) {
+    let given;
+    const t = await packTree(dir, rev, { maxBytes: 1 << 30, maxUnpacked: 1 << 30, timeoutMs, select: (fs, until) => { given = until - Date.now(); return { keep: new Set(), stats: { changedInTree: 1 } }; } });
+    assert.ok(given <= most && given > most - 1_000, `timeout ${timeoutMs}: the list got ${given} ms`);
+    assert.ok(t.tgz, "the whole tree still packs");
+  }
+  assert.equal(PARTIAL_LIST_MS, 120_000);
+});
+
+test("partial: the unpacked cap measures the partial copy, not the whole tree it was cut from", async () => {
+  const { dir } = twoCommits({ "m.py": "pass\n", "big.txt": "#".repeat(2 << 20) }, { "m.py": "pass\n\n" });
+  const rev = execFileSync("git", ["-C", dir, "rev-parse", "HEAD^{tree}"]).toString().trim();
+  const opts = { maxBytes: 1 << 30, maxUnpacked: 1 << 20, timeoutMs: 60_000 };
+  assert.match((await packTree(dir, rev, opts)).cannot, /unpacked, over the 1 MiB/);
+  const t = await packTree(dir, rev, { ...opts, select: (fs) => ({ keep: new Set(fs.filter((f) => f.path.toString() === "m.py").map((f) => f.path.toString("latin1"))), stats: { kept: 1 } }) });
+  assert.equal(t.files, 1);
+  assert.ok(t.partial);
 });
 
 test("partial L10: files named like secrets are never listed and take no slot", async () => {
@@ -2771,7 +2802,7 @@ test("partial L9: a git grep that fails fails the list, and the pack then sends 
   const rev = execFileSync("git", ["-C", dir, "rev-parse", "HEAD^{tree}"]).toString().trim();
   // A tree id git does not have: the grep exits 128, not 1 (no match).
   const t = await packTree(dir, rev, { maxBytes: 1 << 30, maxUnpacked: 1 << 30, timeoutMs: 60_000,
-    select: (fs, until) => selectPartial(dir, ["HEAD~1", "HEAD"], "0".repeat(40), ["m.py"], fs, until) });
+    select: (fs, until) => selectPartial(dir, "diff --git a/m.py b/m.py\n@@ -1 +1,2 @@\n pass\n+grep_name_here()\n", "0".repeat(40), ["m.py"], fs, until) });
   assert.equal(t.partial, undefined);
   assert.match(t.partialWhy, /the file list could not be built \(git grep failed\)/);
   assert.equal(t.files, 2);

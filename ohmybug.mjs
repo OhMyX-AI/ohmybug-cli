@@ -183,7 +183,7 @@ export function resolveBase(opts, env, hasRef) {
 }
 
 /**
- * The change to review: { diff, changed, all, rev, base, range }. `rev` is the tree object reviewed: the commit's with a base,
+ * The change to review: { diff, changed, all, rev, base }. `rev` is the tree object reviewed: the commit's with a base,
  * a snapshot of the working tree with --uncommitted. Every file sent is read from it, so a file request answered
  * minutes later reads what was reviewed. `all` is every path in it.
  */
@@ -205,7 +205,7 @@ export function selectChange(opts, env, git, snapshot) {
   const diff = git("diff", ...range, ...DIFF_FLAGS);
   const changed = git("diff", ...range, "--name-only", "--diff-filter=d", "-z").split("\0").filter(Boolean);
   const all = git("ls-tree", "-r", "--name-only", "-z", rev).split("\0").filter(Boolean);
-  return { diff, changed, all, rev, base, range };
+  return { diff, changed, all, rev, base };
 }
 
 /**
@@ -360,11 +360,12 @@ export async function packTree(root, rev, { maxBytes, maxUnpacked, timeoutMs, se
   }
   if (!files.length) return { cannot: "the reviewed tree has no files to send" };
   // The partial copy (`select`, selectPartial): its list or, with a reason, the whole tree. It never fails the pack: the
-  // list gets at most half of the clock left, so a list that runs out of time still leaves the whole tree time to pack.
+  // list gets half of the clock left, at most PARTIAL_LIST_MS, so a list that runs out of time leaves the whole tree
+  // (at the default 15 minutes, 13 of them or more) to pack and upload.
   let partial, partialWhy, packed = files;
   if (select) {
     try {
-      const r = await select(files, Date.now() + Math.floor((until - Date.now()) / 2));
+      const r = await select(files, Date.now() + Math.min(Math.floor((until - Date.now()) / 2), PARTIAL_LIST_MS));
       if (r.keep.size) { partial = r.stats; packed = files.filter((f) => r.keep.has(f.path.toString("latin1"))); }
       else partialWhy = r.stats.changedInTree ? "every changed file is over 4 MiB, binary or a git-lfs pointer" : "no changed file is in the reviewed tree, or every one is named like a secret";
     } catch (e) { partialWhy = `the file list could not be built (${clean(e?.message ?? e, 160)})`; }
@@ -408,6 +409,8 @@ export async function packTree(root, rev, { maxBytes, maxUnpacked, timeoutMs, se
 export const PARTIAL = { changed: 60, callers: 20, bytes: 16 * 1024 * 1024, file: 4 << 20, names: 40, perName: 8, nulScan: 8000 };
 // No caller search on a tree past either line: one grep pass reads every blob. A count of the tree, never a timer.
 export const PARTIAL_SEARCH = { files: 200000, bytes: 512 * 1024 * 1024 };
+// The most of the snapshot's clock the list may take (packTree): past it the whole tree goes.
+export const PARTIAL_LIST_MS = 120_000;
 export const OS_MANIFEST = /^(package\.json|.*\.gemspec|Gemfile|pyproject\.toml|setup\.py|setup\.cfg|Cargo\.toml|go\.mod|pom\.xml|build\.gradle(\.kts)?|composer\.json|requirements\.txt|tsconfig\.json)$/;
 export const OS_KW = new Set(`self this that true false null none None True False return const function class import from export default async await
 while for else elif then case break continue public private protected static final void string number boolean object print
@@ -418,9 +421,9 @@ export const OS_DOC2 = /(^|\/)(LICEN[CS]E|CHANGELOG|NOTICE)([-_.][^/]*)?$/;
 export const NAME = /(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]{3,})\s*\(|(?:def|function|class|interface|fn|func|fun)\s+([A-Za-z_][A-Za-z0-9_]{3,})/g;
 const LFS = Buffer.from("version https://git-lfs.github.com/spec/");
 
-/** Names on the added lines of a -U0 diff: calls and definitions, keywords out, longest first, at most PARTIAL.names.
- *  A line counts only inside a hunk (after its @@ line, before the next file's header), so a header such as +++ is
- *  never read as one, and no option newer than git 2.0 is needed (--output-indicator-new is 2.25). */
+/** Names on the added lines of a unified diff: calls and definitions, keywords out, longest first, at most
+ *  PARTIAL.names. A line counts only inside a hunk (after its @@ line, before the next file's header), so a header such
+ *  as +++ is never read as one, and no git option newer than 2.0 is needed (--output-indicator-new is 2.25). */
 export function addedNames(diff) {
   const found = new Set();
   let hunk = false;
@@ -451,7 +454,8 @@ async function eachBlob(root, list, until, each) {
       await r.take(1);
       if (each(f, data) === false) break;
     }
-  } finally { git.kill(); }
+  } catch (e) { throw Date.now() >= until ? new Error("out of time on the list's share of the snapshot's clock") : e; }
+  finally { git.kill(); }
 }
 
 /**
@@ -459,12 +463,13 @@ async function eachBlob(root, list, until, each) {
  * the changed files (at most 60), the build manifests in their folders and every folder above, then the unchanged
  * files that use the names the added lines call or define, at most 20 by weight; then the caps in that rank order
  * (over 4 MiB skipped, a NUL in the first 8000 bytes or a git-lfs pointer skipped, past 16 MiB skipped while later ones
- * may still fit). `range` and `rev` (the reviewed tree) are selectChange's, so the names come from the reviewed diff. No caller search past
+ * may still fit). `diff`, `rev` (the reviewed tree) and `changed` are selectChange's: the names come from the very diff
+ * reviewed, never from a second diff whose base ref may have moved since. No caller search past
  * PARTIAL_SEARCH, nor in a partial (promisor) clone, where one grep would fetch every blob one by one. Nothing reads a
  * clock or a random source to decide, and every set is walked in a fixed byte order: a rerun gives the same list.
  * Returns { keep: Set of paths (latin1 keys), stats }; throws when git cannot answer (the caller packs the whole tree).
  */
-export async function selectPartial(root, range, rev, changed, files, until, limits = PARTIAL_SEARCH) {
+export async function selectPartial(root, diff, rev, changed, files, until, limits = PARTIAL_SEARCH) {
   const run = (args, ok = [0]) => {
     try { return execFileSync("git", ["-C", root, ...args], { maxBuffer: 256 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"], timeout: Math.max(1, until - Date.now()) }); }
     catch (e) { if (ok.includes(e.status) && e.stdout) return e.stdout; throw new Error(`git ${args[0]} failed${e.code === "ETIMEDOUT" ? " (out of time)" : ""}`); }
@@ -476,6 +481,9 @@ export async function selectPartial(root, range, rev, changed, files, until, lim
   const skip = new Set(changed);
   const dir = (p) => { const i = p.lastIndexOf("/"); return i < 0 ? "" : p.slice(0, i); };
   const byBytes = (a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b));
+  // A partial clone: extensions.partialClone names its remote; a remote.<name>.promisor counts only when true.
+  const promisor = () => run(["config", "--get-regexp", "^extensions\\.partialclone$"], [0, 1]).toString().trim() !== ""
+    || /\strue$/m.test(run(["config", "--bool", "--get-regexp", "^remote\\..*\\.promisor$"], [0, 1]).toString());
 
   // 1. The changed files in the tree (a changed symlink too), in the diff's order.
   const head = changed.map((p) => byPath.get(p)).filter(Boolean).slice(0, PARTIAL.changed);
@@ -499,11 +507,11 @@ export async function selectPartial(root, range, rev, changed, files, until, lim
   let cut = "-";
   if (regular.length > limits.files) cut = "files";
   else if (regular.reduce((n, f) => n + f.size, 0) > limits.bytes) cut = "bytes";
-  else if (run(["config", "--get-regexp", "^(extensions\\.partialclone|remote\\..*\\.promisor)$"], [0, 1]).length) cut = "partial clone";
+  else if (promisor()) cut = "partial clone";
   let callers = [];
-  const names = cut === "-" ? addedNames(run(["diff", ...range, ...DIFF_FLAGS, "-U0"])) : [];
+  const names = cut === "-" ? addedNames(diff) : [];
   if (names.length) {
-    const out = run(["grep", "-F", "-w", "-I", "-l", "-z", ...names.flatMap((n) => ["-e", n]), rev], [0, 1]);
+    const out = run(["grep", "--no-color", "-F", "-w", "-I", "-l", "-z", ...names.flatMap((n) => ["-e", n]), rev], [0, 1]);
     const pre = Buffer.from(`${rev}:`);
     const cand = [];
     for (let at = 0; at < out.length;) {
@@ -1167,7 +1175,7 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
         // Packed on the snapshot's clock, and only when the ticket wants it (a deep run packed it before the ticket, whole:
         // the service asks a partial copy of a fast ticket only, and a deep ticket's door refuses the mark).
         // A fast ticket with `pack: "partial"` gets the partial copy (OhMyBug#3856), or the whole tree when no list is built.
-        const select = t.pack === "partial" ? (fs, until) => selectPartial(root, change.range, change.rev, change.changed, fs, until) : undefined;
+        const select = t.pack === "partial" ? (fs, until) => selectPartial(root, change.diff, change.rev, change.changed, fs, until) : undefined;
         if (!tree) tree = await packTree(root, change.rev, { ...snap, timeoutMs: deadline - Date.now(), ...(select ? { select } : {}) });
         if (tree.cannot) throw new Refusal(`${tree.cannot}; no snapshot was sent, nothing started, and the upload ticket expires unused`);
         if (tree.partialWhy) log(`the upload ticket asks for a partial copy of the repository and none was built (${tree.partialWhy}): the whole tree goes`);
