@@ -7,7 +7,7 @@ import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync, readFileSync, utime
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ciMeta, contextDenied, DECISION_WAIT_S, exitCodeFor, fileReader, formatFindings, fitBody, packTree, snapshotDenied, parseArgs, resolveBase, resultMarkdown, resultOf, rpcMessage, run, silentBillLine, trimDiff, VERSION } from "../ohmybug.mjs";
+import { ciMeta, contextDenied, DECISION_WAIT_S, exitCodeFor, fileReader, formatFindings, fitBody, packTree, snapshotDenied, parseArgs, resolveBase, resultMarkdown, resultOf, rpcMessage, run, silentBillLine, trimDiff, VERSION, selectPartial, addedNames, PARTIAL, PARTIAL_SEARCH, OS_MANIFEST, OS_KW, OS_SKIP, OS_DOC1, OS_DOC2, NAME } from "../ohmybug.mjs";
 
 // The tests own their git config: a developer's or a runner's own (a git-lfs filter, say) would change what they see.
 process.env.GIT_CONFIG_GLOBAL = "/dev/null";
@@ -61,7 +61,7 @@ async function server({ huntMs = 0, findings = [], status = "done", review_of_re
         return res.end(JSON.stringify(d === "retired" ? { ok: true, retired: true, review_id: "rev_test" } : { error: "not found" }));
       }
       if (req.url.startsWith("/u/")) {
-        const door = /\/repo$/.test(req.url) ? "repo" : "payload";
+        const door = /\/repo(\?|$)/.test(req.url) ? "repo" : "payload";
         uploads.push({ door, path: req.url, type: req.headers["content-type"], body: Buffer.concat(chunks) });
         const st = (ticket?.[door] ?? []).shift() ?? 200;
         if (st === "reset") return req.socket.destroy();
@@ -104,7 +104,7 @@ async function server({ huntMs = 0, findings = [], status = "done", review_of_re
       const ask = name === "wait_review" && requested ? [requested, requestedAgain][asks] : undefined;
       if (ask) asks++;
       const result = toolError ? toolError
-        : name === "submit_review" && args.upload ? { ...(ticket?.noId ? {} : { review_id: "rev_test" }), status: "awaiting_upload", ...(ticket?.live ? { live_url: ticket.live } : {}), ...(ticket?.url === null ? {} : { upload_url: ticket?.url ?? `${url}/u/tok-secret${ticket?.slash ? "/" : ""}` }), ...(ticket?.snapshot ? { snapshot: ticket.snapshot } : {}) }
+        : name === "submit_review" && args.upload ? { ...(ticket?.noId ? {} : { review_id: "rev_test" }), status: "awaiting_upload", ...(ticket?.live ? { live_url: ticket.live } : {}), ...(ticket?.url === null ? {} : { upload_url: ticket?.url ?? `${url}/u/tok-secret${ticket?.slash ? "/" : ""}` }), ...(ticket?.snapshot ? { snapshot: ticket.snapshot } : {}), ...(ticket?.pack ? { pack: ticket.pack } : {}) }
         : name === "submit_review" ? { review_id: "rev_test", status: "running", ...submitExtra }
         : ask ? { review_id: "rev_test", status: "needs_files", requested_files: ask, files_url: filesUrl ?? `${url}/files` }
         : name === "wait_review" ? { review_id: "rev_test", status: Date.now() - (huntFrom ??= Date.now()) < huntMs ? "running" : status }
@@ -2614,5 +2614,210 @@ test("--deep --snapshot: the capacity code on a status other than 503 may have s
     assert.match(r.log, /may have started/);
     assert.equal(s.deletes.length, 0, "a hunt may run: the ticket is not retired");
     assert.equal(s.uploads.filter((u) => u.door === "payload").length, 1);
+  } finally { await s.close() }
+});
+
+
+// ---- The partial copy (OhMyBug#3856): the plugin's omb_paths.py rule, its test rows ported -----------------------
+
+/** A repository with a base commit and a head commit, written by `base` and `head` (path -> text or Buffer). */
+function twoCommits(base, head, remove = [], rename = []) {
+  const dir = mkdtempSync(join(tmpdir(), "ohmybug-partial-"));
+  const git = (...a) => execFileSync("git", ["-C", dir, ...a], { stdio: ["ignore", "pipe", "pipe"], maxBuffer: 256 << 20 });
+  const w = (files) => { for (const [p, c] of Object.entries(files)) { mkdirSync(join(dir, p, ".."), { recursive: true }); writeFileSync(join(dir, p), c); } };
+  git("init", "-q", "-b", "main"); git("config", "user.email", "t@example.com"); git("config", "user.name", "t");
+  w(base); git("add", "-A"); git("commit", "-qm", "base");
+  w(head);
+  for (const p of remove) rmSync(join(dir, p));
+  for (const [a, b] of rename) git("mv", a, b);
+  git("add", "-A"); git("commit", "-qm", "head");
+  return { dir, git };
+}
+/** The list for HEAD~1..HEAD, in rank order, as selectChange and packTree would feed it. */
+async function partialOf(dir, limits) {
+  const git = (...a) => execFileSync("git", ["-C", dir, ...a], { maxBuffer: 256 << 20 });
+  const range = ["HEAD~1", "HEAD"];
+  const rev = git("rev-parse", "HEAD^{tree}").toString().trim();
+  const changed = git("diff", ...range, "--name-only", "--diff-filter=d", "-z").toString().split("\0").filter(Boolean);
+  const files = [];
+  const ls = git("ls-tree", "-r", "-l", "-z", rev);
+  for (let at = 0; at < ls.length;) {
+    let end = ls.indexOf(0, at); if (end < 0) end = ls.length;
+    const rec = ls.subarray(at, end); at = end + 1;
+    if (!rec.length) continue;
+    const tab = rec.indexOf(9);
+    const [mode, type, oid, size] = rec.subarray(0, tab).toString().trim().split(/\s+/);
+    const path = rec.subarray(tab + 1);
+    if (type === "blob" && !snapshotDenied(path.toString())) files.push({ mode, oid, size: Number(size), path });
+  }
+  const r = await selectPartial(dir, range, rev, changed, files, Date.now() + 60_000, limits);
+  return { list: [...r.keep].map((k) => Buffer.from(k, "latin1").toString()).join(" "), stats: r.stats };
+}
+
+test("partial: the rule's constants equal the written-out copy (the plugin's omb_paths.py, the service's own rule)", () => {
+  assert.deepEqual(PARTIAL, { changed: 60, callers: 20, bytes: 16 * 1024 * 1024, file: 4 << 20, names: 40, perName: 8, nulScan: 8000 });
+  assert.deepEqual(PARTIAL_SEARCH, { files: 200000, bytes: 512 * 1024 * 1024 });
+  assert.equal(OS_MANIFEST.source, String.raw`^(package\.json|.*\.gemspec|Gemfile|pyproject\.toml|setup\.py|setup\.cfg|Cargo\.toml|go\.mod|pom\.xml|build\.gradle(\.kts)?|composer\.json|requirements\.txt|tsconfig\.json)$`);
+  assert.equal(OS_SKIP.source, String.raw`(^|\/)(node_modules|vendor|third_party|dist|build|\.yarn)\/|(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|Cargo\.lock|poetry\.lock|go\.sum|composer\.lock|Gemfile\.lock|uv\.lock|Pipfile\.lock|bun\.lockb?)$|\.(min\.js|min\.css|map|png|jpe?g|gif|ico|svg|webp|pdf|zip|gz|jar|woff2?|ttf|eot|mp4|mp3|lock|snap)$|_pb2\.py$|\.pb\.go$`);
+  assert.equal(OS_DOC1.source + "/" + OS_DOC1.flags, String.raw`\.(md|mdx|rst|txt|adoc)$|(^|\/)(licen[cs]e|changelog|notice)$/i`);
+  assert.equal(OS_DOC2.source + "/" + OS_DOC2.flags, String.raw`(^|\/)(LICEN[CS]E|CHANGELOG|NOTICE)([-_.][^/]*)?$/`);
+  assert.equal(NAME.source, String.raw`(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]{3,})\s*\(|(?:def|function|class|interface|fn|func|fun)\s+([A-Za-z_][A-Za-z0-9_]{3,})`);
+  assert.deepEqual([...OS_KW].sort(), `self this that true false null none None True False return const function class import from export default async await
+while for else elif then case break continue public private protected static final void string number boolean object print
+length value values items index error errors result results data type name test tests assert expect equal should params props`.split(/\s+/).sort());
+});
+
+test("partial L2: four fixtures give the service rule's lists, in its order (the plugin's reference lists)", async () => {
+  // A: ranking. Names in 1 to 9 files, keywords, short names, skipped and doc paths, more than 20 callers.
+  const a = {
+    "package.json": '{"name": "a", "main": "alpha_one"}\n', "src/app/pyproject.toml": "[x]\nalpha_one = 1\n", "src/setup.cfg": "[x]\n",
+    "other/Cargo.toml": "[x]\n", "src/app/main.py": "def main():\n    pass\n",
+    "node_modules/dep/alpha_one.js": "alpha_one()\n", "vendor/x/beta.go": "beta_two()\n", "dist/app.min.js": "gamma_three()\n",
+    "docs/guide.md": "gamma_three()\n", "CHANGELOG": "gamma_three()\n", "LICENSE-MIT": "gamma_three()\n",
+    "lib/shared.py": "alpha_one(); beta_two(); epsilon_five()\n", "lib/upper.py": "ALPHA_ONE()\n", "lib/partword.py": "xalpha_one(); alpha_one_x()\n",
+  };
+  for (const [name, n] of [["alpha_one", 2], ["beta_two", 3], ["gamma_three", 1], ["DeltaFour", 8], ["common_nine", 9], ["epsilon_five", 4], ["zeta_six", 5],
+    ["eta_seven", 6], ["theta_eight", 7], ["iota_ten", 3], ["kappa_x", 2], ["lambda_y", 3]]) for (let j = 0; j < n; j++) a[`lib/${name}/f${j}.py`] = `from x import ${name}\n${name}(1)\n`;
+  const ra = twoCommits(a, {
+    "src/app/main.py": "def main():\n    pass\n" + ["alpha_one", "beta_two", "common_nine", "epsilon_five", "zeta_six", "eta_seven", "theta_eight",
+      "iota_ten", "kappa_x", "lambda_y", "print", "return", "ab", "values", "self.result"].map((n) => `    ${n}(1)\n`).join("") + "def gamma_three():\n    pass\nclass DeltaFour:\n    pass\n",
+    "src/app/new_mod.py": "def brand_new():\n    alpha_one (2)\n",
+  });
+  // B: caps. A changed file over 4 MiB, a caller with a NUL byte, callers past 16 MiB together, a small one that still fits.
+  const b = { "big.py": "x = 1\n", "mod.py": "pass\n", "c1_nul.py": Buffer.from("\0binary_name_here()\n"), "c7_small.py": "big_caller_name()\nbinary_name_here()\n", "c8_exact.py": "edge_name_four()\n" };
+  for (let i = 0; i < 5; i++) b[`c${i + 2}_big.py`] = "big_caller_name()\n" + "#".repeat(3900 * 1024) + "\n";
+  const rb = twoCommits(b, { "big.py": "x = 2\n" + "#".repeat(4 * 1024 * 1024) + "\n", "mod.py": "pass\nbig_caller_name()\nbinary_name_here()\nedge_name_four()\n" });
+  // C: folders. 62 changed files (60 count), nested manifests, a changed manifest, a deletion and a rename.
+  const c = { "Gemfile": "x\n", "a/package.json": "{}\n", "a/b/go.mod": "x\n", "a/b/c/foo.gemspec": "x\n", "a/b/c/requirements.txt": "x\n", "a/b/c/setup.py": "x\n",
+    "a/b/c/x.py": "x\n", "a/y.go": "x\n", "d/pom.xml": "x\n", "d/old_name.py": Array.from({ length: 20 }, (_, i) => `line ${i}`).join("\n") + "\n", "gone.py": "x\n",
+    "z/build.gradle.kts": "x\n", "q/user.py": "deep_helper_name()\n" };
+  const ch = { "a/b/c/x.py": "x\ndeep_helper_name()\n", "a/b/c/setup.py": "y\n", "a/y.go": "y\n" };
+  for (let i = 0; i < 62; i++) { const p = `z/f${String(i).padStart(2, "0")}.py`; c[p] = "x\n"; ch[p] = "y\n"; }
+  const rc = twoCommits(c, ch, ["gone.py"], [["d/old_name.py", "d/new_name.py"]]);
+  // D: more than 40 names of many lengths: the 40 longest are searched. A changed git-lfs pointer is left out.
+  const names = Array.from({ length: 48 }, (_, i) => `n${"x".repeat(i % 9)}_${i}`);
+  const d = { "m.py": "pass\n", "asset.bin": `version https://git-lfs.github.com/spec/v1\\noid sha256:${"0".repeat(64)}\\nsize 10\\n` };
+  names.forEach((n, i) => { d[`u/f${String(i).padStart(2, "0")}.py`] = `${n}()\n`; });
+  const rd = twoCommits(d, { "m.py": "pass\n" + names.map((n) => `${n}(1)\n`).join(""), "asset.bin": `version https://git-lfs.github.com/spec/v1\noid sha256:${"1".repeat(64)}\nsize 11\n` });
+  const want = {
+    a: "src/app/main.py src/app/new_mod.py src/app/pyproject.toml src/setup.cfg package.json lib/gamma_three/f0.py lib/shared.py lib/kappa_x/f0.py lib/kappa_x/f1.py lib/iota_ten/f0.py lib/iota_ten/f1.py lib/iota_ten/f2.py lib/lambda_y/f0.py lib/lambda_y/f1.py lib/lambda_y/f2.py lib/beta_two/f0.py lib/beta_two/f1.py lib/beta_two/f2.py lib/alpha_one/f0.py lib/alpha_one/f1.py lib/epsilon_five/f0.py lib/epsilon_five/f1.py lib/epsilon_five/f2.py lib/epsilon_five/f3.py lib/zeta_six/f0.py",
+    b: "mod.py c7_small.py c8_exact.py c2_big.py c3_big.py c4_big.py c5_big.py",
+    c: "a/b/c/setup.py a/b/c/x.py a/y.go d/new_name.py " + Array.from({ length: 56 }, (_, i) => `z/f${String(i).padStart(2, "0")}.py`).join(" ") + " a/package.json Gemfile a/b/c/foo.gemspec a/b/c/requirements.txt a/b/go.mod d/pom.xml z/build.gradle.kts q/user.py",
+    d: "m.py u/f03.py u/f04.py u/f05.py u/f06.py u/f07.py u/f08.py u/f10.py u/f11.py u/f12.py u/f13.py u/f14.py u/f15.py u/f16.py u/f17.py u/f19.py u/f20.py u/f21.py u/f22.py u/f23.py u/f24.py",
+  };
+  for (const [k, r] of Object.entries({ a: ra, b: rb, c: rc, d: rd })) assert.equal((await partialOf(r.dir)).list, want[k], `fixture ${k}`);
+});
+
+test("partial L1: an added line whose text starts with '++' gives a name; a context line that looks like a header does not", async () => {
+  const { dir } = twoCommits({ "m.py": "x = 1\n+++ fake_name_here()\n", "u1.py": "call_me_now()\n", "u2.py": "fake_name_here()\n" }, { "m.py": "x = 1\n+++ fake_name_here()\n++ call_me_now()\n" });
+  assert.equal((await partialOf(dir)).list, "m.py u1.py");
+  assert.deepEqual(addedNames(Buffer.from("+++ b/x.py\n\x01++ call_me_now()\n\x01def made_here(): pass\n\x01print(x)\n")), ["call_me_now", "made_here"]);
+});
+
+test("partial L4: a NUL by byte 8000 is binary, past it is not; 4 MiB kept, one byte over skipped", async () => {
+  const { dir } = twoCommits({ "m.py": "pass\n", "early.py": Buffer.concat([Buffer.alloc(7999, 0x61), Buffer.from("\0\nnul_name_here()\n")]),
+    "late.py": Buffer.concat([Buffer.alloc(8000, 0x61), Buffer.from("\0\nnul_name_here()\n")]) },
+  { "m.py": "pass\nnul_name_here()\n", "four.txt.py": "#".repeat(4 << 20), "over.py": "#".repeat((4 << 20) + 1) });
+  // early.py has a NUL inside the first 8000 bytes (git grep -I and the rule both call it binary); late.py at byte
+  // 8000, past the window: a caller.
+  const list = (await partialOf(dir)).list.split(" ");
+  assert.deepEqual([list.includes("four.txt.py"), list.includes("over.py"), list.includes("late.py"), list.includes("early.py")], [true, false, true, false], list.join(" "));
+});
+
+test("partial L5: a name in 8 files adds them; in 9, none", async () => {
+  const base = { "m.py": "pass\n" };
+  for (let i = 0; i < 8; i++) base[`e/f${i}.py`] = "eight_files_name()\n";
+  for (let i = 0; i < 9; i++) base[`n/f${i}.py`] = "nine_files_name()\n";
+  const { dir } = twoCommits(base, { "m.py": "pass\neight_files_name()\nnine_files_name()\n" });
+  assert.equal((await partialOf(dir)).list, ["m.py", ...Array.from({ length: 8 }, (_, i) => `e/f${i}.py`)].join(" "));
+});
+
+test("partial L6: a symlink is no caller and no manifest; a changed symlink stays", async () => {
+  const { dir, git } = twoCommits({ "m.py": "pass\n", "real.py": "link_name_here()\n" }, { "m.py": "pass\n\n" });
+  symlinkSync("real.py", join(dir, "alias.py")); symlinkSync("real.py", join(dir, "package.json"));
+  git("add", "-A"); git("commit", "-qm", "links");
+  writeFileSync(join(dir, "m.py"), "pass\nlink_name_here()\n"); rmSync(join(dir, "alias.py")); symlinkSync("m.py", join(dir, "alias.py"));
+  git("add", "-A"); git("commit", "-qm", "head");
+  assert.equal((await partialOf(dir)).list, "alias.py m.py real.py");
+});
+
+test("partial L7: past the search line no caller search runs: changed files and manifests only, the stats say why", async () => {
+  const base = { "m.py": "pass\n", "package.json": "{}\n" };
+  for (let i = 0; i < 5; i++) base[`u/f${i}.py`] = "far_name_here()\n";
+  const { dir } = twoCommits(base, { "m.py": "pass\nfar_name_here()\n" });
+  const under = await partialOf(dir, { files: 7, bytes: 1 << 30 });
+  assert.equal(under.stats.cut, "-"); assert.ok(under.stats.callers > 0);
+  const files = await partialOf(dir, { files: 6, bytes: 1 << 30 });
+  assert.deepEqual([files.list, files.stats.cut], ["m.py package.json", "files"]);
+  const bytes = await partialOf(dir, { files: 1000, bytes: 10 });
+  assert.deepEqual([bytes.list, bytes.stats.cut], ["m.py package.json", "bytes"]);
+});
+
+test("partial: a partial (promisor) clone runs no caller search, where one grep would fetch every file", async () => {
+  const { dir, git } = twoCommits({ "m.py": "pass\n", "u.py": "clone_name_here()\n" }, { "m.py": "pass\nclone_name_here()\n" });
+  git("config", "remote.origin.promisor", "true");
+  const r = await partialOf(dir);
+  assert.deepEqual([r.list, r.stats.cut], ["m.py", "partial clone"]);
+});
+
+test("partial L10: files named like secrets are never listed and take no slot", async () => {
+  const { dir } = twoCommits({ "m.py": "pass\n", "config/secrets.py": "secret_name_here()\n", ".env.local": "x\n", "ok.py": "secret_name_here()\n" },
+    { "m.py": "pass\nsecret_name_here()\n", ".env.local": "y\n" });
+  assert.equal((await partialOf(dir)).list, "m.py ok.py");
+});
+
+test("partial L9: a git grep that fails fails the list, and the pack then sends the whole tree with the reason", async () => {
+  const { dir } = twoCommits({ "m.py": "pass\n", "u.py": "grep_name_here()\n" }, { "m.py": "pass\ngrep_name_here()\n" });
+  const rev = execFileSync("git", ["-C", dir, "rev-parse", "HEAD^{tree}"]).toString().trim();
+  // A tree id git does not have: the grep exits 128, not 1 (no match).
+  const t = await packTree(dir, rev, { maxBytes: 1 << 30, maxUnpacked: 1 << 30, timeoutMs: 60_000,
+    select: (fs, until) => selectPartial(dir, ["HEAD~1", "HEAD"], "0".repeat(40), ["m.py"], fs, until) });
+  assert.equal(t.partial, undefined);
+  assert.match(t.partialWhy, /the file list could not be built \(git grep failed\)/);
+  assert.equal(t.files, 2);
+});
+
+test("partial upload: a fast ticket asking pack: partial gets the list as the snapshot, marked ?pack=partial", { skip: !hasTar && "no tar" }, async () => {
+  // An unchanged file on the base: in the whole tree, not in the partial list (no name of the change uses it).
+  const { dir, git } = repo();
+  writeFileSync(join(dir, "unrelated.js"), "export const z = 9\n"); git("add", "-A"); git("commit", "-qm", "more");
+  git("update-ref", "refs/remotes/origin/main", "HEAD");
+  writeFileSync(join(dir, "app.js"), "export const a = 2\n"); git("commit", "-qam", "change");
+  const s = await server({ findings: [high], faults: NEEDS_SNAPSHOT(), ticket: { snapshot: "required", pack: "partial" } });
+  try {
+    const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url }, SNAP);
+    assert.equal(r.code, 1, r.log);
+    assert.deepEqual(s.uploads.map((u) => u.door), ["repo", "payload"]);
+    assert.match(s.uploads[0].path, /\/repo\?pack=partial$/);
+    const root = untar(s.uploads[0].body);
+    assert.equal(readFileSync(join(root, "app.js"), "utf8"), "export const a = 2\n");
+    assert.throws(() => statSync(join(root, "unrelated.js")));
+    assert.match(r.log, /uploading a partial repository snapshot \(1 of \d+ file\(s\): 1 changed/);
+  } finally { await s.close() }
+});
+
+test("partial upload: no pack on the ticket, or a list with nothing in it, sends the whole tree unmarked", { skip: !hasTar && "no tar" }, async () => {
+  for (const [ticket, why] of [[{ snapshot: "required" }, null], [{ snapshot: "required", pack: "whole" }, null], [{ snapshot: "required", pack: "partial" }, /every changed file is over 4 MiB, binary or a git-lfs pointer/]]) {
+    const { dir, git } = changed();
+    if (why) { writeFileSync(join(dir, "app.js"), Buffer.from("\0binary\n")); git("add", "-A"); git("commit", "-qm", "binary"); }
+    const s = await server({ findings: [high], faults: NEEDS_SNAPSHOT(), ticket });
+    try {
+      const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url }, SNAP);
+      assert.equal(r.code, 1, r.log);
+      assert.match(s.uploads[0].path, /\/repo$/, JSON.stringify(ticket));
+      assert.match(r.log, /uploading the repository snapshot/);
+      if (why) assert.match(r.log, why); else assert.doesNotMatch(r.log, /partial copy/);
+    } finally { await s.close() }
+  }
+});
+
+test("partial upload: --deep packs the whole tree before its ticket and never marks it, whatever the ticket says", { skip: !hasTar && "no tar" }, async () => {
+  const { dir } = changed();
+  const s = await server({ findings: [high], ticket: { snapshot: "required", pack: "partial" } });
+  try {
+    const r = await cli(dir, ["--deep", "--snapshot", "--format", "json"], { OHMYBUG_URL: s.url }, SNAP);
+    assert.equal(r.code, 1, r.log);
+    assert.match(s.uploads[0].path, /\/repo$/);
+    assert.doesNotMatch(r.log, /partial/);
   } finally { await s.close() }
 });

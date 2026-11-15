@@ -183,7 +183,7 @@ export function resolveBase(opts, env, hasRef) {
 }
 
 /**
- * The change to review: { diff, changed, all, rev, base }. `rev` is the tree object reviewed: the commit's with a base,
+ * The change to review: { diff, changed, all, rev, base, range }. `rev` is the tree object reviewed: the commit's with a base,
  * a snapshot of the working tree with --uncommitted. Every file sent is read from it, so a file request answered
  * minutes later reads what was reviewed. `all` is every path in it.
  */
@@ -205,7 +205,7 @@ export function selectChange(opts, env, git, snapshot) {
   const diff = git("diff", ...range, ...DIFF_FLAGS);
   const changed = git("diff", ...range, "--name-only", "--diff-filter=d", "-z").split("\0").filter(Boolean);
   const all = git("ls-tree", "-r", "--name-only", "-z", rev).split("\0").filter(Boolean);
-  return { diff, changed, all, rev, base };
+  return { diff, changed, all, rev, base, range };
 }
 
 /**
@@ -336,7 +336,7 @@ export function contextDenied(path) {
  * shortcut: a symlink is not a link entry, so an import through a symlinked directory does not resolve on the
  * service; send typeflag 2 if the service asks for it.
  */
-export async function packTree(root, rev, { maxBytes, maxUnpacked, timeoutMs }) {
+export async function packTree(root, rev, { maxBytes, maxUnpacked, timeoutMs, select }) {
   const mib = (n) => Math.ceil(n / 1048576);
   let listing;
   const until = Date.now() + timeoutMs;
@@ -357,19 +357,28 @@ export async function packTree(root, rev, { maxBytes, maxUnpacked, timeoutMs }) 
     if (type !== "blob") { gitlinks++; continue; }
     if (snapshotDenied(path.toString())) { secrets++; continue; }
     files.push({ mode, oid, size: Number(size), path });
-    unpacked += (path.length > 100 ? tarEntry(path, 0o644, 0).length : 512) + Math.ceil(Number(size) / 512) * 512;
   }
   if (!files.length) return { cannot: "the reviewed tree has no files to send" };
+  // The partial copy (`select`, selectPartial): its list or, with a reason, the whole tree. It never fails the pack.
+  let partial, partialWhy, packed = files;
+  if (select) {
+    try {
+      const r = await select(files, until);
+      if (r.keep.size) { partial = r.stats; packed = files.filter((f) => r.keep.has(f.path.toString("latin1"))); }
+      else partialWhy = r.stats.changedInTree ? "every changed file is over 4 MiB, binary or a git-lfs pointer" : "no changed file is in the reviewed tree";
+    } catch (e) { partialWhy = `the file list could not be built (${clean(e?.message ?? e, 160)})`; }
+  }
+  for (const f of packed) unpacked += (f.path.length > 100 ? tarEntry(f.path, 0o644, 0).length : 512) + Math.ceil(f.size / 512) * 512;
   const left = until - Date.now();
   if (left < 1) return { cannot: "could not pack the repository snapshot in time" };
   if (unpacked > maxUnpacked) return { cannot: `the reviewed tree is ${mib(unpacked)} MiB unpacked, over the ${mib(maxUnpacked)} MiB the service takes` };
   const git = spawn("git", ["-C", root, "cat-file", "--batch"], { stdio: ["pipe", "pipe", "ignore"], timeout: left });
   git.on("error", () => {});
   git.stdin.on("error", () => {});
-  git.stdin.end(files.map((f) => `${f.oid}\n`).join(""));
+  git.stdin.end(packed.map((f) => `${f.oid}\n`).join(""));
   const r = byteReader(git.stdout);
   async function* entries() {
-    for (const f of files) {
+    for (const f of packed) {
       const head = (await r.line()).split(" ");
       if (head[0] !== f.oid || head[1] !== "blob" || Number(head[2]) !== f.size) throw new Error(`git cat-file answered "${clean(head.join(" "), 80)}" for ${f.oid}`);
       yield tarEntry(f.path, f.mode === "100755" ? 0o755 : 0o644, f.size);
@@ -388,7 +397,150 @@ export async function packTree(root, rev, { maxBytes, maxUnpacked, timeoutMs }) 
       : Date.now() >= until ? `could not pack the repository snapshot within ${Math.round(timeoutMs / 1000)}s (git was still reading the blobs)`
       : `could not pack the repository snapshot (${clean(e.message, 200)})` };
   } finally { git.kill(); }
-  return { tgz: Buffer.concat(out), files: files.length, gitlinks, secrets };
+  return { tgz: Buffer.concat(out), files: packed.length, gitlinks, secrets, ...(partial ? { partial } : {}), ...(partialWhy ? { partialWhy } : {}) };
+}
+
+/*
+ * The partial copy's rule (OhMyBug#3856): the plugin's omb_paths.py, which is the service's own pick for a partial
+ * repository, constant for constant. The tests hold a written-out copy these must equal.
+ */
+export const PARTIAL = { changed: 60, callers: 20, bytes: 16 * 1024 * 1024, file: 4 << 20, names: 40, perName: 8, nulScan: 8000 };
+// No caller search on a tree past either line: one grep pass reads every blob. A count of the tree, never a timer.
+export const PARTIAL_SEARCH = { files: 200000, bytes: 512 * 1024 * 1024 };
+export const OS_MANIFEST = /^(package\.json|.*\.gemspec|Gemfile|pyproject\.toml|setup\.py|setup\.cfg|Cargo\.toml|go\.mod|pom\.xml|build\.gradle(\.kts)?|composer\.json|requirements\.txt|tsconfig\.json)$/;
+export const OS_KW = new Set(`self this that true false null none None True False return const function class import from export default async await
+while for else elif then case break continue public private protected static final void string number boolean object print
+length value values items index error errors result results data type name test tests assert expect equal should params props`.split(/\s+/));
+export const OS_SKIP = /(^|\/)(node_modules|vendor|third_party|dist|build|\.yarn)\/|(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|Cargo\.lock|poetry\.lock|go\.sum|composer\.lock|Gemfile\.lock|uv\.lock|Pipfile\.lock|bun\.lockb?)$|\.(min\.js|min\.css|map|png|jpe?g|gif|ico|svg|webp|pdf|zip|gz|jar|woff2?|ttf|eot|mp4|mp3|lock|snap)$|_pb2\.py$|\.pb\.go$/;
+export const OS_DOC1 = /\.(md|mdx|rst|txt|adoc)$|(^|\/)(licen[cs]e|changelog|notice)$/i;
+export const OS_DOC2 = /(^|\/)(LICEN[CS]E|CHANGELOG|NOTICE)([-_.][^/]*)?$/;
+export const NAME = /(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]{3,})\s*\(|(?:def|function|class|interface|fn|func|fun)\s+([A-Za-z_][A-Za-z0-9_]{3,})/g;
+const LFS = Buffer.from("version https://git-lfs.github.com/spec/");
+
+/** Names on the added lines (each starting with byte 0x01, git's --output-indicator-new): calls and definitions,
+ *  keywords out, longest first, at most PARTIAL.names. No diff header is ever read as a line. */
+export function addedNames(added) {
+  const found = new Set();
+  for (const ln of added.toString("utf8").split("\n")) {
+    if (!ln.startsWith("\x01")) continue;
+    for (const m of ln.matchAll(NAME)) { const n = m[1] ?? m[2]; if (!OS_KW.has(n)) found.add(n); }
+  }
+  return [...found].sort((a, b) => b.length - a.length || (a < b ? -1 : a > b ? 1 : 0)).slice(0, PARTIAL.names);
+}
+
+/** Blobs in order through one `git cat-file --batch`: calls `each(file, data)` until it returns false. */
+async function eachBlob(root, list, until, each) {
+  if (!list.length) return;
+  const left = until - Date.now();
+  if (left < 1) throw new Error("out of time on the snapshot's clock");
+  const git = spawn("git", ["-C", root, "cat-file", "--batch"], { stdio: ["pipe", "pipe", "ignore"], timeout: left });
+  git.on("error", () => {});
+  git.stdin.on("error", () => {});
+  git.stdin.end(list.map((f) => `${f.oid}\n`).join(""));
+  const r = byteReader(git.stdout);
+  try {
+    for (const f of list) {
+      const head = (await r.line()).split(" ");
+      if (head[0] !== f.oid || head[1] !== "blob" || Number(head[2]) !== f.size) throw new Error(`git cat-file answered "${clean(head.join(" "), 80)}" for ${f.oid}`);
+      const data = await r.take(f.size);
+      await r.take(1);
+      if (each(f, data) === false) break;
+    }
+  } finally { git.kill(); }
+}
+
+/**
+ * The partial copy's file list over the reviewed tree's `files` (packTree's: blobs, secret-named ones already out):
+ * the changed files (at most 60), the build manifests in their folders and every folder above, then the unchanged
+ * files that use the names the added lines call or define, at most 20 by weight; then the caps in that rank order
+ * (over 4 MiB skipped, a NUL in the first 8000 bytes or a git-lfs pointer skipped, past 16 MiB skipped while later ones
+ * may still fit). `range` and `rev` (the reviewed tree) are selectChange's, so the names come from the reviewed diff. No caller search past
+ * PARTIAL_SEARCH, nor in a partial (promisor) clone, where one grep would fetch every blob one by one. Nothing reads a
+ * clock or a random source to decide, and every set is walked in a fixed byte order: a rerun gives the same list.
+ * Returns { keep: Set of paths (latin1 keys), stats }; throws when git cannot answer (the caller packs the whole tree).
+ */
+export async function selectPartial(root, range, rev, changed, files, until, limits = PARTIAL_SEARCH) {
+  const run = (args, ok = [0]) => {
+    try { return execFileSync("git", ["-C", root, ...args], { maxBuffer: 256 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"], timeout: Math.max(1, until - Date.now()) }); }
+    catch (e) { if (ok.includes(e.status) && e.stdout) return e.stdout; throw new Error(`git ${args[0]} failed${e.code === "ETIMEDOUT" ? " (out of time)" : ""}`); }
+  };
+  const key = (f) => f.path.toString("latin1");
+  const byPath = new Map(files.map((f) => [f.path.toString(), f]));
+  const regular = files.filter((f) => f.mode === "100644" || f.mode === "100755");
+  const present = new Set(regular.map(key));
+  const skip = new Set(changed);
+  const dir = (p) => { const i = p.lastIndexOf("/"); return i < 0 ? "" : p.slice(0, i); };
+  const byBytes = (a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b));
+
+  // 1. The changed files in the tree (a changed symlink too), in the diff's order.
+  const head = changed.map((p) => byPath.get(p)).filter(Boolean).slice(0, PARTIAL.changed);
+
+  // 2. Build manifests in the folders of head and every folder above, unchanged ones, in tree order per folder.
+  const inDir = new Map();
+  for (const f of regular) {
+    const p = f.path.toString();
+    if (OS_MANIFEST.test(p.slice(p.lastIndexOf("/") + 1)) && !skip.has(p)) { const d = dir(p); if (!inDir.has(d)) inDir.set(d, []); inDir.get(d).push(f); }
+  }
+  const manifests = [], seen = new Set(), taken = new Set();
+  for (let d of [...new Set(head.map((f) => dir(f.path.toString())))].sort(byBytes)) {
+    for (;;) {
+      if (!seen.has(d)) { seen.add(d); for (const f of inDir.get(d) ?? []) if (!taken.has(key(f))) { taken.add(key(f)); manifests.push(f); } }
+      if (!d) break;
+      d = dir(d);
+    }
+  }
+
+  // 3-5. Callers: one git grep pass for every name, then which names each candidate holds, read from its blob.
+  let cut = "-";
+  if (regular.length > limits.files) cut = "files";
+  else if (regular.reduce((n, f) => n + f.size, 0) > limits.bytes) cut = "bytes";
+  else if (run(["config", "--get-regexp", "^(extensions\\.partialclone|remote\\..*\\.promisor)$"], [0, 1]).length) cut = "partial clone";
+  let callers = [];
+  const names = cut === "-" ? addedNames(run(["diff", ...range, ...DIFF_FLAGS, "-U0", "--output-indicator-new=\x01"])) : [];
+  if (names.length) {
+    const out = run(["grep", "-F", "-w", "-I", "-l", "-z", ...names.flatMap((n) => ["-e", n]), rev], [0, 1]);
+    const pre = Buffer.from(`${rev}:`);
+    const cand = [];
+    for (let at = 0; at < out.length;) {
+      let end = out.indexOf(0, at);
+      if (end < 0) end = out.length;
+      const rec = out.subarray(at, end);
+      at = end + 1;
+      if (!rec.length) continue;
+      if (!rec.subarray(0, pre.length).equals(pre)) throw new Error("git grep answered a path outside the tree");
+      const raw = rec.subarray(pre.length), p = raw.toString();
+      if (present.has(raw.toString("latin1")) && !skip.has(p) && !OS_SKIP.test(p) && !OS_DOC1.test(p) && !OS_DOC2.test(p)) cand.push(byPath.get(p));
+    }
+    const filesOf = new Map(names.map((n) => [n, []]));
+    const live = new Set(names);
+    const word = new Map(names.map((n) => [n, new RegExp(`(?<![A-Za-z0-9_])${n}(?![A-Za-z0-9_])`)]));
+    await eachBlob(root, cand.filter(Boolean), until, (f, data) => {
+      const text = data.toString("latin1");
+      for (const n of [...live]) if (text.includes(n) && word.get(n).test(text)) { filesOf.get(n).push(f); if (filesOf.get(n).length > PARTIAL.perName) live.delete(n); }
+      return live.size > 0;
+    });
+    const hits = new Map();
+    for (const n of names) {
+      const fs = filesOf.get(n);
+      if (!fs.length || fs.length > PARTIAL.perName) continue;
+      for (const f of fs) { const h = hits.get(key(f)) ?? { f, w: 0 }; h.w += 1 / fs.length; hits.set(key(f), h); }
+    }
+    callers = [...hits.values()].sort((a, b) => b.w - a.w || Buffer.compare(a.f.path, b.f.path)).map((h) => h.f).filter((f) => !taken.has(key(f))).slice(0, PARTIAL.callers);
+  }
+
+  // 6. The caps, in rank order: sizes from the tree, the NUL and LFS check on each candidate's first bytes.
+  const ranked = [...head, ...manifests, ...callers].filter((f) => f.size <= PARTIAL.file);
+  const binary = new Set();
+  await eachBlob(root, ranked, until, (f, data) => { if (data.subarray(0, PARTIAL.nulScan).includes(0) || data.subarray(0, LFS.length).equals(LFS)) binary.add(key(f)); });
+  const keep = new Set();
+  let total = 0;
+  for (const f of ranked) {
+    if (binary.has(key(f)) || total + f.size > PARTIAL.bytes) continue;
+    total += f.size;
+    keep.add(key(f));
+  }
+  const count = (list) => list.filter((f) => keep.has(key(f))).length;
+  return { keep, stats: { kept: keep.size, changed: count(head), changedInTree: head.length, manifests: count(manifests), callers: count(callers), files: files.length, cut } };
 }
 
 /**
@@ -1007,15 +1159,24 @@ async function review({ opts, env, cwd, out, log, rec, decisionWaitS, snap }) {
       };
       const sendSnapshot = async () => {
         if (env.OHMYBUG_SNAPSHOT === "off") throw new Refusal("the service asks for a snapshot of the repository, and OHMYBUG_SNAPSHOT=off keeps it on this machine; no snapshot was sent, nothing started, and the upload ticket expires unused (diff-only reviews are chosen in the hunting policy: https://app.ohmybug.ai/me/policy)");
-        // Packed on the snapshot's clock, and only when the ticket wants it (a deep run packed it before the ticket).
-        if (!tree) tree = await packTree(root, change.rev, { ...snap, timeoutMs: deadline - Date.now() });
+        // Packed on the snapshot's clock, and only when the ticket wants it (a deep run packed it before the ticket, whole:
+        // the service asks a partial copy of a fast ticket only, and a deep ticket's door refuses the mark).
+        // A fast ticket with `pack: "partial"` gets the partial copy (OhMyBug#3856), or the whole tree when no list is built.
+        const select = t.pack === "partial" ? (fs, until) => selectPartial(root, change.range, change.rev, change.changed, fs, until) : undefined;
+        if (!tree) tree = await packTree(root, change.rev, { ...snap, timeoutMs: deadline - Date.now(), ...(select ? { select } : {}) });
         if (tree.cannot) throw new Refusal(`${tree.cannot}; no snapshot was sent, nothing started, and the upload ticket expires unused`);
-        log(`uploading the repository snapshot (${tree.files} file(s), ${Math.ceil(tree.tgz.length / 1024)} KiB${tree.gitlinks ? `; ${tree.gitlinks} submodule(s) left out` : ""}${tree.secrets ? `; ${tree.secrets} file(s) named like secrets, or in folders named like them, left out` : ""})`);
+        if (tree.partialWhy) log(`the upload ticket asks for a partial copy of the repository and none was built (${tree.partialWhy}): the whole tree goes`);
+        const p = tree.partial;
+        const cutWhy = { files: "the tree has too many files", bytes: "the tree is too big", "partial clone": "this is a partial clone, where it would fetch every file" };
+        const what = p ? `a partial repository snapshot (${p.kept} of ${p.files} file(s): ${p.changed} changed, ${p.manifests} build manifest(s), ${p.callers} caller(s)${p.cut !== "-" ? `; no caller search: ${cutWhy[p.cut] ?? p.cut}` : ""}` : `the repository snapshot (${tree.files} file(s)`;
+        log(`uploading ${what}, ${Math.ceil(tree.tgz.length / 1024)} KiB${tree.gitlinks ? `; ${tree.gitlinks} submodule(s) left out` : ""}${tree.secrets ? `; ${tree.secrets} file(s) named like secrets, or in folders named like them, left out` : ""})`);
         // From here the review holds a snapshot: the files beside it, sent now or on request, leave out what it leaves out.
         read = fileReader(change, gitBuf, snapshotDenied);
         files = files.filter((f) => !snapshotDenied(f.path));
         const door = new URL(url);
         door.pathname = `${door.pathname.replace(/\/$/, "")}/repo`;
+        // The mark goes only with a list that was really built and packed.
+        if (p) door.searchParams.set("pack", "partial");
         await uploadSnapshot(door.href, tree.tgz);
       };
       const sendPayload = async () => {
