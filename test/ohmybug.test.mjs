@@ -2634,7 +2634,7 @@ function twoCommits(base, head, remove = [], rename = []) {
   return { dir, git };
 }
 /** The list for HEAD~1..HEAD, in rank order, as selectChange and packTree would feed it. */
-async function partialOf(dir, limits) {
+async function partialOf(dir, limits, selectEnv = {}) {
   const git = (...a) => execFileSync("git", ["-C", dir, ...a], { maxBuffer: 256 << 20 });
   const range = ["HEAD~1", "HEAD"];
   const rev = git("rev-parse", "HEAD^{tree}").toString().trim();
@@ -2651,7 +2651,11 @@ async function partialOf(dir, limits) {
     if (type === "blob" && !snapshotDenied(path.toString())) files.push({ mode, oid, size: Number(size), path });
   }
   const diff = git("diff", ...range, "--no-color", "--no-ext-diff", "--no-textconv").toString();
-  const r = await selectPartial(dir, diff, rev, changed, files, Date.now() + 60_000, limits);
+  const saved = Object.fromEntries(Object.keys(selectEnv).map((k) => [k, process.env[k]]));
+  Object.assign(process.env, selectEnv);
+  let r;
+  try { r = await selectPartial(dir, diff, rev, changed, files, Date.now() + 60_000, limits); }
+  finally { for (const [k, v] of Object.entries(saved)) if (v === undefined) delete process.env[k]; else process.env[k] = v; }
   return { list: [...r.keep].map((k) => Buffer.from(k, "latin1").toString()).join(" "), stats: r.stats };
 }
 
@@ -2763,10 +2767,18 @@ test("partial: a partial (promisor) clone runs no caller search, where one grep 
   }
 });
 
-test("partial: a user config that colors git output does not break the caller search", async () => {
+test("partial: a hostile user config (color, a pager, grep settings, global attributes) changes nothing in the list", async () => {
   const { dir, git } = twoCommits({ "m.py": "pass\n", "u.py": "color_name_here()\n" }, { "m.py": "pass\ncolor_name_here()\n" });
-  git("config", "color.ui", "always"); git("config", "color.grep", "always");
-  assert.equal((await partialOf(dir)).list, "m.py u.py");
+  // The repository's own config: color and a pager that would mangle every line.
+  git("config", "color.ui", "always"); git("config", "color.grep", "always"); git("config", "core.pager", "sed s/^/X/");
+  git("config", "pager.grep", "true");
+  // A global config (the tests run with GIT_CONFIG_GLOBAL=/dev/null; point it at a hostile one for this case): color,
+  // a regex grep, line numbers, and an attributes file that calls every .py file binary.
+  const home = mkdtempSync(join(tmpdir(), "ohmybug-hostile-"));
+  writeFileSync(join(home, "attributes"), "*.py binary\n");
+  writeFileSync(join(home, "gitconfig"), `[color]\n\tui = always\n[grep]\n\tpatternType = perl\n\tlineNumber = true\n[core]\n\tattributesFile = ${join(home, "attributes")}\n`);
+  // Only the selection runs under it: the diff it reads is the one the change already sent.
+  assert.equal((await partialOf(dir, undefined, { GIT_CONFIG_GLOBAL: join(home, "gitconfig") })).list, "m.py u.py");
 });
 
 test("partial: the list gets half of the snapshot clock, at most PARTIAL_LIST_MS; the rest is the pack's", async () => {
@@ -2879,4 +2891,27 @@ test("partial upload: base...HEAD and --uncommitted both bring a caller of the c
       assert.match(r.log, /1 changed, 0 build manifest\(s\), 1 caller\(s\)/);
     } finally { await s.close() }
   }
+});
+
+test("partial: a real list that outruns its share of the clock is cut there, and the whole tree still packs in the rest", async () => {
+  const { dir } = twoCommits({ "m.py": "pass\n", "u.py": "slow_name_here()\n" }, { "m.py": "pass\nslow_name_here()\n" });
+  const rev = execFileSync("git", ["-C", dir, "rev-parse", "HEAD^{tree}"]).toString().trim();
+  const diff = execFileSync("git", ["-C", dir, "diff", "HEAD~1", "HEAD", "--no-color"]).toString();
+  // A git whose grep takes 30 s: the list must stop at its share (half of 6 s), not wait for it.
+  const bin = mkdtempSync(join(tmpdir(), "ohmybug-slowgit-"));
+  const real = execFileSync("sh", ["-c", "command -v git"]).toString().trim();
+  writeFileSync(join(bin, "git"), `#!/bin/sh\nfor a in "$@"; do [ "$a" = grep ] && exec sleep 30; done\nexec "${real}" "$@"\n`, { mode: 0o755 });
+  const path = process.env.PATH;
+  process.env.PATH = `${bin}:${path}`;
+  try {
+    const from = Date.now();
+    const t = await packTree(dir, rev, { maxBytes: 1 << 30, maxUnpacked: 1 << 30, timeoutMs: 6_000,
+      select: (fs, until) => selectPartial(dir, diff, rev, ["m.py"], fs, until) });
+    const took = Date.now() - from;
+    assert.ok(t.tgz, `the whole tree packs: ${t.cannot}`);
+    assert.equal(t.partial, undefined);
+    assert.match(t.partialWhy, /out of time/);
+    assert.equal(t.files, 2);
+    assert.ok(took < 5_000, `the list stopped at its share: ${took} ms`);
+  } finally { process.env.PATH = path; }
 });

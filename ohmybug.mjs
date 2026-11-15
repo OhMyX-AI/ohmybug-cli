@@ -436,12 +436,25 @@ export function addedNames(diff) {
   return [...found].sort((a, b) => b.length - a.length || (a < b ? -1 : a > b ? 1 : 0)).slice(0, PARTIAL.names);
 }
 
+/*
+ * Every git call of the partial list runs under no user setting, as the plugin's upload script runs its own (0.164.0):
+ * no system or global config, no home folder, the C locale, and the settings a repository's own config could still
+ * set (color, pager) overridden on the command line; aliases cannot shadow the built-in commands called. The user's
+ * global config is out, so the ownership check that config may have answered (safe.directory, common on CI runners)
+ * is answered here for this call only: the repository already passed it under the user's own config in selectChange.
+ * The whole tree's pack keeps the user's git (a partial clone may need its credential helpers to fetch blobs).
+ */
+const NO_USER_GIT_ENV = { HOME: join(tmpdir(), "ohmybug-no-home"), XDG_CONFIG_HOME: join(tmpdir(), "ohmybug-no-home"),
+  GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0", LC_ALL: "C" };
+const noUserGit = (root, args) => ["--no-pager", "-c", "safe.directory=*", "-c", "color.ui=never", "-c", "color.grep=never", "-c", "core.pager=cat", "-C", root, ...args];
+const noUserEnv = () => ({ ...NO_USER_GIT_ENV, PATH: process.env.PATH ?? "" });
+
 /** Blobs in order through one `git cat-file --batch`: calls `each(file, data)` until it returns false. */
 async function eachBlob(root, list, until, each) {
   if (!list.length) return;
   const left = until - Date.now();
-  if (left < 1) throw new Error("out of time on the snapshot's clock");
-  const git = spawn("git", ["-C", root, "cat-file", "--batch"], { stdio: ["pipe", "pipe", "ignore"], timeout: left });
+  if (left < 1) throw new Error("out of time on the list's share of the snapshot's clock");
+  const git = spawn("git", noUserGit(root, ["cat-file", "--batch"]), { stdio: ["pipe", "pipe", "ignore"], timeout: left, env: noUserEnv() });
   git.on("error", () => {});
   git.stdin.on("error", () => {});
   git.stdin.end(list.map((f) => `${f.oid}\n`).join(""));
@@ -471,7 +484,7 @@ async function eachBlob(root, list, until, each) {
  */
 export async function selectPartial(root, diff, rev, changed, files, until, limits = PARTIAL_SEARCH) {
   const run = (args, ok = [0]) => {
-    try { return execFileSync("git", ["-C", root, ...args], { maxBuffer: 256 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"], timeout: Math.max(1, until - Date.now()) }); }
+    try { return execFileSync("git", noUserGit(root, args), { maxBuffer: 256 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"], timeout: Math.max(1, until - Date.now()), env: noUserEnv() }); }
     catch (e) { if (ok.includes(e.status) && e.stdout) return e.stdout; throw new Error(`git ${args[0]} failed${e.code === "ETIMEDOUT" ? " (out of time)" : ""}`); }
   };
   const key = (f) => f.path.toString("latin1");
