@@ -3,7 +3,7 @@
 // One file, no dependencies, Node 18+. Exit 0: no medium or worse bug. 1: at least one. 2: the review could not run,
 // or was cut short with no medium or worse bug.
 import { execFileSync, spawn } from "node:child_process";
-import { appendFileSync, copyFileSync, realpathSync, rmSync, statSync, utimesSync } from "node:fs";
+import { appendFileSync, copyFileSync, mkdtempSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -437,24 +437,42 @@ export function addedNames(diff) {
 }
 
 /*
- * Every git call of the partial list runs under no user setting, as the plugin's upload script runs its own (0.164.0):
- * no system or global config, no home folder, the C locale, and the settings a repository's own config could still
- * set (color, pager) overridden on the command line; aliases cannot shadow the built-in commands called. The user's
- * global config is out, so the ownership check that config may have answered (safe.directory, common on CI runners)
- * is answered here for this call only: the repository already passed it under the user's own config in selectChange.
- * The whole tree's pack keeps the user's git (a partial clone may need its credential helpers to fetch blobs).
+ * Every git call of the partial list runs under no system or global git setting, as the plugin's upload script runs
+ * its own (0.164.0). The contract, so nobody has to derive it again:
+ * - The environment is the run's own minus what configures git or its output: GIT_CONFIG*, GIT_PAGER, PAGER,
+ *   GIT_ATTR_*, GIT_EXTERNAL_DIFF, LANG, LANGUAGE, LC_*, HOME, XDG_CONFIG_HOME. GIT_DIR, GIT_WORK_TREE and the object
+ *   store variables stay, as they do for selectChange and the pack.
+ * - The system config is off (GIT_CONFIG_NOSYSTEM). The global config is a file this run writes in its own mkdtemp
+ *   folder and removes on exit: safe.directory = * and the repository's path (git 2.35.2 reads only exact paths,
+ *   `*` from 2.35.3; before protected config, git 2.38, safe.directory is read from system and global config only,
+ *   never from -c), core.attributesFile = /dev/null, no pager, no color. HOME and XDG_CONFIG_HOME point there too.
+ * - The repository's own config still applies, so color and pager are also overridden on the command line, where they
+ *   outrank it. An alias cannot shadow a built-in command. The locale is C.
+ * The repository passed git's ownership check under the user's own config in selectChange; this answers it again for
+ * the list only. The whole tree's pack keeps the user's git (a partial clone may need its credential helpers).
  */
-const NO_USER_GIT_ENV = { HOME: join(tmpdir(), "ohmybug-no-home"), XDG_CONFIG_HOME: join(tmpdir(), "ohmybug-no-home"),
-  GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0", LC_ALL: "C" };
-const noUserGit = (root, args) => ["--no-pager", "-c", "safe.directory=*", "-c", "color.ui=never", "-c", "color.grep=never", "-c", "core.pager=cat", "-C", root, ...args];
-const noUserEnv = () => ({ ...NO_USER_GIT_ENV, PATH: process.env.PATH ?? "" });
+const NOT_INHERITED = /^(GIT_CONFIG.*|GIT_PAGER|PAGER|GIT_ATTR_.*|GIT_EXTERNAL_DIFF|LANG|LANGUAGE|LC_.*|HOME|XDG_CONFIG_HOME)$/;
+let noUserHome;
+const quoted = (v) => `"${v.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
+const noUserGit = (root, args) => ["--no-pager", "-c", "color.ui=never", "-c", "color.grep=never", "-c", "core.pager=cat", "-C", root, ...args];
+function noUserEnv(root) {
+  if (!noUserHome) {
+    noUserHome = mkdtempSync(join(tmpdir(), "ohmybug-git-"));
+    const home = noUserHome;
+    process.once("exit", () => { try { rmSync(home, { recursive: true, force: true }); } catch {} });
+    let real = root; try { real = realpathSync(root); } catch {}
+    writeFileSync(join(home, "gitconfig"), `[safe]\n\tdirectory = *\n\tdirectory = ${quoted(real)}\n[core]\n\tattributesFile = /dev/null\n\tpager = cat\n[color]\n\tui = never\n\tgrep = never\n`, { mode: 0o600 });
+  }
+  const env = Object.fromEntries(Object.entries(process.env).filter(([k]) => !NOT_INHERITED.test(k)));
+  return { ...env, HOME: noUserHome, XDG_CONFIG_HOME: noUserHome, GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: join(noUserHome, "gitconfig"), GIT_TERMINAL_PROMPT: "0", LC_ALL: "C" };
+}
 
 /** Blobs in order through one `git cat-file --batch`: calls `each(file, data)` until it returns false. */
 async function eachBlob(root, list, until, each) {
   if (!list.length) return;
   const left = until - Date.now();
   if (left < 1) throw new Error("out of time on the list's share of the snapshot's clock");
-  const git = spawn("git", noUserGit(root, ["cat-file", "--batch"]), { stdio: ["pipe", "pipe", "ignore"], timeout: left, env: noUserEnv() });
+  const git = spawn("git", noUserGit(root, ["cat-file", "--batch"]), { stdio: ["pipe", "pipe", "ignore"], timeout: left, env: noUserEnv(root) });
   git.on("error", () => {});
   git.stdin.on("error", () => {});
   git.stdin.end(list.map((f) => `${f.oid}\n`).join(""));
@@ -484,7 +502,7 @@ async function eachBlob(root, list, until, each) {
  */
 export async function selectPartial(root, diff, rev, changed, files, until, limits = PARTIAL_SEARCH) {
   const run = (args, ok = [0]) => {
-    try { return execFileSync("git", noUserGit(root, args), { maxBuffer: 256 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"], timeout: Math.max(1, until - Date.now()), env: noUserEnv() }); }
+    try { return execFileSync("git", noUserGit(root, args), { maxBuffer: 256 * 1024 * 1024, stdio: ["ignore", "pipe", "ignore"], timeout: Math.max(1, until - Date.now()), env: noUserEnv(root) }); }
     catch (e) { if (ok.includes(e.status) && e.stdout) return e.stdout; throw new Error(`git ${args[0]} failed${e.code === "ETIMEDOUT" ? " (out of time)" : ""}`); }
   };
   const key = (f) => f.path.toString("latin1");

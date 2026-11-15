@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync, readFileSync, utimesSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync, readFileSync, utimesSync, rmSync, statSync, renameSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -2781,6 +2781,27 @@ test("partial: a hostile user config (color, a pager, grep settings, global attr
   assert.equal((await partialOf(dir, undefined, { GIT_CONFIG_GLOBAL: join(home, "gitconfig") })).list, "m.py u.py");
 });
 
+test("partial: a checkout owned by another user (git's ownership check) still gets its list: the run's own global config trusts it", async () => {
+  const { dir } = twoCommits({ "m.py": "pass\n", "u.py": "owner_name_here()\n" }, { "m.py": "pass\nowner_name_here()\n" });
+  // git's own test switch makes every repository look foreign-owned; under an empty global config git refuses it.
+  const foreign = { ...process.env, GIT_TEST_ASSUME_DIFFERENT_OWNER: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" };
+  const refused = (() => { try { execFileSync("git", ["-C", dir, "rev-parse", "HEAD"], { env: foreign, stdio: "pipe" }); return false; } catch { return true; } })();
+  assert.ok(refused, "this git honours GIT_TEST_ASSUME_DIFFERENT_OWNER");
+  assert.equal((await partialOf(dir, undefined, { GIT_TEST_ASSUME_DIFFERENT_OWNER: "1" })).list, "m.py u.py");
+});
+
+test("partial: the list keeps the run's object-store variables (GIT_ALTERNATE_OBJECT_DIRECTORIES), as selectChange and the pack do", async () => {
+  const { dir, git } = twoCommits({ "m.py": "pass\n", "u.py": "store_name_here()\n" }, { "m.py": "pass\nstore_name_here()\n" });
+  git("repack", "-a", "-d", "-q"); git("prune-packed");
+  const store = mkdtempSync(join(tmpdir(), "ohmybug-store-"));
+  renameSync(join(dir, ".git", "objects", "pack"), join(store, "pack"));
+  mkdirSync(join(dir, ".git", "objects", "pack"));
+  const saved = process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES;
+  process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES = store;
+  try { assert.equal((await partialOf(dir)).list, "m.py u.py"); }
+  finally { if (saved === undefined) delete process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES; else process.env.GIT_ALTERNATE_OBJECT_DIRECTORIES = saved; }
+});
+
 test("partial: the list gets half of the snapshot clock, at most PARTIAL_LIST_MS; the rest is the pack's", async () => {
   const { dir } = twoCommits({ "m.py": "pass\n" }, { "m.py": "pass\n\n" });
   const rev = execFileSync("git", ["-C", dir, "rev-parse", "HEAD^{tree}"]).toString().trim();
@@ -2852,6 +2873,27 @@ test("partial upload: no pack on the ticket, or a list with nothing in it, sends
       if (why) assert.match(r.log, why); else assert.doesNotMatch(r.log, /partial copy/);
     } finally { await s.close() }
   }
+});
+
+test("partial upload: a list that fails (git grep exits 128) sends the whole tree unmarked and says why", { skip: !hasTar && "no tar" }, async () => {
+  const { dir, git } = repo();
+  writeFileSync(join(dir, "other.js"), "fail_name_here()\n"); git("add", "-A"); git("commit", "-qm", "caller");
+  git("update-ref", "refs/remotes/origin/main", "HEAD");
+  writeFileSync(join(dir, "app.js"), "export const a = fail_name_here()\n"); git("commit", "-qam", "change");
+  const bin = mkdtempSync(join(tmpdir(), "ohmybug-badgit-"));
+  const real = execFileSync("sh", ["-c", "command -v git"]).toString().trim();
+  writeFileSync(join(bin, "git"), `#!/bin/sh\nfor a in "$@"; do [ "$a" = grep ] && exit 128; done\nexec "${real}" "$@"\n`, { mode: 0o755 });
+  const s = await server({ findings: [high], faults: NEEDS_SNAPSHOT(), ticket: { snapshot: "required", pack: "partial" } });
+  const path = process.env.PATH;
+  process.env.PATH = `${bin}:${path}`;
+  try {
+    const r = await cli(dir, ["--format", "json"], { OHMYBUG_URL: s.url }, SNAP);
+    assert.equal(r.code, 1, r.log);
+    assert.match(s.uploads[0].path, /\/repo$/);
+    assert.match(r.log, /the file list could not be built \(git grep failed\)/);
+    assert.match(r.log, /uploading the repository snapshot/);
+    statSync(join(untar(s.uploads[0].body), "other.js"));
+  } finally { process.env.PATH = path; await s.close(); }
 });
 
 test("partial upload: --deep packs the whole tree before its ticket and never marks it, whatever the ticket says", { skip: !hasTar && "no tar" }, async () => {
