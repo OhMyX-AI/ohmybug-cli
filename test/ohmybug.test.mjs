@@ -186,6 +186,23 @@ test("exit codes: a known medium does not block; still_open, a high, a bad mark 
   assert.doesNotMatch(formatFindings([{ ...med }]), /known/);
 });
 
+test("a note: shown last under Notes, never blocking, carried as kind; a raised one is a regular finding", () => {
+  const note = { finding_id: "n1", severity: "low", file: "a.js", line: 3, title: "could validate the input", failure_scenario: "s", kind: "note" };
+  const low = { finding_id: "l1", severity: "low", file: "a.js", line: 9, title: "off by one", failure_scenario: "s" };
+  const med = { finding_id: "m1", severity: "medium", file: "b.js", line: 1, title: "crash", failure_scenario: "s" };
+  const raised = { ...note, finding_id: "n2", severity: "medium", title: "raised note" };
+  const text = formatFindings([note, med, low]);
+  assert.match(text, /^MEDIUM  b\.js:1  crash[\s\S]*^LOW  a\.js:9  off by one[\s\S]*^Notes \(1\): [^\n]*\n\nLOW  a\.js:3  could validate the input/m);
+  assert.doesNotMatch(formatFindings([low, med]), /Notes/);
+  assert.match(formatFindings([note]), /^Notes \(1\)/);
+  assert.equal(exitCodeFor({ status: "done", findings: [note] }), 0);
+  assert.equal(exitCodeFor({ status: "done", findings: [raised] }), 1);
+  const res = resultOf({ reviewId: "rev_x", answer: { status: "done", findings: [note, raised, low, { ...low, finding_id: "t1", kind: "test" }, { ...low, finding_id: "x1", kind: "other" }] } }, 1);
+  assert.deepEqual(res.findings.map((f) => [f.id, f.kind, f.blocking]), [["n2", null, true], ["n1", "note", false], ["l1", null, false], ["t1", "test", false], ["x1", null, false]]);
+  assert.match(resultMarkdown(res), /\| LOW \(note\) \| ` a\.js:3 ` \|/);
+  assert.doesNotMatch(formatFindings([raised]), /Notes/);
+});
+
 test("exit codes: 1 on a medium or worse bug, 0 on lows or none, 2 on a failed or cut-short clean run", () => {
   assert.equal(exitCodeFor({ status: "done", findings: [high] }), 1);
   assert.equal(exitCodeFor({ status: "done", findings: [{ ...low, severity: "medium" }] }), 1);
@@ -1057,7 +1074,7 @@ test("--format json: one object on stdout, the same exit code, every field prese
     assert.equal(j.billing.charged_usd, null);
     assert.equal(j.silent_bill, null);
     assert.deepEqual(j.findings.map((f) => [f.severity, f.blocking]), [["high", true], ["medium", true], ["low", false], ["unrated", true]]);
-    assert.deepEqual(j.findings[1], { id: "rev_test:f2", severity: "medium", blocking: true, known: false, file: "b.js", line: 2, title: "t2", body: "s2", suggested_fix: "fix it" });
+    assert.deepEqual(j.findings[1], { id: "rev_test:f2", severity: "medium", blocking: true, known: false, kind: null, file: "b.js", line: 2, title: "t2", body: "s2", suggested_fix: "fix it" });
     assert.deepEqual([j.findings[3].file, j.findings[3].line, j.findings[3].id], [null, null, null]);
     assert.deepEqual(j.counts, { total: 4, blocking: 3, critical: 0, high: 1, medium: 1, low: 1, unrated: 1 });
     assert.equal(j.error, null);

@@ -11,7 +11,7 @@ import { Readable, Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createGzip } from "node:zlib";
 
-export const VERSION = "0.11.0";
+export const VERSION = "0.12.0";
 const USAGE = `ohmybug ${VERSION}: review this repository's changes with OhMyBug.
 
 Usage:
@@ -69,6 +69,10 @@ const isKnown = (f) => rankOf(f) === 2 && f?.verdict === "REAL" && !!f.known && 
 // A gate fails closed: a severity it does not know blocks; a known medium does not.
 const isBlocking = (f) => rankOf(f) !== 3 && !isKnown(f);
 const KNOWN_TAG = "known: tracked in your ticket";
+// A note (the service's kind "note"): a low that names no input or state that goes wrong today. Shown last; never blocks.
+const isNote = (f) => f?.kind === "note" && rankOf(f) === 3;
+// The kind the service sent, when it is one this CLI knows; a note only while it is still low.
+const kindOf = (f) => (isNote(f) ? "note" : f?.kind === "test" || f?.kind === "docs" ? f.kind : null);
 const MAYBE_STARTED = "A hunt may have started: see https://app.ohmybug.ai/me";
 // A deep upload ticket starts no hunt and is never charged, but until it is used, retired or expired it counts as one
 // running review of the account (#3676).
@@ -693,6 +697,14 @@ export function exitCodeFor(r) {
 }
 
 export function formatFindings(findings) {
+  const notes = findings.filter(isNote);
+  const rest = formatList(findings.filter((f) => !isNote(f)));
+  if (!notes.length) return rest;
+  const head = `Notes (${notes.length}): lows that name no failing input today; they never fail the run`;
+  return [rest, `${head}\n\n${formatList(notes)}`].filter(Boolean).join("\n\n");
+}
+
+function formatList(findings) {
   return [...findings].sort((a, b) => rankOf(a) - rankOf(b)).map((f) => {
     const where = f.file ? (f.line ? `${f.file}:${f.line}` : String(f.file)) : "";
     const scenario = String(f.failure_scenario ?? "").trim().replace(/\n/g, "\n    ");
@@ -717,7 +729,7 @@ const usd = (v) => (v === null || v === undefined || v === "" || !Number.isFinit
 export function resultOf(rec, code) {
   const r = rec.answer;
   const findings = [...(r?.findings ?? []).filter((f) => f && typeof f === "object")].sort((a, b) => rankOf(a) - rankOf(b)).map((f) => ({
-    id: scalar(f.finding_id ?? f.id), severity: severityOf(f), blocking: isBlocking(f), known: isKnown(f), file: scalar(f.file),
+    id: scalar(f.finding_id ?? f.id), severity: severityOf(f), blocking: isBlocking(f), known: isKnown(f), kind: kindOf(f), file: scalar(f.file),
     line: /^[1-9]\d*$/.test(String(f.line ?? "")) ? Number(f.line) : null, title: String(f.title ?? ""),
     body: String(f.failure_scenario ?? ""), suggested_fix: strOrNull(f.suggested_fix),
   }));
@@ -786,7 +798,7 @@ export function resultMarkdown(res, folds = true) {
   const where = (f) => (f.file ? (f.line ? `${f.file}:${f.line}` : f.file) : "");
   if (res.findings.length) {
     out.push("| Severity | Location | Finding |", "|---|---|---|");
-    for (const f of res.findings) out.push(`| ${f.severity.toUpperCase()}${f.known ? ` (${KNOWN_TAG})` : ""} | ${cell(where(f))} | ${cell(f.title)} |`);
+    for (const f of res.findings) out.push(`| ${f.severity.toUpperCase()}${f.known ? ` (${KNOWN_TAG})` : ""}${f.kind === "note" ? " (note)" : ""} | ${cell(where(f))} | ${cell(f.title)} |`);
     out.push("");
     for (const f of folds ? res.findings : []) {
       out.push(`<details><summary>${escHtml(`${f.severity.toUpperCase()} ${where(f)}: ${f.title}`.replace(/[\r\n]+/g, " "))}</summary>`, "");
