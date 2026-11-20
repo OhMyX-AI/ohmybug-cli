@@ -11,7 +11,7 @@ import { Readable, Writable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { createGzip } from "node:zlib";
 
-export const VERSION = "0.12.0";
+export const VERSION = "0.13.0";
 const USAGE = `ohmybug ${VERSION}: review this repository's changes with OhMyBug.
 
 Usage:
@@ -71,6 +71,16 @@ const isBlocking = (f) => rankOf(f) !== 3 && !isKnown(f);
 const KNOWN_TAG = "known: tracked in your ticket";
 // A note (the service's kind "note"): a low that names no input or state that goes wrong today. Shown last; never blocks.
 const isNote = (f) => f?.kind === "note" && rankOf(f) === 3;
+// What a second read of the change said of a finding: its fixed sentence, or null. `says` is for programs, never printed.
+const secondReadOf = (f) => {
+  const s = f?.second_read;
+  return s && typeof s === "object" && typeof s.why === "string" && (s.says === "likely_not_a_defect" || s.says === "doubted") ? s : null;
+};
+// A low a read of the change moved: listed last, under the service's heading. Never blocks (it is low).
+const isMoved = (f) => secondReadOf(f)?.says === "likely_not_a_defect" && rankOf(f) === 3;
+const whyOf = (f) => (secondReadOf(f) ? secondReadOf(f).why.replace(/[\r\n]+/g, " ").trim() : "");
+// The service's heading for the moved findings, word for word (its report and PR comment print the same).
+export const likelyNotHeading = (n) => `Likely not defects: ${n}. A read of the change found each of these handled or already present at the place named. Not a proof: judge them like any finding.`;
 // The kind the service sent, when it is one this CLI knows; a note only while it is still low.
 const kindOf = (f) => (isNote(f) ? "note" : f?.kind === "test" || f?.kind === "docs" ? f.kind : null);
 const MAYBE_STARTED = "A hunt may have started: see https://app.ohmybug.ai/me";
@@ -697,18 +707,21 @@ export function exitCodeFor(r) {
 }
 
 export function formatFindings(findings) {
-  const notes = findings.filter(isNote);
-  const rest = formatList(findings.filter((f) => !isNote(f)));
-  if (!notes.length) return rest;
-  const head = `Notes (${notes.length}): lows that name no failing input today; they never fail the run`;
-  return [rest, `${head}\n\n${formatList(notes)}`].filter(Boolean).join("\n\n");
+  const moved = findings.filter(isMoved);
+  const notes = findings.filter((f) => isNote(f) && !isMoved(f));
+  const rest = formatList(findings.filter((f) => !isNote(f) && !isMoved(f)));
+  const out = [rest];
+  if (notes.length) out.push(`Notes (${notes.length}): lows that name no failing input today; they never fail the run\n\n${formatList(notes)}`);
+  if (moved.length) out.push(`${likelyNotHeading(moved.length)}\n\n${formatList(moved)}`);
+  return out.filter(Boolean).join("\n\n");
 }
 
 function formatList(findings) {
   return [...findings].sort((a, b) => rankOf(a) - rankOf(b)).map((f) => {
     const where = f.file ? (f.line ? `${f.file}:${f.line}` : String(f.file)) : "";
     const scenario = String(f.failure_scenario ?? "").trim().replace(/\n/g, "\n    ");
-    return `${String(f.severity ?? "unrated").toUpperCase()}  ${where}  ${f.title ?? ""}${isKnown(f) ? `  (${KNOWN_TAG})` : ""}`.trimEnd() + (scenario ? `\n    ${scenario}` : "");
+    const why = whyOf(f);
+    return `${String(f.severity ?? "unrated").toUpperCase()}  ${where}  ${f.title ?? ""}${isKnown(f) ? `  (${KNOWN_TAG})` : ""}${why ? `  · ${why}` : ""}`.trimEnd() + (scenario ? `\n    ${scenario}` : "");
   }).join("\n\n");
 }
 
@@ -732,6 +745,8 @@ export function resultOf(rec, code) {
     id: scalar(f.finding_id ?? f.id), severity: severityOf(f), blocking: isBlocking(f), known: isKnown(f), kind: kindOf(f), file: scalar(f.file),
     line: /^[1-9]\d*$/.test(String(f.line ?? "")) ? Number(f.line) : null, title: String(f.title ?? ""),
     body: String(f.failure_scenario ?? ""), suggested_fix: strOrNull(f.suggested_fix),
+    // Only when the service sent one: a result with none is the same object as before.
+    ...(secondReadOf(f) ? { second_read: { says: secondReadOf(f).says, why: secondReadOf(f).why, at: strOrNull(f.second_read.at) } } : {}),
   }));
   const counts = { total: findings.length, blocking: findings.filter((f) => f.blocking).length };
   for (const s of SEVERITIES) counts[s] = 0;
@@ -796,14 +811,24 @@ export function resultMarkdown(res, folds = true) {
   const head = res.outcome === "blocking" ? `${res.counts.blocking} blocking bug${res.counts.blocking === 1 ? "" : "s"}` : HEADLINE[res.outcome] ?? res.outcome;
   const out = [`### OhMyBug review: ${head}`, ""];
   const where = (f) => (f.file ? (f.line ? `${f.file}:${f.line}` : f.file) : "");
-  if (res.findings.length) {
+  // A low a read of the change moved goes to its own table after the others, under the service's heading.
+  const movedRow = (f) => f.second_read?.says === "likely_not_a_defect" && f.severity === "low";
+  const table = (rows) => {
     out.push("| Severity | Location | Finding |", "|---|---|---|");
-    for (const f of res.findings) out.push(`| ${f.severity.toUpperCase()}${f.known ? ` (${KNOWN_TAG})` : ""}${f.kind === "note" ? " (note)" : ""} | ${cell(where(f))} | ${cell(f.title)} |`);
+    for (const f of rows) out.push(`| ${f.severity.toUpperCase()}${f.known ? ` (${KNOWN_TAG})` : ""}${f.kind === "note" ? " (note)" : ""} | ${cell(where(f))} | ${cell(f.title)} |`);
     out.push("");
-    for (const f of folds ? res.findings : []) {
-      out.push(`<details><summary>${escHtml(`${f.severity.toUpperCase()} ${where(f)}: ${f.title}`.replace(/[\r\n]+/g, " "))}</summary>`, "");
-      out.push(`<pre>${escHtml(f.body)}</pre>`, "", "</details>", "");
-    }
+  };
+  const main = res.findings.filter((f) => !movedRow(f)), moved = res.findings.filter(movedRow);
+  if (main.length) table(main);
+  if (moved.length) {
+    const [name, ...rest] = likelyNotHeading(moved.length).split(/(?<=^[^.]*\.) /);
+    out.push(`**${name}** ${rest.join(" ")}`, "");
+    table(moved);
+  }
+  for (const f of folds ? [...main, ...moved] : []) {
+    out.push(`<details><summary>${escHtml(`${f.severity.toUpperCase()} ${where(f)}: ${f.title}`.replace(/[\r\n]+/g, " "))}</summary>`, "");
+    if (f.second_read) out.push(`<p>${escHtml(f.second_read.why.replace(/[\r\n]+/g, " "))}</p>`, "");
+    out.push(`<pre>${escHtml(f.body)}</pre>`, "", "</details>", "");
   }
   if (res.error) out.push(`<pre>${escHtml(res.error.message)}</pre>`, "");
   const rv = res.review ?? {};

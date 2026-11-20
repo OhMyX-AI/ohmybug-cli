@@ -203,6 +203,79 @@ test("a note: shown last under Notes, never blocking, carried as kind; a raised 
   assert.doesNotMatch(formatFindings([raised]), /Notes/);
 });
 
+// A second read of the change (the service's `second_read`): a moved low goes last under the service's heading with its
+// sentence, a doubt stays in place with its sentence; `says` is never printed; nothing changes which findings block.
+const HEADING = "Likely not defects: 3. A read of the change found each of these handled or already present at the place named. Not a proof: judge them like any finding.";
+const moved = (at) => ({ says: "likely_not_a_defect", why: `A read of the change found the case handled at ${at}.`, at });
+const READ_ANSWER = [
+  { finding_id: "p1", severity: "low", file: "p.js", line: 1, title: "plain low", failure_scenario: "sp" },
+  { finding_id: "n1", severity: "low", file: "n.js", line: 2, title: "own note", failure_scenario: "sn", kind: "note" },
+  { finding_id: "m1", severity: "low", file: "m.js", line: 3, title: "moved low", failure_scenario: "sm", second_read: moved("m.js:9") },
+  { finding_id: "m2", severity: "low", file: "o.js", line: 4, title: "moved own note", failure_scenario: "so", kind: "note", second_read: moved("o.js:8") },
+  { finding_id: "m3", severity: "low", file: "t.js", line: 5, title: "moved test row", failure_scenario: "st", kind: "test", reported_severity: "medium", second_read: { says: "likely_not_a_defect", why: "A read of the change found what is reported missing at t.js:7.", at: "t.js:7" } },
+  { finding_id: "d1", severity: "medium", file: "d.js", line: 6, title: "medium in doubt", failure_scenario: "sd", second_read: { says: "doubted", why: "A second read doubts this: the task asks for this behaviour.", at: null } },
+];
+
+test("a second read: moved lows last under the service's heading with the sentence, a doubt in place; text, summary and JSON", () => {
+  assert.equal(formatFindings(READ_ANSWER), [
+    "MEDIUM  d.js:6  medium in doubt  · A second read doubts this: the task asks for this behaviour.\n    sd",
+    "LOW  p.js:1  plain low\n    sp",
+    "Notes (1): lows that name no failing input today; they never fail the run",
+    "LOW  n.js:2  own note\n    sn",
+    HEADING,
+    "LOW  m.js:3  moved low  · A read of the change found the case handled at m.js:9.\n    sm\n\n"
+      + "LOW  o.js:4  moved own note  · A read of the change found the case handled at o.js:8.\n    so\n\n"
+      + "LOW  t.js:5  moved test row  · A read of the change found what is reported missing at t.js:7.\n    st",
+  ].join("\n\n"));
+  // The moved rows never block: the medium in doubt alone does.
+  assert.equal(exitCodeFor({ status: "done", findings: READ_ANSWER }), 1);
+  assert.equal(exitCodeFor({ status: "done", findings: READ_ANSWER.filter((f) => f.finding_id !== "d1") }), 0);
+  const res = resultOf({ reviewId: "rev_x", answer: { status: "done", findings: READ_ANSWER } }, 1);
+  assert.equal(res.counts.blocking, 1);
+  const by = Object.fromEntries(res.findings.map((f) => [f.id, f]));
+  assert.deepEqual(by.m1.second_read, { says: "likely_not_a_defect", why: "A read of the change found the case handled at m.js:9.", at: "m.js:9" });
+  assert.deepEqual(by.d1.second_read, { says: "doubted", why: "A second read doubts this: the task asks for this behaviour.", at: null });
+  assert.equal(by.m2.kind, "note");
+  assert.equal(by.m3.kind, "test");
+  assert.equal("second_read" in by.p1, false);
+  const md = resultMarkdown(res);
+  const [mainTable, rest] = md.split(`**Likely not defects: 3.** A read of the change found each of these handled or already present at the place named. Not a proof: judge them like any finding.`);
+  assert.ok(rest, "the heading line is printed once");
+  assert.match(mainTable, /\| MEDIUM \| ` d\.js:6 ` \| ` medium in doubt ` \|/);
+  assert.match(mainTable, /\| LOW \(note\) \| ` n\.js:2 ` \| ` own note ` \|/);
+  assert.doesNotMatch(mainTable, /moved/);
+  const movedTable = rest.split("<details>")[0];
+  for (const t of ["moved low", "moved own note", "moved test row"]) assert.match(movedTable, new RegExp(`\` ${t} \``));
+  assert.match(movedTable, /\| LOW \(note\) \| ` o\.js:4 `/);
+  assert.match(md, /<summary>LOW m\.js:3: moved low<\/summary>\n\n<p>A read of the change found the case handled at m\.js:9\.<\/p>\n\n<pre>sm<\/pre>/);
+  assert.match(md, /<summary>MEDIUM d\.js:6: medium in doubt<\/summary>\n\n<p>A second read doubts this: the task asks for this behaviour\.<\/p>/);
+  // `says` is for programs: no person-facing output prints it.
+  for (const out of [formatFindings(READ_ANSWER), md]) assert.doesNotMatch(out, /likely_not_a_defect|doubted/);
+  // A malformed read is ignored, as before; a moved word on a non-low row keeps its place with its sentence.
+  assert.equal(formatFindings([{ ...READ_ANSWER[0], second_read: { says: "likely_not_a_defect" } }]), formatFindings([READ_ANSWER[0]]));
+  assert.match(formatFindings([{ ...READ_ANSWER[5], second_read: moved("d.js:1") }]), /^MEDIUM  d\.js:6  medium in doubt  · A read of the change found the case handled at d\.js:1\.$/m);
+});
+
+test("with no second read anywhere, the text, the summary and the JSON are 0.12.0's byte for byte", async (t) => {
+  let old;
+  try { old = execFileSync("git", ["show", "v0.12.0:ohmybug.mjs"], { cwd: fileURLToPath(new URL("..", import.meta.url)), encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }); }
+  catch { return t.skip("tag v0.12.0 not fetched"); }
+  const dir = mkdtempSync(join(tmpdir(), "ohmybug-old-"));
+  writeFileSync(join(dir, "old.mjs"), old);
+  const was = await import(new URL(`file://${join(dir, "old.mjs")}`).href);
+  const answersBase = (i) => { const { second_read, ...f } = READ_ANSWER[i]; return f; };
+  const answers = [READ_ANSWER.map(({ second_read, ...f }) => f), [], [READ_ANSWER[1]], [{ ...answersBase(5), known: { kind: "deferred", ref: "#1" }, verdict: "REAL" }]];
+  for (const findings of answers) {
+    assert.equal(formatFindings(findings), was.formatFindings(findings));
+    const rec = { reviewId: "rev_x", answer: { status: "done", findings } };
+    const now = resultOf(rec, 1), then = was.resultOf(rec, 1);
+    assert.deepEqual({ ...now, cli_version: null }, { ...then, cli_version: null });
+    assert.equal(JSON.stringify({ ...now, cli_version: null }), JSON.stringify({ ...then, cli_version: null }));
+    assert.equal(resultMarkdown(now), was.resultMarkdown(then));
+  }
+  rmSync(dir, { recursive: true, force: true });
+});
+
 test("exit codes: 1 on a medium or worse bug, 0 on lows or none, 2 on a failed or cut-short clean run", () => {
   assert.equal(exitCodeFor({ status: "done", findings: [high] }), 1);
   assert.equal(exitCodeFor({ status: "done", findings: [{ ...low, severity: "medium" }] }), 1);
