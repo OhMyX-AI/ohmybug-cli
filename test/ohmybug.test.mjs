@@ -249,8 +249,16 @@ test("a second read: moved lows last under the service's heading with the senten
   assert.match(movedTable, /\| LOW \(note\) \| ` o\.js:4 `/);
   assert.match(md, /<summary>LOW m\.js:3: moved low<\/summary>\n\n<p>A read of the change found the case handled at m\.js:9\.<\/p>\n\n<pre>sm<\/pre>/);
   assert.match(md, /<summary>MEDIUM d\.js:6: medium in doubt<\/summary>\n\n<p>A second read doubts this: the task asks for this behaviour\.<\/p>/);
-  // `says` is for programs: no person-facing output prints it.
+  // `says` is for programs: only the JSON carries its machine value, never the text or the summary.
   for (const out of [formatFindings(READ_ANSWER), md]) assert.doesNotMatch(out, /likely_not_a_defect|doubted/);
+  assert.match(JSON.stringify(res), /"says":"likely_not_a_defect"/);
+  assert.match(JSON.stringify(res), /"says":"doubted"/);
+  // Over the summary's size bound the folds go and both tables stay whole: the heading always has its rows under it.
+  const big = READ_ANSWER.map((f) => ({ ...f, failure_scenario: "x".repeat(200 * 1024) }));
+  const cut = resultMarkdown(resultOf({ reviewId: "rev_x", answer: { status: "done", findings: big } }, 1));
+  assert.doesNotMatch(cut, /<details>/);
+  const after = cut.split("**Likely not defects: 3.**")[1];
+  for (const t of ["moved low", "moved own note", "moved test row"]) assert.match(after, new RegExp(`\` ${t} \``));
   // A malformed read is ignored, as before; a moved word on a non-low row keeps its place with its sentence.
   assert.equal(formatFindings([{ ...READ_ANSWER[0], second_read: { says: "likely_not_a_defect" } }]), formatFindings([READ_ANSWER[0]]));
   assert.match(formatFindings([{ ...READ_ANSWER[5], second_read: moved("d.js:1") }]), /^MEDIUM  d\.js:6  medium in doubt  · A read of the change found the case handled at d\.js:1\.$/m);
