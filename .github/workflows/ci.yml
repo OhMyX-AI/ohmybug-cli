@@ -16,6 +16,8 @@ jobs:
         node: [18, 20, 22]
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the tests compare the output with the last release's (a tag)
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node }}
